@@ -1,0 +1,4 @@
+{$CRM_DOMAIN} {
+  encode gzip zstd
+  reverse_proxy crm:8080
+}

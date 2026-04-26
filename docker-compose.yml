@@ -1,0 +1,30 @@
+services:
+  crm:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - crm-data:/app/data
+      - crm-uploads:/app/uploads
+    expose:
+      - "8080"
+
+  caddy:
+    image: caddy:2.10-alpine
+    restart: unless-stopped
+    depends_on:
+      - crm
+    env_file: .env
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+volumes:
+  crm-data:
+  crm-uploads:
+  caddy-data:
+  caddy-config:
