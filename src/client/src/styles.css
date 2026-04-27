@@ -488,6 +488,125 @@ legend {
   font-weight: 400;
 }
 
+.detailPage {
+  animation: detailEnter 220ms var(--ease) both;
+}
+
+@keyframes detailEnter {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.detailHeader {
+  padding-bottom: 22px;
+  border-bottom: 1px solid var(--line);
+  position: relative;
+}
+
+.detailHeader::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  bottom: -1px;
+  width: 56px;
+  height: 2px;
+  background: var(--warm);
+}
+
+.detailHeaderTop {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 22px;
+}
+
+.detailHeaderBody {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: wrap;
+  margin-top: 4px;
+}
+
+.detailHeader h1 {
+  margin: 10px 0 0;
+  font-family: "Raleway", sans-serif;
+  font-size: clamp(2.2rem, 3.6vw, 3rem);
+  font-weight: 800;
+  letter-spacing: -0.025em;
+  line-height: 1.02;
+  color: var(--ink);
+}
+
+.detailCaption {
+  margin: 10px 0 0;
+  max-width: 64ch;
+  color: var(--muted);
+  font-size: 1.02rem;
+  line-height: 1.5;
+}
+
+.backButton {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-pill);
+  background: var(--surface-input);
+  color: var(--ink);
+  padding: 7px 16px 7px 13px;
+  font-family: "Raleway", sans-serif;
+  font-size: 0.82rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  cursor: pointer;
+  transition: transform 140ms var(--ease), border-color 140ms var(--ease), color 140ms var(--ease), box-shadow 140ms var(--ease);
+}
+
+.backButton:hover {
+  border-color: var(--warm-deep);
+  color: var(--warm-deep);
+  transform: translateX(-2px);
+  box-shadow: var(--shadow-sm);
+}
+
+.backButton:focus-visible {
+  outline: 0;
+  border-color: var(--warm-deep);
+  box-shadow: var(--focus-ring);
+}
+
+.detailRelated {
+  gap: 20px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .detailPage {
+    animation: none;
+  }
+
+  .backButton:hover {
+    transform: none;
+  }
+}
+
+@media (max-width: 980px) {
+  .detailHeaderTop {
+    margin-bottom: 16px;
+  }
+
+  .detailHeader h1 {
+    font-size: clamp(1.8rem, 5vw, 2.2rem);
+  }
+}
+
 .metricGrid {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));

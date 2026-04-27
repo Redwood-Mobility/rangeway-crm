@@ -1,6 +1,7 @@
 import React, { FormEvent, useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
+  ArrowLeft,
   BriefcaseBusiness,
   CalendarClock,
   Check,
@@ -673,6 +674,24 @@ function ContactsView() {
     setSelected({ ...selected, activities: data.activities });
   }
 
+  if (selected) {
+    return (
+      <ContactDetail
+        contact={selected}
+        form={editForm}
+        setForm={setEditForm}
+        onSubmit={updateContact}
+        onDelete={deleteContact}
+        onBack={() => setSelectedId(null)}
+        projects={projects}
+        link={link}
+        setLink={setLink}
+        onLinkProject={linkProject}
+        onAddActivity={addContactActivity}
+      />
+    );
+  }
+
   return (
     <section className="view">
       <Header
@@ -704,7 +723,7 @@ function ContactsView() {
           {busy && <Notice>Loading stakeholders</Notice>}
           <div className="recordList">
             {filtered.map((contact) => (
-              <button key={contact.id} className={selectedId === contact.id ? "record active" : "record"} onClick={() => setSelectedId(contact.id)}>
+              <button key={contact.id} className="record" onClick={() => setSelectedId(contact.id)}>
                 <span className="recordIcon"><UserRound size={17} /></span>
                 <span className="recordBody">
                   <span className="recordEyebrow">{contact.category}</span>
@@ -717,30 +736,9 @@ function ContactsView() {
             {!busy && filtered.length === 0 && <Empty label="No stakeholders found" />}
           </div>
         </Panel>
-        <div className="stack">
-          <Panel title="New Stakeholder">
-            <ContactForm form={form} setForm={setForm} onSubmit={saveContact} buttonLabel="Add Stakeholder" />
-          </Panel>
-          {selected && (
-            <Panel title={selected.name} action={<button className="iconButton danger" title="Delete stakeholder" onClick={deleteContact}><Trash2 size={16} /></button>}>
-              <ContactForm form={editForm} setForm={setEditForm} onSubmit={updateContact} buttonLabel="Save Stakeholder" />
-              <h3>Related Locations</h3>
-              <MiniList items={(selected.projects || []).map((project) => `${project.name} · ${project.relationship || project.status}`)} empty="No related locations" />
-              <form className="inlineForm" onSubmit={linkProject}>
-                <select value={link.projectId} onChange={(event) => setLink({ ...link, projectId: event.target.value })}>
-                  <option value="">Location</option>
-                  {projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}
-                </select>
-                <input value={link.relationship} onChange={(event) => setLink({ ...link, relationship: event.target.value })} placeholder="Relationship" />
-                <button className="iconButton" title="Link location"><Link2 size={17} /></button>
-              </form>
-              <h3>Diligence</h3>
-              <DocumentList documents={selected.documents || []} />
-              <h3>Activity</h3>
-              <ActivityPanel activities={selected.activities || []} onAdd={addContactActivity} />
-            </Panel>
-          )}
-        </div>
+        <Panel title="New Stakeholder">
+          <ContactForm form={form} setForm={setForm} onSubmit={saveContact} buttonLabel="Add Stakeholder" />
+        </Panel>
       </div>
     </section>
   );
@@ -843,6 +841,24 @@ function ProjectsView() {
     setSelected({ ...selected, activities: data.activities });
   }
 
+  if (selected) {
+    return (
+      <ProjectDetail
+        project={selected}
+        form={editForm}
+        setForm={setEditForm}
+        onSubmit={updateProject}
+        onDelete={deleteProject}
+        onBack={() => setSelectedId(null)}
+        contacts={contacts}
+        link={link}
+        setLink={setLink}
+        onLinkContact={linkContact}
+        onAddActivity={addProjectActivity}
+      />
+    );
+  }
+
   return (
     <section className="view">
       <Header
@@ -878,7 +894,7 @@ function ProjectsView() {
           {busy && <Notice>Loading locations</Notice>}
           <div className="recordList">
             {filtered.map((project) => (
-              <button key={project.id} className={selectedId === project.id ? "record active" : "record"} onClick={() => setSelectedId(project.id)}>
+              <button key={project.id} className="record" onClick={() => setSelectedId(project.id)}>
                 <span className="recordIcon"><BriefcaseBusiness size={17} /></span>
                 <span className="recordBody">
                   <span className="recordEyebrow">{project.format}</span>
@@ -891,33 +907,9 @@ function ProjectsView() {
             {!busy && filtered.length === 0 && <Empty label="No location pursuits found" />}
           </div>
         </Panel>
-        <div className="stack">
-          <Panel title="New Location Pursuit">
-            <ProjectForm form={form} setForm={setForm} onSubmit={saveProject} buttonLabel="Add Location" />
-          </Panel>
-          {selected && (
-            <Panel title={selected.name} action={<button className="iconButton danger" title="Delete location" onClick={deleteProject}><Trash2 size={16} /></button>}>
-              <ProjectForm form={editForm} setForm={setEditForm} onSubmit={updateProject} buttonLabel="Save Location" />
-              {money(selected.estimatedValue) && <p className="notes">Estimated value: {money(selected.estimatedValue)}</p>}
-              <h3>Stakeholders</h3>
-              <MiniList items={(selected.contacts || []).map((contact) => `${contact.name} · ${contact.relationship || contact.category}`)} empty="No related stakeholders" />
-              <form className="inlineForm" onSubmit={linkContact}>
-                <select value={link.contactId} onChange={(event) => setLink({ ...link, contactId: event.target.value })}>
-                  <option value="">Stakeholder</option>
-                  {contacts.map((contact) => <option key={contact.id} value={contact.id}>{contact.name}</option>)}
-                </select>
-                <input value={link.relationship} onChange={(event) => setLink({ ...link, relationship: event.target.value })} placeholder="Relationship" />
-                <button className="iconButton" title="Link stakeholder"><Link2 size={17} /></button>
-              </form>
-              <h3>Next Steps</h3>
-              <TaskList tasks={selected.tasks || []} compact />
-              <h3>Diligence</h3>
-              <DocumentList documents={selected.documents || []} />
-              <h3>Activity</h3>
-              <ActivityPanel activities={selected.activities || []} onAdd={addProjectActivity} />
-            </Panel>
-          )}
-        </div>
+        <Panel title="New Location Pursuit">
+          <ProjectForm form={form} setForm={setForm} onSubmit={saveProject} buttonLabel="Add Location" />
+        </Panel>
       </div>
     </section>
   );
@@ -1162,6 +1154,201 @@ function ProjectForm({ form, setForm, onSubmit, buttonLabel }: { form: typeof em
       </fieldset>
       <button className="primaryButton wide">{buttonLabel.startsWith("Save") ? <Check size={16} /> : <Plus size={16} />} {buttonLabel}</button>
     </form>
+  );
+}
+
+function DetailHeader({
+  backLabel,
+  onBack,
+  eyebrow,
+  title,
+  caption,
+  status,
+  statusVariant,
+  onDelete
+}: {
+  backLabel: string;
+  onBack: () => void;
+  eyebrow: string;
+  title: string;
+  caption?: string;
+  status?: string;
+  statusVariant?: string;
+  onDelete?: () => void;
+}) {
+  return (
+    <header className="detailHeader">
+      <div className="detailHeaderTop">
+        <button type="button" className="backButton" onClick={onBack}>
+          <ArrowLeft size={15} /> {backLabel}
+        </button>
+        {onDelete && (
+          <button className="iconButton danger" title="Delete" onClick={onDelete}>
+            <Trash2 size={16} />
+          </button>
+        )}
+      </div>
+      <div className="detailHeaderBody">
+        <span className="eyebrow">{eyebrow}</span>
+        {status && <span className="statusPill" data-variant={statusVariant || "muted"}>{status}</span>}
+      </div>
+      <h1>{title}</h1>
+      {caption && <p className="detailCaption">{caption}</p>}
+    </header>
+  );
+}
+
+function ContactDetail({
+  contact,
+  form,
+  setForm,
+  onSubmit,
+  onDelete,
+  onBack,
+  projects,
+  link,
+  setLink,
+  onLinkProject,
+  onAddActivity
+}: {
+  contact: Contact;
+  form: typeof emptyContact;
+  setForm: (form: typeof emptyContact) => void;
+  onSubmit: (event: FormEvent) => void;
+  onDelete: () => void;
+  onBack: () => void;
+  projects: Project[];
+  link: { projectId: string; relationship: string; notes: string };
+  setLink: (link: { projectId: string; relationship: string; notes: string }) => void;
+  onLinkProject: (event: FormEvent) => void;
+  onAddActivity: (activity: { activityType: string; body: string }) => Promise<void>;
+}) {
+  useEffect(() => {
+    function handler(event: KeyboardEvent) {
+      if (event.key === "Escape") onBack();
+    }
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [onBack]);
+
+  const caption = [contact.company, contact.role, contact.location].filter(Boolean).join(" · ");
+
+  return (
+    <section className="view detailPage">
+      <DetailHeader
+        backLabel="Back to Stakeholders"
+        onBack={onBack}
+        eyebrow={contact.category}
+        title={contact.name}
+        caption={caption || undefined}
+        status={contact.stage}
+        statusVariant={statusVariantClass(contact.stage, contactStageVariant)}
+        onDelete={onDelete}
+      />
+      <Panel title="Details">
+        <ContactForm form={form} setForm={setForm} onSubmit={onSubmit} buttonLabel="Save Stakeholder" />
+      </Panel>
+      <Panel title="Related Locations">
+        <MiniList
+          items={(contact.projects || []).map((project) => `${project.name} · ${project.relationship || project.status}`)}
+          empty="No related locations"
+        />
+        <form className="inlineForm" onSubmit={onLinkProject}>
+          <select value={link.projectId} onChange={(event) => setLink({ ...link, projectId: event.target.value })}>
+            <option value="">Location</option>
+            {projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}
+          </select>
+          <input value={link.relationship} onChange={(event) => setLink({ ...link, relationship: event.target.value })} placeholder="Relationship" />
+          <button className="iconButton" title="Link location"><Link2 size={17} /></button>
+        </form>
+      </Panel>
+      <Panel title="Diligence">
+        <DocumentList documents={contact.documents || []} />
+      </Panel>
+      <Panel title="Activity">
+        <ActivityPanel activities={contact.activities || []} onAdd={onAddActivity} />
+      </Panel>
+    </section>
+  );
+}
+
+function ProjectDetail({
+  project,
+  form,
+  setForm,
+  onSubmit,
+  onDelete,
+  onBack,
+  contacts,
+  link,
+  setLink,
+  onLinkContact,
+  onAddActivity
+}: {
+  project: Project;
+  form: typeof emptyProject;
+  setForm: (form: typeof emptyProject) => void;
+  onSubmit: (event: FormEvent) => void;
+  onDelete: () => void;
+  onBack: () => void;
+  contacts: Contact[];
+  link: { contactId: string; relationship: string; notes: string };
+  setLink: (link: { contactId: string; relationship: string; notes: string }) => void;
+  onLinkContact: (event: FormEvent) => void;
+  onAddActivity: (activity: { activityType: string; body: string }) => Promise<void>;
+}) {
+  useEffect(() => {
+    function handler(event: KeyboardEvent) {
+      if (event.key === "Escape") onBack();
+    }
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [onBack]);
+
+  const caption = [project.corridor || project.location, project.siteFit].filter(Boolean).join(" · ");
+
+  return (
+    <section className="view detailPage">
+      <DetailHeader
+        backLabel="Back to Location Pursuits"
+        onBack={onBack}
+        eyebrow={project.format}
+        title={project.name}
+        caption={caption || undefined}
+        status={project.status}
+        statusVariant={statusVariantClass(project.status, projectStatusVariant)}
+        onDelete={onDelete}
+      />
+      <Panel title="Details">
+        <ProjectForm form={form} setForm={setForm} onSubmit={onSubmit} buttonLabel="Save Location" />
+        {money(project.estimatedValue) && <p className="notes">Estimated value: {money(project.estimatedValue)}</p>}
+      </Panel>
+      <div className="splitGrid detailRelated">
+        <Panel title="Stakeholders">
+          <MiniList
+            items={(project.contacts || []).map((contact) => `${contact.name} · ${contact.relationship || contact.category}`)}
+            empty="No related stakeholders"
+          />
+          <form className="inlineForm" onSubmit={onLinkContact}>
+            <select value={link.contactId} onChange={(event) => setLink({ ...link, contactId: event.target.value })}>
+              <option value="">Stakeholder</option>
+              {contacts.map((contact) => <option key={contact.id} value={contact.id}>{contact.name}</option>)}
+            </select>
+            <input value={link.relationship} onChange={(event) => setLink({ ...link, relationship: event.target.value })} placeholder="Relationship" />
+            <button className="iconButton" title="Link stakeholder"><Link2 size={17} /></button>
+          </form>
+        </Panel>
+        <Panel title="Next Steps">
+          <TaskList tasks={project.tasks || []} compact />
+        </Panel>
+      </div>
+      <Panel title="Diligence">
+        <DocumentList documents={project.documents || []} />
+      </Panel>
+      <Panel title="Activity">
+        <ActivityPanel activities={project.activities || []} onAdd={onAddActivity} />
+      </Panel>
+    </section>
   );
 }
 
