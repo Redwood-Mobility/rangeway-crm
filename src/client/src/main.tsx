@@ -10,13 +10,15 @@ import {
   Link2,
   LogOut,
   PanelsTopLeft,
+  Pencil,
   Plus,
   RefreshCw,
   Search,
   Trash2,
   Upload,
   UserRound,
-  UsersRound
+  UsersRound,
+  X as XIcon
 } from "lucide-react";
 import "./styles.css";
 
@@ -1217,7 +1219,11 @@ function DetailHeader({
   caption,
   status,
   statusVariant,
-  onDelete
+  onDelete,
+  onEdit,
+  onCancel,
+  editLabel,
+  mode
 }: {
   backLabel: string;
   onBack: () => void;
@@ -1227,6 +1233,10 @@ function DetailHeader({
   status?: string;
   statusVariant?: string;
   onDelete?: () => void;
+  onEdit?: () => void;
+  onCancel?: () => void;
+  editLabel?: string;
+  mode?: "view" | "edit";
 }) {
   return (
     <header className="detailHeader">
@@ -1234,11 +1244,23 @@ function DetailHeader({
         <button type="button" className="backButton" onClick={onBack}>
           <ArrowLeft size={15} /> {backLabel}
         </button>
-        {onDelete && (
-          <button className="iconButton danger" title="Delete" onClick={onDelete}>
-            <Trash2 size={16} />
-          </button>
-        )}
+        <div className="detailHeaderActions">
+          {mode === "edit" && onCancel && (
+            <button type="button" className="textButton" onClick={onCancel}>
+              <XIcon size={14} /> Cancel
+            </button>
+          )}
+          {mode !== "edit" && onEdit && (
+            <button type="button" className="primaryButton" onClick={onEdit}>
+              <Pencil size={15} /> {editLabel || "Edit"}
+            </button>
+          )}
+          {mode !== "edit" && onDelete && (
+            <button className="iconButton danger" title="Delete" onClick={onDelete}>
+              <Trash2 size={16} />
+            </button>
+          )}
+        </div>
       </div>
       <div className="detailHeaderBody">
         <span className="eyebrow">{eyebrow}</span>
@@ -1248,6 +1270,50 @@ function DetailHeader({
       {caption && <p className="detailCaption">{caption}</p>}
     </header>
   );
+}
+
+type DataField = { label: string; value: React.ReactNode };
+type DataSection = { heading: string; fields: DataField[] };
+
+function isEmptyValue(value: React.ReactNode) {
+  return value === null || value === undefined || value === "" || value === "Unknown";
+}
+
+function DataView({ sections, notes }: { sections: DataSection[]; notes?: string }) {
+  return (
+    <div className="dataView">
+      {sections.map((section) => {
+        const fields = section.fields.filter((field) => !isEmptyValue(field.value));
+        if (fields.length === 0) return null;
+        return (
+          <div key={section.heading} className="dataSection">
+            <h3 className="dataSectionHeading">{section.heading}</h3>
+            <div className="dataFields">
+              {fields.map((field) => (
+                <div key={field.label} className="dataField">
+                  <span className="dataLabel">{field.label}</span>
+                  <span className="dataValue">{field.value}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        );
+      })}
+      {notes && notes.trim() && (
+        <div className="dataSection">
+          <h3 className="dataSectionHeading">Notes</h3>
+          <p className="dataNotes">{notes}</p>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function formatDate(value: string) {
+  if (!value) return "";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" });
 }
 
 function ContactDetail({
@@ -1277,15 +1343,69 @@ function ContactDetail({
   onAddActivity: (activity: { activityType: string; body: string }) => Promise<void>;
   onOpenProject: (id: string) => void;
 }) {
+  const [mode, setMode] = useState<"view" | "edit">("view");
+  const [snapshot, setSnapshot] = useState(form);
+
+  useEffect(() => {
+    setMode("view");
+  }, [contact.id]);
+
   useEffect(() => {
     function handler(event: KeyboardEvent) {
-      if (event.key === "Escape") onBack();
+      if (event.key === "Escape") {
+        if (mode === "edit") {
+          setForm(snapshot);
+          setMode("view");
+        } else {
+          onBack();
+        }
+      }
     }
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [onBack]);
+  }, [onBack, mode, snapshot, setForm]);
+
+  function startEdit() {
+    setSnapshot(form);
+    setMode("edit");
+  }
+
+  function cancelEdit() {
+    setForm(snapshot);
+    setMode("view");
+  }
+
+  async function handleSubmit(event: FormEvent) {
+    await onSubmit(event);
+    setMode("view");
+  }
 
   const caption = [contact.company, contact.role, contact.location].filter(Boolean).join(" · ");
+
+  const sections: DataSection[] = [
+    {
+      heading: "Identity",
+      fields: [
+        { label: "Company", value: contact.company },
+        { label: "Role", value: contact.role }
+      ]
+    },
+    {
+      heading: "Contact",
+      fields: [
+        { label: "Email", value: contact.email ? <a href={`mailto:${contact.email}`}>{contact.email}</a> : "" },
+        { label: "Phone", value: contact.phone ? <a href={`tel:${contact.phone}`}>{contact.phone}</a> : "" },
+        { label: "Location", value: contact.location }
+      ]
+    },
+    {
+      heading: "Classification",
+      fields: [
+        { label: "Type", value: contact.category },
+        { label: "Stage", value: contact.stage }
+      ]
+    }
+  ];
 
   return (
     <section className="view detailPage">
@@ -1297,10 +1417,18 @@ function ContactDetail({
         caption={caption || undefined}
         status={contact.stage}
         statusVariant={statusVariantClass(contact.stage, contactStageVariant)}
+        mode={mode}
+        onEdit={startEdit}
+        onCancel={cancelEdit}
+        editLabel="Edit Stakeholder"
         onDelete={onDelete}
       />
       <Panel title="Details">
-        <ContactForm form={form} setForm={setForm} onSubmit={onSubmit} buttonLabel="Save Stakeholder" />
+        {mode === "edit" ? (
+          <ContactForm form={form} setForm={setForm} onSubmit={handleSubmit} buttonLabel="Save Stakeholder" />
+        ) : (
+          <DataView sections={sections} notes={contact.notes} />
+        )}
       </Panel>
       <Panel title="Related Locations">
         <RelatedRecordList
@@ -1361,15 +1489,82 @@ function ProjectDetail({
   onAddActivity: (activity: { activityType: string; body: string }) => Promise<void>;
   onOpenContact: (id: string) => void;
 }) {
+  const [mode, setMode] = useState<"view" | "edit">("view");
+  const [snapshot, setSnapshot] = useState(form);
+
+  useEffect(() => {
+    setMode("view");
+  }, [project.id]);
+
   useEffect(() => {
     function handler(event: KeyboardEvent) {
-      if (event.key === "Escape") onBack();
+      if (event.key === "Escape") {
+        if (mode === "edit") {
+          setForm(snapshot);
+          setMode("view");
+        } else {
+          onBack();
+        }
+      }
     }
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [onBack]);
+  }, [onBack, mode, snapshot, setForm]);
+
+  function startEdit() {
+    setSnapshot(form);
+    setMode("edit");
+  }
+
+  function cancelEdit() {
+    setForm(snapshot);
+    setMode("view");
+  }
+
+  async function handleSubmit(event: FormEvent) {
+    await onSubmit(event);
+    setMode("view");
+  }
 
   const caption = [project.corridor || project.location, project.siteFit].filter(Boolean).join(" · ");
+
+  const sections: DataSection[] = [
+    {
+      heading: "Site",
+      fields: [
+        { label: "Format", value: project.format },
+        { label: "Owner", value: project.owner },
+        { label: "Location", value: project.location },
+        { label: "Corridor", value: project.corridor },
+        { label: "Road Context", value: project.siteFit }
+      ]
+    },
+    {
+      heading: "Land & Utility",
+      fields: [
+        { label: "Land Status", value: project.landStatus },
+        { label: "Utility Status", value: project.utilityStatus }
+      ]
+    },
+    {
+      heading: "Power & Hospitality",
+      fields: [
+        { label: "Power Strategy", value: project.powerStrategy },
+        { label: "Hospitality Scope", value: project.hospitalityScope }
+      ]
+    },
+    {
+      heading: "Risk & Milestone",
+      fields: [
+        { label: "Phase", value: project.status },
+        { label: "Priority", value: project.priority },
+        { label: "Target Date", value: formatDate(project.targetDate) },
+        { label: "Estimated Value", value: money(project.estimatedValue) },
+        { label: "Next Milestone", value: project.nextMilestone },
+        { label: "Risk Level", value: project.riskLevel }
+      ]
+    }
+  ];
 
   return (
     <section className="view detailPage">
@@ -1381,11 +1576,18 @@ function ProjectDetail({
         caption={caption || undefined}
         status={project.status}
         statusVariant={statusVariantClass(project.status, projectStatusVariant)}
+        mode={mode}
+        onEdit={startEdit}
+        onCancel={cancelEdit}
+        editLabel="Edit Location"
         onDelete={onDelete}
       />
       <Panel title="Details">
-        <ProjectForm form={form} setForm={setForm} onSubmit={onSubmit} buttonLabel="Save Location" />
-        {money(project.estimatedValue) && <p className="notes">Estimated value: {money(project.estimatedValue)}</p>}
+        {mode === "edit" ? (
+          <ProjectForm form={form} setForm={setForm} onSubmit={handleSubmit} buttonLabel="Save Location" />
+        ) : (
+          <DataView sections={sections} notes={project.notes} />
+        )}
       </Panel>
       <div className="splitGrid detailRelated">
         <Panel title="Stakeholders">
