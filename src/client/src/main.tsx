@@ -9,7 +9,6 @@ import {
   Link2,
   LogOut,
   PanelsTopLeft,
-  Paperclip,
   Plus,
   RefreshCw,
   Search,
@@ -215,6 +214,85 @@ function fileSize(size: number) {
   return `${(size / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+const projectStatusVariant: Record<string, "sage" | "warm" | "charcoal" | "muted" | "alert"> = {
+  Scouting: "sage",
+  Outreach: "sage",
+  Discovery: "sage",
+  "Site Control": "warm",
+  "Utility Study": "warm",
+  Design: "warm",
+  Permitting: "warm",
+  "Capital Stack": "warm",
+  "Pre-Construction": "warm",
+  Construction: "charcoal",
+  Live: "charcoal",
+  Paused: "muted",
+  Closed: "muted"
+};
+
+const contactStageVariant: Record<string, "sage" | "warm" | "charcoal" | "muted" | "alert"> = {
+  New: "muted",
+  Researching: "muted",
+  "Intro Made": "warm",
+  "Active Conversation": "warm",
+  Diligence: "warm",
+  Partnered: "sage",
+  "On Hold": "muted",
+  Closed: "charcoal"
+};
+
+const activityVerb: Record<string, string> = {
+  Note: "noted",
+  Call: "called",
+  Meeting: "met",
+  Email: "emailed",
+  "Site Visit": "visited",
+  Decision: "decided",
+  Risk: "flagged",
+  Milestone: "reached"
+};
+
+function statusVariantClass(value: string, map: Record<string, string>) {
+  return map[value] || "muted";
+}
+
+function dayKey(iso: string) {
+  const date = new Date(iso);
+  return new Date(date.getFullYear(), date.getMonth(), date.getDate()).toISOString();
+}
+
+function formatDayLabel(iso: string) {
+  const date = new Date(iso);
+  const today = new Date();
+  const dayMs = 24 * 60 * 60 * 1000;
+  const diffDays = Math.round((new Date(today.getFullYear(), today.getMonth(), today.getDate()).getTime() - new Date(date.getFullYear(), date.getMonth(), date.getDate()).getTime()) / dayMs);
+  if (diffDays === 0) return "Today";
+  if (diffDays === 1) return "Yesterday";
+  return date.toLocaleDateString(undefined, { month: "short", day: "numeric" }).toUpperCase();
+}
+
+function formatActivityTime(iso: string) {
+  return new Date(iso).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+}
+
+function RangewayMark({ size = 38 }: { size?: number }) {
+  const width = Math.round((size * 96) / 112);
+  return (
+    <svg width={width} height={size} viewBox="0 0 96 112" aria-hidden="true" focusable="false">
+      <rect width="96" height="112" fill="#2D2D2D" rx="16" />
+      <path
+        d="M20 100 L20 16 C20 10 24 6 30 6 L56 6 C72 6 80 16 80 32 C80 46 72 54 58 56 L82 100"
+        stroke="#F5F1EB"
+        strokeWidth="10"
+        fill="none"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+      <circle cx="58" cy="32" r="10" fill="#F4A855" />
+    </svg>
+  );
+}
+
 function App() {
   const [user, setUser] = useState<User | null>(null);
   const [loading, setLoading] = useState(true);
@@ -283,6 +361,7 @@ function Login({ error, onLogin }: { error: string; onLogin: (email: string, pas
   const [email, setEmail] = useState("admin@rangeway.energy");
   const [password, setPassword] = useState("");
   const [busy, setBusy] = useState(false);
+  const [showPassword, setShowPassword] = useState(false);
 
   async function submit(event: FormEvent) {
     event.preventDefault();
@@ -294,26 +373,36 @@ function Login({ error, onLogin }: { error: string; onLogin: (email: string, pas
   return (
     <main className="loginPage">
       <section className="loginPanel">
-        <div className="brandMark">R</div>
-        <h1>Atlas</h1>
+        <div className="loginBrand">
+          <strong>Rangeway</strong>
+          <span>Atlas</span>
+        </div>
+        <h1>Sign in</h1>
         <a className="primaryButton googleButton" href="/api/auth/google">
-          <UserRound size={16} /> Sign in with Google
+          <UserRound size={16} /> Continue with Google
         </a>
-        <div className="loginDivider">Development fallback</div>
-        <form onSubmit={submit} className="stack">
-          <label>
-            Email
-            <input value={email} onChange={(event) => setEmail(event.target.value)} type="email" autoComplete="username" required />
-          </label>
-          <label>
-            Password
-            <input value={password} onChange={(event) => setPassword(event.target.value)} type="password" autoComplete="current-password" required />
-          </label>
-          {error && <p className="error">{error}</p>}
-          <button className="primaryButton" disabled={busy}>
-            {busy ? <RefreshCw className="spin" size={16} /> : <Check size={16} />} Sign in
+        {error && !showPassword && <p className="error" style={{ marginTop: 12 }}>{error}</p>}
+        {!showPassword && (
+          <button type="button" className="passwordToggle" onClick={() => setShowPassword(true)}>
+            Sign in with email instead
           </button>
-        </form>
+        )}
+        {showPassword && (
+          <form onSubmit={submit} className="stack" style={{ marginTop: 14 }}>
+            <label>
+              Email
+              <input value={email} onChange={(event) => setEmail(event.target.value)} type="email" autoComplete="username" required />
+            </label>
+            <label>
+              Password
+              <input value={password} onChange={(event) => setPassword(event.target.value)} type="password" autoComplete="current-password" required />
+            </label>
+            {error && <p className="error">{error}</p>}
+            <button className="primaryButton" disabled={busy}>
+              {busy ? <RefreshCw className="spin" size={16} /> : <Check size={16} />} Sign in
+            </button>
+          </form>
+        )}
       </section>
     </main>
   );
@@ -331,13 +420,11 @@ function Shell({ screen, setScreen, user, onLogout }: { screen: Screen; setScree
   return (
     <div className="appShell">
       <aside className="sidebar">
-        <div className="sidebarBrand">
-          <div className="brandMark">R</div>
-          <div>
-            <strong>Rangeway</strong>
-            <span>Atlas</span>
-          </div>
-        </div>
+        <button type="button" className="sidebarBrand" onClick={() => setScreen("dashboard")} aria-label="Go to Command Center">
+          <RangewayMark size={40} />
+          <strong>Rangeway</strong>
+          <span>Atlas</span>
+        </button>
         <nav>
           {nav.map(([id, Icon, label]) => (
             <button key={id} className={screen === id ? "active" : ""} onClick={() => setScreen(id)}>
@@ -452,12 +539,16 @@ function DashboardView() {
 
   return (
     <section className="view">
-      <Header eyebrow="Network Development" title="Rangeway command center" />
+      <Header
+        eyebrow="Network Development"
+        title="Command Center"
+        subhead="Active site pursuits, early-stage development, risk, and what's coming up next across the Rangeway network."
+      />
       <div className="metricGrid">
-        <Metric label="Site pursuits" value={dashboard.totals.projects} icon={<BriefcaseBusiness size={18} />} />
-        <Metric label="Active early-stage" value={dashboard.totals.activePursuits} icon={<PanelsTopLeft size={18} />} />
-        <Metric label="Stakeholders" value={dashboard.totals.contacts} icon={<UsersRound size={18} />} />
-        <Metric label="High-risk items" value={dashboard.totals.highRisk} icon={<Paperclip size={18} />} />
+        <Metric label="Site Pursuits" value={dashboard.totals.projects} />
+        <Metric label="Active Early-Stage" value={dashboard.totals.activePursuits} />
+        <Metric label="Stakeholders" value={dashboard.totals.contacts} />
+        <Metric label="High-Risk Items" value={dashboard.totals.highRisk} />
       </div>
       <div className="splitGrid">
         <Panel title="Development Phase">
@@ -584,7 +675,11 @@ function ContactsView() {
 
   return (
     <section className="view">
-      <Header eyebrow="Relationship Map" title="Stakeholders" />
+      <Header
+        eyebrow="Relationship Map"
+        title="Stakeholders"
+        subhead="People and organizations who can unlock, fund, power, permit, build, operate, or support a Rangeway site."
+      />
       {error && <Notice type="error">{error}</Notice>}
       <div className="twoColumn">
         <Panel
@@ -611,11 +706,12 @@ function ContactsView() {
             {filtered.map((contact) => (
               <button key={contact.id} className={selectedId === contact.id ? "record active" : "record"} onClick={() => setSelectedId(contact.id)}>
                 <span className="recordIcon"><UserRound size={17} /></span>
-                <span>
+                <span className="recordBody">
+                  <span className="recordEyebrow">{contact.category}</span>
                   <strong>{contact.name}</strong>
-                  <small>{[contact.company, contact.role].filter(Boolean).join(" · ") || contact.category}</small>
+                  <small>{[contact.company, contact.role, contact.location].filter(Boolean).join(" · ") || "—"}</small>
                 </span>
-                <em>{contact.stage}</em>
+                <span className="statusPill" data-variant={statusVariantClass(contact.stage, contactStageVariant)}>{contact.stage}</span>
               </button>
             ))}
             {!busy && filtered.length === 0 && <Empty label="No stakeholders found" />}
@@ -749,7 +845,11 @@ function ProjectsView() {
 
   return (
     <section className="view">
-      <Header eyebrow="Network Map" title="Location Pursuits" />
+      <Header
+        eyebrow="Network Map"
+        title="Location Pursuits"
+        subhead="Prospective sites and corridors — format fit, development phase, land, utility, power, and risk."
+      />
       {error && <Notice type="error">{error}</Notice>}
       <div className="twoColumn">
         <Panel
@@ -780,11 +880,12 @@ function ProjectsView() {
             {filtered.map((project) => (
               <button key={project.id} className={selectedId === project.id ? "record active" : "record"} onClick={() => setSelectedId(project.id)}>
                 <span className="recordIcon"><BriefcaseBusiness size={17} /></span>
-                <span>
+                <span className="recordBody">
+                  <span className="recordEyebrow">{project.format}</span>
                   <strong>{project.name}</strong>
-                  <small>{[project.format, project.corridor || project.location, project.siteFit].filter(Boolean).join(" · ")}</small>
+                  <small>{[project.corridor || project.location, project.siteFit].filter(Boolean).join(" · ") || "—"}</small>
                 </span>
-                <em>{project.status}</em>
+                <span className="statusPill" data-variant={statusVariantClass(project.status, projectStatusVariant)}>{project.status}</span>
               </button>
             ))}
             {!busy && filtered.length === 0 && <Empty label="No location pursuits found" />}
@@ -861,7 +962,11 @@ function DocumentsView() {
 
   return (
     <section className="view">
-      <Header eyebrow="Diligence Room" title="Documents" />
+      <Header
+        eyebrow="Diligence Room"
+        title="Documents"
+        subhead="Controlled storage for site, land, utility, design, permitting, capital, partner, and operations files."
+      />
       {error && <Notice type="error">{error}</Notice>}
       <div className="twoColumn">
         <Panel title="Upload">
@@ -929,7 +1034,11 @@ function TasksView({ user }: { user: User }) {
 
   return (
     <section className="view">
-      <Header eyebrow="Follow Through" title="Next Steps" />
+      <Header
+        eyebrow="Follow Through"
+        title="Next Steps"
+        subhead="Practical follow-through — introductions, LOIs, utility screens, partner reviews, permitting items, and internal action items."
+      />
       {error && <Notice type="error">{error}</Notice>}
       <div className="twoColumn">
         <Panel title="New Next Step">
@@ -1021,34 +1130,47 @@ function ContactForm({ form, setForm, onSubmit, buttonLabel }: { form: typeof em
 
 function ProjectForm({ form, setForm, onSubmit, buttonLabel }: { form: typeof emptyProject; setForm: (form: typeof emptyProject) => void; onSubmit: (event: FormEvent) => void; buttonLabel: string }) {
   return (
-    <form className="formGrid" onSubmit={onSubmit}>
-      <label className="wide">Location or Corridor Name<input value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} required /></label>
-      <label>Format Fit<select value={form.format} onChange={(event) => setForm({ ...form, format: event.target.value })}>{formats.map((option) => <option key={option}>{option}</option>)}</select></label>
-      <label>Development Phase<select value={form.status} onChange={(event) => setForm({ ...form, status: event.target.value })}>{locationStatuses.map((option) => <option key={option}>{option}</option>)}</select></label>
-      <label>Priority<select value={form.priority} onChange={(event) => setForm({ ...form, priority: event.target.value })}>{["Low", "Medium", "High", "Critical"].map((option) => <option key={option}>{option}</option>)}</select></label>
-      <label>Owner<input value={form.owner} onChange={(event) => setForm({ ...form, owner: event.target.value })} /></label>
-      <label>Location<input value={form.location} onChange={(event) => setForm({ ...form, location: event.target.value })} /></label>
-      <label>Corridor<input value={form.corridor} onChange={(event) => setForm({ ...form, corridor: event.target.value })} placeholder="I-15, Highway 101, etc." /></label>
-      <label>Road Context<select value={form.siteFit} onChange={(event) => setForm({ ...form, siteFit: event.target.value })}>{siteFits.map((option) => <option key={option}>{option}</option>)}</select></label>
-      <label>Land Status<select value={form.landStatus} onChange={(event) => setForm({ ...form, landStatus: event.target.value })}>{landStatuses.map((option) => <option key={option}>{option}</option>)}</select></label>
-      <label>Utility Status<select value={form.utilityStatus} onChange={(event) => setForm({ ...form, utilityStatus: event.target.value })}>{utilityStatuses.map((option) => <option key={option}>{option}</option>)}</select></label>
-      <label>Power Strategy<select value={form.powerStrategy} onChange={(event) => setForm({ ...form, powerStrategy: event.target.value })}>{powerStrategies.map((option) => <option key={option}>{option}</option>)}</select></label>
-      <label>Hospitality Scope<select value={form.hospitalityScope} onChange={(event) => setForm({ ...form, hospitalityScope: event.target.value })}>{hospitalityScopes.map((option) => <option key={option}>{option}</option>)}</select></label>
-      <label>Target<input type="date" value={form.targetDate} onChange={(event) => setForm({ ...form, targetDate: event.target.value })} /></label>
-      <label>Value<input type="number" min="0" value={form.estimatedValue || ""} onChange={(event) => setForm({ ...form, estimatedValue: event.target.value ? Number(event.target.value) : null })} /></label>
-      <label>Next Milestone<input value={form.nextMilestone} onChange={(event) => setForm({ ...form, nextMilestone: event.target.value })} placeholder="Owner intro, utility screen, LOI review" /></label>
-      <label>Risk Level<select value={form.riskLevel} onChange={(event) => setForm({ ...form, riskLevel: event.target.value })}>{riskLevels.map((option) => <option key={option}>{option}</option>)}</select></label>
-      <label className="wide">Notes<textarea value={form.notes} onChange={(event) => setForm({ ...form, notes: event.target.value })} rows={3} /></label>
+    <form onSubmit={onSubmit}>
+      <fieldset className="formGrid">
+        <legend>Site</legend>
+        <label className="wide">Location or Corridor Name<input value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} required /></label>
+        <label>Format Fit<select value={form.format} onChange={(event) => setForm({ ...form, format: event.target.value })}>{formats.map((option) => <option key={option}>{option}</option>)}</select></label>
+        <label>Owner<input value={form.owner} onChange={(event) => setForm({ ...form, owner: event.target.value })} /></label>
+        <label>Location<input value={form.location} onChange={(event) => setForm({ ...form, location: event.target.value })} /></label>
+        <label>Corridor<input value={form.corridor} onChange={(event) => setForm({ ...form, corridor: event.target.value })} placeholder="I-15, Highway 101, etc." /></label>
+        <label className="wide">Road Context<select value={form.siteFit} onChange={(event) => setForm({ ...form, siteFit: event.target.value })}>{siteFits.map((option) => <option key={option}>{option}</option>)}</select></label>
+      </fieldset>
+      <fieldset className="formGrid">
+        <legend>Land &amp; Utility</legend>
+        <label>Land Status<select value={form.landStatus} onChange={(event) => setForm({ ...form, landStatus: event.target.value })}>{landStatuses.map((option) => <option key={option}>{option}</option>)}</select></label>
+        <label>Utility Status<select value={form.utilityStatus} onChange={(event) => setForm({ ...form, utilityStatus: event.target.value })}>{utilityStatuses.map((option) => <option key={option}>{option}</option>)}</select></label>
+      </fieldset>
+      <fieldset className="formGrid">
+        <legend>Power &amp; Hospitality</legend>
+        <label>Power Strategy<select value={form.powerStrategy} onChange={(event) => setForm({ ...form, powerStrategy: event.target.value })}>{powerStrategies.map((option) => <option key={option}>{option}</option>)}</select></label>
+        <label>Hospitality Scope<select value={form.hospitalityScope} onChange={(event) => setForm({ ...form, hospitalityScope: event.target.value })}>{hospitalityScopes.map((option) => <option key={option}>{option}</option>)}</select></label>
+      </fieldset>
+      <fieldset className="formGrid">
+        <legend>Risk &amp; Milestone</legend>
+        <label>Development Phase<select value={form.status} onChange={(event) => setForm({ ...form, status: event.target.value })}>{locationStatuses.map((option) => <option key={option}>{option}</option>)}</select></label>
+        <label>Priority<select value={form.priority} onChange={(event) => setForm({ ...form, priority: event.target.value })}>{["Low", "Medium", "High", "Critical"].map((option) => <option key={option}>{option}</option>)}</select></label>
+        <label>Target<input type="date" value={form.targetDate} onChange={(event) => setForm({ ...form, targetDate: event.target.value })} /></label>
+        <label>Value<input type="number" min="0" value={form.estimatedValue || ""} onChange={(event) => setForm({ ...form, estimatedValue: event.target.value ? Number(event.target.value) : null })} /></label>
+        <label>Next Milestone<input value={form.nextMilestone} onChange={(event) => setForm({ ...form, nextMilestone: event.target.value })} placeholder="Owner intro, utility screen, LOI review" /></label>
+        <label>Risk Level<select value={form.riskLevel} onChange={(event) => setForm({ ...form, riskLevel: event.target.value })}>{riskLevels.map((option) => <option key={option}>{option}</option>)}</select></label>
+        <label className="wide">Notes<textarea value={form.notes} onChange={(event) => setForm({ ...form, notes: event.target.value })} rows={3} /></label>
+      </fieldset>
       <button className="primaryButton wide">{buttonLabel.startsWith("Save") ? <Check size={16} /> : <Plus size={16} />} {buttonLabel}</button>
     </form>
   );
 }
 
-function Header({ eyebrow, title }: { eyebrow: string; title: string }) {
+function Header({ eyebrow, title, subhead }: { eyebrow: string; title: string; subhead?: string }) {
   return (
     <header className="viewHeader">
       <span>{eyebrow}</span>
       <h1>{title}</h1>
+      {subhead && <p className="viewSubhead">{subhead}</p>}
     </header>
   );
 }
@@ -1065,12 +1187,11 @@ function Panel({ title, action, children }: { title: string; action?: React.Reac
   );
 }
 
-function Metric({ label, value, icon }: { label: string; value: number; icon: React.ReactNode }) {
+function Metric({ label, value }: { label: string; value: number }) {
   return (
     <div className="metric">
-      {icon}
-      <span>{label}</span>
       <strong>{value}</strong>
+      <span>{label}</span>
     </div>
   );
 }
@@ -1127,6 +1248,17 @@ function ActivityPanel({ activities, onAdd }: { activities: Activity[]; onAdd: (
     setBusy(false);
   }
 
+  const grouped = useMemo(() => {
+    const buckets = new Map<string, Activity[]>();
+    for (const activity of activities) {
+      const key = dayKey(activity.createdAt);
+      const list = buckets.get(key) || [];
+      list.push(activity);
+      buckets.set(key, list);
+    }
+    return Array.from(buckets.entries()).map(([key, items]) => ({ key, items }));
+  }, [activities]);
+
   return (
     <div className="activityPanel">
       <form className="activityForm" onSubmit={submit}>
@@ -1137,15 +1269,25 @@ function ActivityPanel({ activities, onAdd }: { activities: Activity[]; onAdd: (
         <button className="primaryButton" disabled={busy || !body.trim()}><Plus size={16} /> Add Activity</button>
       </form>
       <div className="activityList">
-        {activities.length === 0 && <Empty label="No activity yet" />}
-        {activities.map((activity) => (
-          <article key={activity.id} className="activityItem">
-            <div>
-              <strong>{activity.activityType}</strong>
-              <small>{[activity.createdByName || activity.createdByEmail, new Date(activity.createdAt).toLocaleString()].filter(Boolean).join(" · ")}</small>
+        {grouped.length === 0 && <Empty label="No activity yet" />}
+        {grouped.map((day) => (
+          <div key={day.key} className="activityDay">
+            <div className="activityDayLabel">{formatDayLabel(day.key)}</div>
+            <div className="activityDayItems">
+              {day.items.map((activity) => {
+                const verb = activityVerb[activity.activityType] || activity.activityType.toLowerCase();
+                const who = activity.createdByName || activity.createdByEmail || "Someone";
+                return (
+                  <article key={activity.id} className="activityItem">
+                    <div className="activityMeta">
+                      {who} <em>{verb}</em> · {formatActivityTime(activity.createdAt)}
+                    </div>
+                    <p>{activity.body}</p>
+                  </article>
+                );
+              })}
             </div>
-            <p>{activity.body}</p>
-          </article>
+          </div>
         ))}
       </div>
     </div>
