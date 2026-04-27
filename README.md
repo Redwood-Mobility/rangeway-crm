@@ -139,17 +139,17 @@ docker compose logs -f crm
 
 ## Backups
 
-The important production data lives in Docker volumes:
+The important production data lives in Docker volumes. Compose names them after the project, which is the directory name on the server (`/opt/atlas`):
 
-- `rangeway-crm_crm-data`
-- `rangeway-crm_crm-uploads`
+- `atlas_crm-data`
+- `atlas_crm-uploads`
 
 For a simple server-side backup:
 
 ```bash
-mkdir -p ~/rangeway-crm-backups
-docker run --rm -v rangeway-crm_crm-data:/data -v "$HOME/rangeway-crm-backups:/backup" alpine tar czf /backup/crm-data-$(date +%F).tgz -C /data .
-docker run --rm -v rangeway-crm_crm-uploads:/uploads -v "$HOME/rangeway-crm-backups:/backup" alpine tar czf /backup/crm-uploads-$(date +%F).tgz -C /uploads .
+mkdir -p ~/atlas-backups
+docker run --rm -v atlas_crm-data:/data -v "$HOME/atlas-backups:/backup" alpine tar czf /backup/crm-data-$(date +%F).tgz -C /data .
+docker run --rm -v atlas_crm-uploads:/uploads -v "$HOME/atlas-backups:/backup" alpine tar czf /backup/crm-uploads-$(date +%F).tgz -C /uploads .
 ```
 
 ## Hostinger API Notes
