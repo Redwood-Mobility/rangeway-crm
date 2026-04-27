@@ -298,7 +298,15 @@ function App() {
   const [user, setUser] = useState<User | null>(null);
   const [loading, setLoading] = useState(true);
   const [screen, setScreen] = useState<Screen>("dashboard");
+  const [contactSelectedId, setContactSelectedId] = useState<string | null>(null);
+  const [projectSelectedId, setProjectSelectedId] = useState<string | null>(null);
   const [error, setError] = useState("");
+
+  function navigate(target: Screen, recordId?: string | null) {
+    if (target === "contacts") setContactSelectedId(recordId ?? null);
+    else if (target === "projects") setProjectSelectedId(recordId ?? null);
+    setScreen(target);
+  }
 
   useEffect(() => {
     let cancelled = false;
@@ -348,7 +356,9 @@ function App() {
   return (
     <Shell
       screen={screen}
-      setScreen={setScreen}
+      navigate={navigate}
+      contactSelectedId={contactSelectedId}
+      projectSelectedId={projectSelectedId}
       user={user}
       onLogout={async () => {
         await api("/api/logout", { method: "POST" });
@@ -409,7 +419,21 @@ function Login({ error, onLogin }: { error: string; onLogin: (email: string, pas
   );
 }
 
-function Shell({ screen, setScreen, user, onLogout }: { screen: Screen; setScreen: (screen: Screen) => void; user: User; onLogout: () => void }) {
+function Shell({
+  screen,
+  navigate,
+  contactSelectedId,
+  projectSelectedId,
+  user,
+  onLogout
+}: {
+  screen: Screen;
+  navigate: (screen: Screen, recordId?: string | null) => void;
+  contactSelectedId: string | null;
+  projectSelectedId: string | null;
+  user: User;
+  onLogout: () => void;
+}) {
   const nav = [
     ["dashboard", PanelsTopLeft, "Dashboard"],
     ["contacts", UsersRound, "Stakeholders"],
@@ -421,14 +445,14 @@ function Shell({ screen, setScreen, user, onLogout }: { screen: Screen; setScree
   return (
     <div className="appShell">
       <aside className="sidebar">
-        <button type="button" className="sidebarBrand" onClick={() => setScreen("dashboard")} aria-label="Go to Command Center">
+        <button type="button" className="sidebarBrand" onClick={() => navigate("dashboard")} aria-label="Go to Command Center">
           <RangewayMark size={40} />
           <strong>Rangeway</strong>
           <span>Atlas</span>
         </button>
         <nav>
           {nav.map(([id, Icon, label]) => (
-            <button key={id} className={screen === id ? "active" : ""} onClick={() => setScreen(id)}>
+            <button key={id} className={screen === id ? "active" : ""} onClick={() => navigate(id)}>
               <Icon size={18} /> {label}
             </button>
           ))}
@@ -442,8 +466,20 @@ function Shell({ screen, setScreen, user, onLogout }: { screen: Screen; setScree
       </aside>
       <main className="workspace">
         {screen === "dashboard" && <DashboardView />}
-        {screen === "contacts" && <ContactsView />}
-        {screen === "projects" && <ProjectsView />}
+        {screen === "contacts" && (
+          <ContactsView
+            selectedId={contactSelectedId}
+            onSelect={(id) => navigate("contacts", id)}
+            navigate={navigate}
+          />
+        )}
+        {screen === "projects" && (
+          <ProjectsView
+            selectedId={projectSelectedId}
+            onSelect={(id) => navigate("projects", id)}
+            navigate={navigate}
+          />
+        )}
         {screen === "documents" && <DocumentsView />}
         {screen === "tasks" && <TasksView user={user} />}
       </main>
@@ -587,12 +623,19 @@ function DashboardView() {
   );
 }
 
-function ContactsView() {
+function ContactsView({
+  selectedId,
+  onSelect,
+  navigate
+}: {
+  selectedId: string | null;
+  onSelect: (id: string | null) => void;
+  navigate: (screen: Screen, recordId?: string | null) => void;
+}) {
   const { contacts, projects, busy, error, refresh } = useCrmData();
   const [query, setQuery] = useState("");
   const [stageFilter, setStageFilter] = useState("");
   const [categoryFilter, setCategoryFilter] = useState("");
-  const [selectedId, setSelectedId] = useState<string | null>(null);
   const [selected, setSelected] = useState<Contact | null>(null);
   const [form, setForm] = useState(emptyContact);
   const [editForm, setEditForm] = useState(emptyContact);
@@ -653,7 +696,7 @@ function ContactsView() {
     if (!selected) return;
     if (!window.confirm(`Delete stakeholder "${selected.name}"? This permanently removes their record, links, and activity history.`)) return;
     await api(`/api/contacts/${selected.id}`, { method: "DELETE" });
-    setSelectedId(null);
+    onSelect(null);
     setSelected(null);
     await refresh();
   }
@@ -682,12 +725,13 @@ function ContactsView() {
         setForm={setEditForm}
         onSubmit={updateContact}
         onDelete={deleteContact}
-        onBack={() => setSelectedId(null)}
+        onBack={() => onSelect(null)}
         projects={projects}
         link={link}
         setLink={setLink}
         onLinkProject={linkProject}
         onAddActivity={addContactActivity}
+        onOpenProject={(id) => navigate("projects", id)}
       />
     );
   }
@@ -723,7 +767,7 @@ function ContactsView() {
           {busy && <Notice>Loading stakeholders</Notice>}
           <div className="recordList">
             {filtered.map((contact) => (
-              <button key={contact.id} className="record" onClick={() => setSelectedId(contact.id)}>
+              <button key={contact.id} className="record" onClick={() => onSelect(contact.id)}>
                 <span className="recordIcon"><UserRound size={17} /></span>
                 <span className="recordBody">
                   <span className="recordEyebrow">{contact.category}</span>
@@ -744,13 +788,20 @@ function ContactsView() {
   );
 }
 
-function ProjectsView() {
+function ProjectsView({
+  selectedId,
+  onSelect,
+  navigate
+}: {
+  selectedId: string | null;
+  onSelect: (id: string | null) => void;
+  navigate: (screen: Screen, recordId?: string | null) => void;
+}) {
   const { contacts, projects, busy, error, refresh } = useCrmData();
   const [query, setQuery] = useState("");
   const [statusFilter, setStatusFilter] = useState("");
   const [formatFilter, setFormatFilter] = useState("");
   const [riskFilter, setRiskFilter] = useState("");
-  const [selectedId, setSelectedId] = useState<string | null>(null);
   const [selected, setSelected] = useState<Project | null>(null);
   const [form, setForm] = useState(emptyProject);
   const [editForm, setEditForm] = useState(emptyProject);
@@ -820,7 +871,7 @@ function ProjectsView() {
     if (!selected) return;
     if (!window.confirm(`Delete location pursuit "${selected.name}"? This permanently removes the project, links, and activity history.`)) return;
     await api(`/api/projects/${selected.id}`, { method: "DELETE" });
-    setSelectedId(null);
+    onSelect(null);
     setSelected(null);
     await refresh();
   }
@@ -849,12 +900,13 @@ function ProjectsView() {
         setForm={setEditForm}
         onSubmit={updateProject}
         onDelete={deleteProject}
-        onBack={() => setSelectedId(null)}
+        onBack={() => onSelect(null)}
         contacts={contacts}
         link={link}
         setLink={setLink}
         onLinkContact={linkContact}
         onAddActivity={addProjectActivity}
+        onOpenContact={(id) => navigate("contacts", id)}
       />
     );
   }
@@ -894,7 +946,7 @@ function ProjectsView() {
           {busy && <Notice>Loading locations</Notice>}
           <div className="recordList">
             {filtered.map((project) => (
-              <button key={project.id} className="record" onClick={() => setSelectedId(project.id)}>
+              <button key={project.id} className="record" onClick={() => onSelect(project.id)}>
                 <span className="recordIcon"><BriefcaseBusiness size={17} /></span>
                 <span className="recordBody">
                   <span className="recordEyebrow">{project.format}</span>
@@ -1209,7 +1261,8 @@ function ContactDetail({
   link,
   setLink,
   onLinkProject,
-  onAddActivity
+  onAddActivity,
+  onOpenProject
 }: {
   contact: Contact;
   form: typeof emptyContact;
@@ -1222,6 +1275,7 @@ function ContactDetail({
   setLink: (link: { projectId: string; relationship: string; notes: string }) => void;
   onLinkProject: (event: FormEvent) => void;
   onAddActivity: (activity: { activityType: string; body: string }) => Promise<void>;
+  onOpenProject: (id: string) => void;
 }) {
   useEffect(() => {
     function handler(event: KeyboardEvent) {
@@ -1249,9 +1303,17 @@ function ContactDetail({
         <ContactForm form={form} setForm={setForm} onSubmit={onSubmit} buttonLabel="Save Stakeholder" />
       </Panel>
       <Panel title="Related Locations">
-        <MiniList
-          items={(contact.projects || []).map((project) => `${project.name} · ${project.relationship || project.status}`)}
+        <RelatedRecordList
+          items={(contact.projects || []).map((project) => ({
+            id: project.id,
+            name: project.name,
+            eyebrow: project.relationship || undefined,
+            caption: [project.format, project.corridor || project.location].filter(Boolean).join(" · ") || undefined,
+            status: project.status,
+            statusVariant: statusVariantClass(project.status, projectStatusVariant)
+          }))}
           empty="No related locations"
+          onOpen={onOpenProject}
         />
         <form className="inlineForm" onSubmit={onLinkProject}>
           <select value={link.projectId} onChange={(event) => setLink({ ...link, projectId: event.target.value })}>
@@ -1283,7 +1345,8 @@ function ProjectDetail({
   link,
   setLink,
   onLinkContact,
-  onAddActivity
+  onAddActivity,
+  onOpenContact
 }: {
   project: Project;
   form: typeof emptyProject;
@@ -1296,6 +1359,7 @@ function ProjectDetail({
   setLink: (link: { contactId: string; relationship: string; notes: string }) => void;
   onLinkContact: (event: FormEvent) => void;
   onAddActivity: (activity: { activityType: string; body: string }) => Promise<void>;
+  onOpenContact: (id: string) => void;
 }) {
   useEffect(() => {
     function handler(event: KeyboardEvent) {
@@ -1325,9 +1389,17 @@ function ProjectDetail({
       </Panel>
       <div className="splitGrid detailRelated">
         <Panel title="Stakeholders">
-          <MiniList
-            items={(project.contacts || []).map((contact) => `${contact.name} · ${contact.relationship || contact.category}`)}
+          <RelatedRecordList
+            items={(project.contacts || []).map((contact) => ({
+              id: contact.id,
+              name: contact.name,
+              eyebrow: contact.relationship || undefined,
+              caption: [contact.category, contact.company, contact.role].filter(Boolean).join(" · ") || undefined,
+              status: contact.stage,
+              statusVariant: statusVariantClass(contact.stage, contactStageVariant)
+            }))}
             empty="No related stakeholders"
+            onOpen={onOpenContact}
           />
           <form className="inlineForm" onSubmit={onLinkContact}>
             <select value={link.contactId} onChange={(event) => setLink({ ...link, contactId: event.target.value })}>
@@ -1484,6 +1556,36 @@ function ActivityPanel({ activities, onAdd }: { activities: Activity[]; onAdd: (
 function MiniList({ items, empty }: { items: string[]; empty: string }) {
   if (items.length === 0) return <Empty label={empty} />;
   return <ul className="miniList">{items.map((item) => <li key={item}>{item}</li>)}</ul>;
+}
+
+type RelatedRow = {
+  id: string;
+  name: string;
+  eyebrow?: string;
+  caption?: string;
+  status?: string;
+  statusVariant?: string;
+};
+
+function RelatedRecordList({ items, empty, onOpen }: { items: RelatedRow[]; empty: string; onOpen: (id: string) => void }) {
+  if (items.length === 0) return <Empty label={empty} />;
+  return (
+    <div className="relatedList">
+      {items.map((row) => (
+        <button key={row.id} type="button" className="relatedRow" onClick={() => onOpen(row.id)}>
+          <span className="relatedBody">
+            {row.eyebrow && <span className="relatedEyebrow">{row.eyebrow}</span>}
+            <strong>{row.name}</strong>
+            {row.caption && <small>{row.caption}</small>}
+          </span>
+          {row.status && (
+            <span className="statusPill" data-variant={row.statusVariant || "muted"}>{row.status}</span>
+          )}
+          <span className="relatedChevron" aria-hidden="true">→</span>
+        </button>
+      ))}
+    </div>
+  );
 }
 
 function DocumentList({ documents, onDelete }: { documents: DocumentRecord[]; onDelete?: (id: string) => void }) {

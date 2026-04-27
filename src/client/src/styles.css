@@ -587,6 +587,105 @@ legend {
   gap: 20px;
 }
 
+.relatedList {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.relatedRow {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--surface-record);
+  padding: 12px 14px;
+  text-align: left;
+  cursor: pointer;
+  font: inherit;
+  color: inherit;
+  transition: transform 140ms var(--ease), border-color 140ms var(--ease), box-shadow 140ms var(--ease), background 140ms var(--ease);
+}
+
+.relatedRow:hover {
+  transform: translateY(-1px);
+  border-color: rgba(244, 168, 85, 0.55);
+  background: var(--surface-strong);
+  box-shadow: var(--shadow-sm);
+}
+
+.relatedRow:focus-visible {
+  outline: 0;
+  border-color: var(--warm);
+  box-shadow: var(--focus-ring);
+}
+
+.relatedBody {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.relatedEyebrow {
+  font-family: "Raleway", sans-serif;
+  font-size: 0.66rem;
+  font-weight: 700;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  color: var(--warm-deep);
+}
+
+.relatedRow strong {
+  display: block;
+  font-family: "Raleway", sans-serif;
+  font-size: 1rem;
+  font-weight: 700;
+  letter-spacing: -0.005em;
+  color: var(--ink);
+  line-height: 1.2;
+  overflow-wrap: anywhere;
+}
+
+.relatedRow small {
+  display: block;
+  color: var(--muted);
+  font-size: 0.84rem;
+  line-height: 1.35;
+}
+
+.relatedChevron {
+  color: var(--muted);
+  font-family: "Raleway", sans-serif;
+  font-weight: 700;
+  font-size: 1.05rem;
+  transition: color 140ms var(--ease), transform 140ms var(--ease);
+}
+
+.relatedRow:hover .relatedChevron {
+  color: var(--warm-deep);
+  transform: translateX(2px);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .relatedRow:hover {
+    transform: none;
+  }
+  .relatedRow:hover .relatedChevron {
+    transform: none;
+  }
+}
+
+@media (max-width: 620px) {
+  .relatedRow {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+  .relatedChevron {
+    display: none;
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   .detailPage {
     animation: none;
