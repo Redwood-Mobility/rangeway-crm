@@ -1,4 +1,11 @@
 {$CRM_DOMAIN} {
   encode gzip zstd
+  header {
+    Strict-Transport-Security "max-age=31536000; includeSubDomains"
+    X-Frame-Options "DENY"
+    X-Content-Type-Options "nosniff"
+    Referrer-Policy "strict-origin-when-cross-origin"
+    -Server
+  }
   reverse_proxy crm:8080
 }

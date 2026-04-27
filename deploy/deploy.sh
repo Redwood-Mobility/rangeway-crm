@@ -27,7 +27,6 @@ if [[ ! -f "${ENV_FILE}" ]]; then
 fi
 
 npm run typecheck
-npm run build
 
 ssh "${SSH_OPTS[@]}" "${REMOTE_USER}@${REMOTE_HOST}" "mkdir -p '${REMOTE_DIR}'"
 

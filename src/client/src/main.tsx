@@ -180,6 +180,14 @@ const emptyTask = {
   notes: ""
 };
 
+class ApiError extends Error {
+  status: number;
+  constructor(message: string, status: number) {
+    super(message);
+    this.status = status;
+  }
+}
+
 async function api<T>(path: string, options: RequestInit = {}) {
   const response = await fetch(path, {
     credentials: "include",
@@ -188,7 +196,12 @@ async function api<T>(path: string, options: RequestInit = {}) {
   });
   const text = await response.text();
   const data = text ? (JSON.parse(text) as T & { error?: string }) : ({} as T & { error?: string });
-  if (!response.ok) throw new Error(data.error || "Request failed");
+  if (!response.ok) {
+    if (response.status === 401 && path !== "/api/me" && path !== "/api/login") {
+      window.dispatchEvent(new CustomEvent("atlas:unauthorized"));
+    }
+    throw new ApiError(data.error || "Request failed", response.status);
+  }
   return data;
 }
 
@@ -209,10 +222,29 @@ function App() {
   const [error, setError] = useState("");
 
   useEffect(() => {
+    let cancelled = false;
     api<{ user: User | null }>("/api/me")
-      .then((data) => setUser(data.user))
-      .catch(() => setUser(null))
-      .finally(() => setLoading(false));
+      .then((data) => {
+        if (!cancelled) setUser(data.user);
+      })
+      .catch(() => {
+        if (!cancelled) setUser(null);
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    function handleUnauthorized() {
+      setUser(null);
+      setError("Your session has expired. Please sign in again.");
+    }
+    window.addEventListener("atlas:unauthorized", handleUnauthorized);
+    return () => window.removeEventListener("atlas:unauthorized", handleUnauthorized);
   }, []);
 
   if (loading) return <div className="boot">Atlas</div>;
@@ -364,7 +396,34 @@ function useCrmData() {
   }
 
   useEffect(() => {
-    void refresh();
+    let cancelled = false;
+    setBusy(true);
+    setError("");
+    Promise.all([
+      api<{ contacts: Contact[] }>("/api/contacts"),
+      api<{ projects: Project[] }>("/api/projects"),
+      api<{ tasks: Task[] }>("/api/tasks"),
+      api<{ documents: DocumentRecord[] }>("/api/documents"),
+      api<{ users: User[] }>("/api/users")
+    ])
+      .then(([contactData, projectData, taskData, documentData, userData]) => {
+        if (cancelled) return;
+        setContacts(contactData.contacts);
+        setProjects(projectData.projects);
+        setTasks(taskData.tasks);
+        setDocuments(documentData.documents);
+        setUsers(userData.users);
+      })
+      .catch((loadError) => {
+        if (cancelled) return;
+        setError(loadError instanceof Error ? loadError.message : "Unable to load Atlas data");
+      })
+      .finally(() => {
+        if (!cancelled) setBusy(false);
+      });
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   return { contacts, projects, tasks, documents, users, busy, error, refresh };
@@ -375,9 +434,17 @@ function DashboardView() {
   const [error, setError] = useState("");
 
   useEffect(() => {
+    let cancelled = false;
     api<Dashboard>("/api/dashboard")
-      .then((data) => setDashboard(data))
-      .catch((loadError) => setError(loadError instanceof Error ? loadError.message : "Unable to load dashboard"));
+      .then((data) => {
+        if (!cancelled) setDashboard(data);
+      })
+      .catch((loadError) => {
+        if (!cancelled) setError(loadError instanceof Error ? loadError.message : "Unable to load dashboard");
+      });
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   if (error) return <Notice type="error">{error}</Notice>;
@@ -454,7 +521,9 @@ function ContactsView() {
       setSelected(null);
       return;
     }
+    let cancelled = false;
     api<{ contact: Contact }>(`/api/contacts/${selectedId}`).then((data) => {
+      if (cancelled) return;
       setSelected(data.contact);
       setEditForm({
         name: data.contact.name,
@@ -468,6 +537,9 @@ function ContactsView() {
         notes: data.contact.notes
       });
     });
+    return () => {
+      cancelled = true;
+    };
   }, [selectedId, contacts]);
 
   async function saveContact(event: FormEvent) {
@@ -487,6 +559,7 @@ function ContactsView() {
 
   async function deleteContact() {
     if (!selected) return;
+    if (!window.confirm(`Delete stakeholder "${selected.name}"? This permanently removes their record, links, and activity history.`)) return;
     await api(`/api/contacts/${selected.id}`, { method: "DELETE" });
     setSelectedId(null);
     setSelected(null);
@@ -605,7 +678,9 @@ function ProjectsView() {
       setSelected(null);
       return;
     }
+    let cancelled = false;
     api<{ project: Project }>(`/api/projects/${selectedId}`).then((data) => {
+      if (cancelled) return;
       setSelected(data.project);
       setEditForm({
         name: data.project.name,
@@ -627,6 +702,9 @@ function ProjectsView() {
         notes: data.project.notes
       });
     });
+    return () => {
+      cancelled = true;
+    };
   }, [selectedId, projects]);
 
   async function saveProject(event: FormEvent) {
@@ -646,6 +724,7 @@ function ProjectsView() {
 
   async function deleteProject() {
     if (!selected) return;
+    if (!window.confirm(`Delete location pursuit "${selected.name}"? This permanently removes the project, links, and activity history.`)) return;
     await api(`/api/projects/${selected.id}`, { method: "DELETE" });
     setSelectedId(null);
     setSelected(null);
@@ -773,6 +852,9 @@ function DocumentsView() {
   }
 
   async function deleteDocument(id: string) {
+    const target = documents.find((doc) => doc.id === id);
+    const name = target?.originalName ? `"${target.originalName}"` : "this diligence document";
+    if (!window.confirm(`Delete ${name}? The file is removed from disk and cannot be recovered.`)) return;
     await api(`/api/documents/${id}`, { method: "DELETE" });
     await refresh();
   }
@@ -838,6 +920,9 @@ function TasksView({ user }: { user: User }) {
   }
 
   async function deleteTask(id: string) {
+    const target = tasks.find((task) => task.id === id);
+    const title = target?.title ? `"${target.title}"` : "this next step";
+    if (!window.confirm(`Delete ${title}?`)) return;
     await api(`/api/tasks/${id}`, { method: "DELETE" });
     await refresh();
   }

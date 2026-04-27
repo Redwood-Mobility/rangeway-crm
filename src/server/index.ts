@@ -6,6 +6,7 @@ import cors from "cors";
 import express from "express";
 import multer from "multer";
 import { nanoid } from "nanoid";
+import { ZodError } from "zod";
 import { config } from "./config.js";
 import { clearSessionCookie, constantTimeEqual, currentUser, requireAuth, setSessionCookie } from "./auth.js";
 import { db, migrate, now, upsertUser } from "./db.js";
@@ -169,15 +170,21 @@ function getActivities(subjectType: "contact" | "project", subjectId: string) {
 
 function csvCell(value: unknown) {
   if (value === null || value === undefined) return "";
-  const text = String(value);
+  let text = String(value);
+  if (/^[=+\-@\t\r]/.test(text)) text = `'${text}`;
   if (/[",\n\r]/.test(text)) return `"${text.replace(/"/g, '""')}"`;
   return text;
 }
 
+const CSV_ROW_CAP = 50000;
+
 function sendCsv(res: express.Response, filename: string, rows: Row[], headers: string[]) {
-  const csv = [headers.join(","), ...rows.map((row) => headers.map((header) => csvCell(row[header])).join(","))].join("\n");
+  const truncated = rows.length > CSV_ROW_CAP;
+  const visibleRows = truncated ? rows.slice(0, CSV_ROW_CAP) : rows;
+  const csv = [headers.join(","), ...visibleRows.map((row) => headers.map((header) => csvCell(row[header])).join(","))].join("\n");
   res.setHeader("Content-Type", "text/csv; charset=utf-8");
   res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+  if (truncated) res.setHeader("X-Atlas-Truncated", "true");
   res.send(csv);
 }
 
@@ -347,9 +354,10 @@ app.get("/api/export/contacts.csv", (_req, res) => {
     .prepare(
       `SELECT name, company, role, email, phone, location, stage, category, notes, created_at, updated_at
        FROM contacts
-       ORDER BY updated_at DESC`
+       ORDER BY updated_at DESC
+       LIMIT ?`
     )
-    .all() as Row[];
+    .all(CSV_ROW_CAP + 1) as Row[];
   sendCsv(res, "atlas-stakeholders.csv", rows, ["name", "company", "role", "email", "phone", "location", "stage", "category", "notes", "created_at", "updated_at"]);
 });
 
@@ -359,9 +367,10 @@ app.get("/api/export/projects.csv", (_req, res) => {
       `SELECT name, format, status, priority, location, corridor, site_fit, land_status, utility_status,
         power_strategy, hospitality_scope, next_milestone, risk_level, owner, target_date, estimated_value, notes, created_at, updated_at
        FROM projects
-       ORDER BY updated_at DESC`
+       ORDER BY updated_at DESC
+       LIMIT ?`
     )
-    .all() as Row[];
+    .all(CSV_ROW_CAP + 1) as Row[];
   sendCsv(res, "atlas-location-pursuits.csv", rows, [
     "name",
     "format",
@@ -394,9 +403,10 @@ app.get("/api/export/tasks.csv", (_req, res) => {
        LEFT JOIN contacts c ON c.id = t.contact_id
        LEFT JOIN projects p ON p.id = t.project_id
        LEFT JOIN users u ON u.id = t.assigned_to_user_id
-       ORDER BY t.status = 'Done', t.due_date = '', t.due_date ASC`
+       ORDER BY t.status = 'Done', t.due_date = '', t.due_date ASC
+       LIMIT ?`
     )
-    .all() as Row[];
+    .all(CSV_ROW_CAP + 1) as Row[];
   sendCsv(res, "atlas-next-steps.csv", rows, ["title", "status", "priority", "due_date", "stakeholder", "location_pursuit", "assigned_to", "notes", "created_at", "updated_at"]);
 });
 
@@ -788,6 +798,10 @@ app.delete("/api/tasks/:id", (req, res) => {
 });
 
 app.use((error: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+  if (error instanceof ZodError) {
+    res.status(400).json({ error: "Invalid input", details: error.flatten() });
+    return;
+  }
   const status = error instanceof multer.MulterError ? 400 : 500;
   const message = error instanceof Error ? error.message : "Unexpected server error";
   res.status(status).json({ error: message });
