@@ -418,8 +418,11 @@ app.get("/api/dashboard", (_req, res) => {
         (SELECT COUNT(*) FROM projects) AS projects,
         (SELECT COUNT(*) FROM documents) AS documents,
         (SELECT COUNT(*) FROM tasks WHERE status != 'Done') AS openTasks,
+        (SELECT COUNT(*) FROM tasks WHERE status != 'Done' AND due_date != '' AND date(due_date) < date('now', 'localtime')) AS overdueTasks,
+        (SELECT COUNT(*) FROM tasks WHERE status != 'Done' AND due_date != '' AND date(due_date) = date('now', 'localtime')) AS dueToday,
         (SELECT COUNT(*) FROM projects WHERE status IN ('Scouting', 'Outreach', 'Discovery', 'Site Control', 'Utility Study')) AS activePursuits,
-        (SELECT COUNT(*) FROM projects WHERE risk_level IN ('High', 'Blocked')) AS highRisk`
+        (SELECT COUNT(*) FROM projects WHERE risk_level IN ('High', 'Blocked')) AS highRisk,
+        (SELECT COALESCE(SUM(estimated_value), 0) FROM projects WHERE status NOT IN ('Closed', 'Paused')) AS activePipelineValue`
     )
     .get() as Row;
   const projectStatus = db.prepare("SELECT status, COUNT(*) AS count FROM projects GROUP BY status ORDER BY count DESC").all() as Row[];
@@ -437,12 +440,127 @@ app.get("/api/dashboard", (_req, res) => {
     )
     .all() as Row[];
   const recentDocuments = db.prepare("SELECT * FROM documents ORDER BY uploaded_at DESC LIMIT 6").all() as Row[];
+  const priorityProjects = db
+    .prepare(
+      `SELECT p.*,
+        COUNT(DISTINCT cp.contact_id) AS contact_count,
+        COUNT(DISTINCT t.id) AS task_count
+       FROM projects p
+       LEFT JOIN contact_projects cp ON cp.project_id = p.id
+       LEFT JOIN tasks t ON t.project_id = p.id AND t.status != 'Done'
+       WHERE p.status NOT IN ('Live', 'Closed', 'Paused')
+       GROUP BY p.id
+       ORDER BY
+         CASE p.risk_level WHEN 'Blocked' THEN 0 WHEN 'High' THEN 1 WHEN 'Medium' THEN 2 ELSE 3 END,
+         CASE p.priority WHEN 'Critical' THEN 0 WHEN 'High' THEN 1 WHEN 'Medium' THEN 2 ELSE 3 END,
+         p.target_date = '', p.target_date ASC, p.updated_at DESC
+       LIMIT 6`
+    )
+    .all() as Row[];
+  const recentActivity = db
+    .prepare(
+      `SELECT a.*,
+        COALESCE(c.name, p.name) AS subject_name,
+        u.name AS created_by_name,
+        u.email AS created_by_email
+       FROM activities a
+       LEFT JOIN contacts c ON a.subject_type = 'contact' AND c.id = a.subject_id
+       LEFT JOIN projects p ON a.subject_type = 'project' AND p.id = a.subject_id
+       LEFT JOIN users u ON u.id = a.created_by_user_id
+       ORDER BY a.created_at DESC
+       LIMIT 8`
+    )
+    .all() as Row[];
   res.json({
     totals: normalizeRecord(totals),
     projectStatus: normalizeRows(projectStatus),
     formatMix: normalizeRows(formatMix),
     upcomingTasks: normalizeRows(upcomingTasks),
-    recentDocuments: normalizeRows(recentDocuments)
+    recentDocuments: normalizeRows(recentDocuments),
+    priorityProjects: normalizeRows(priorityProjects),
+    recentActivity: normalizeRows(recentActivity),
+    generatedAt: now()
+  });
+});
+
+app.get("/api/search", (req, res) => {
+  const query = typeof req.query.q === "string" ? req.query.q.trim() : "";
+  if (query.length < 2) {
+    res.json({ results: [] });
+    return;
+  }
+
+  const needle = `%${query.toLowerCase()}%`;
+  const contacts = db
+    .prepare(
+      `SELECT id, name AS title, company, role, category, stage
+       FROM contacts
+       WHERE lower(name || ' ' || company || ' ' || role || ' ' || email || ' ' || location) LIKE ?
+       ORDER BY updated_at DESC
+       LIMIT 6`
+    )
+    .all(needle) as Row[];
+  const projects = db
+    .prepare(
+      `SELECT id, name AS title, location, corridor, format, status, risk_level
+       FROM projects
+       WHERE lower(name || ' ' || location || ' ' || corridor || ' ' || owner || ' ' || status) LIKE ?
+       ORDER BY updated_at DESC
+       LIMIT 6`
+    )
+    .all(needle) as Row[];
+  const tasks = db
+    .prepare(
+      `SELECT t.id, t.title, t.status, t.priority, t.due_date, c.name AS contact_name, p.name AS project_name
+       FROM tasks t
+       LEFT JOIN contacts c ON c.id = t.contact_id
+       LEFT JOIN projects p ON p.id = t.project_id
+       WHERE lower(t.title || ' ' || t.notes || ' ' || COALESCE(c.name, '') || ' ' || COALESCE(p.name, '')) LIKE ?
+       ORDER BY t.status = 'Done', t.due_date = '', t.due_date ASC
+       LIMIT 6`
+    )
+    .all(needle) as Row[];
+  const documents = db
+    .prepare(
+      `SELECT id, original_name AS title, document_category, phase, uploaded_at
+       FROM documents
+       WHERE lower(original_name || ' ' || notes || ' ' || document_category || ' ' || phase) LIKE ?
+       ORDER BY uploaded_at DESC
+       LIMIT 4`
+    )
+    .all(needle) as Row[];
+
+  res.json({
+    results: [
+      ...contacts.map((row) => ({
+        id: row.id,
+        type: "contact",
+        title: row.title,
+        subtitle: [row.company, row.role].filter(Boolean).join(" · "),
+        meta: row.stage || row.category
+      })),
+      ...projects.map((row) => ({
+        id: row.id,
+        type: "project",
+        title: row.title,
+        subtitle: row.corridor || row.location || row.format,
+        meta: row.status || row.risk_level
+      })),
+      ...tasks.map((row) => ({
+        id: row.id,
+        type: "task",
+        title: row.title,
+        subtitle: row.project_name || row.contact_name || "Unlinked next step",
+        meta: row.due_date || row.status
+      })),
+      ...documents.map((row) => ({
+        id: row.id,
+        type: "document",
+        title: row.title,
+        subtitle: [row.document_category, row.phase].filter(Boolean).join(" · "),
+        meta: row.uploaded_at
+      }))
+    ]
   });
 });
 

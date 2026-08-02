@@ -1,14 +1,22 @@
 import React, { FormEvent, useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
+  Activity as ActivityIcon,
+  AlertTriangle,
   ArrowLeft,
   BriefcaseBusiness,
   CalendarClock,
   Check,
+  ChevronRight,
+  CircleDollarSign,
+  Clock3,
+  Command,
+  Compass,
   Download,
   FileText,
   Link2,
   LogOut,
+  MapPin,
   PanelsTopLeft,
   Pencil,
   Plus,
@@ -132,11 +140,32 @@ type Task = {
 };
 
 type Dashboard = {
-  totals: { contacts: number; projects: number; documents: number; openTasks: number; activePursuits: number; highRisk: number };
+  totals: {
+    contacts: number;
+    projects: number;
+    documents: number;
+    openTasks: number;
+    overdueTasks: number;
+    dueToday: number;
+    activePursuits: number;
+    highRisk: number;
+    activePipelineValue: number;
+  };
   projectStatus: { status: string; count: number }[];
   formatMix: { format: string; count: number }[];
   upcomingTasks: Task[];
   recentDocuments: DocumentRecord[];
+  priorityProjects: Project[];
+  recentActivity: (Activity & { subjectName?: string })[];
+  generatedAt: string;
+};
+
+type SearchResult = {
+  id: string;
+  type: "contact" | "project" | "task" | "document";
+  title: string;
+  subtitle: string;
+  meta: string;
 };
 
 const emptyContact = {
@@ -210,6 +239,37 @@ async function api<T>(path: string, options: RequestInit = {}) {
 function money(value: number | null | undefined) {
   if (!value) return "";
   return new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 0 }).format(value);
+}
+
+function compactMoney(value: number | null | undefined) {
+  if (!value) return "$0";
+  return new Intl.NumberFormat("en-US", {
+    style: "currency",
+    currency: "USD",
+    notation: "compact",
+    maximumFractionDigits: 1
+  }).format(value);
+}
+
+function dueLabel(value: string) {
+  if (!value) return "No due date";
+  const date = new Date(`${value}T12:00:00`);
+  const today = new Date();
+  const todayStart = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+  const dueStart = new Date(date.getFullYear(), date.getMonth(), date.getDate());
+  const diff = Math.round((dueStart.getTime() - todayStart.getTime()) / (24 * 60 * 60 * 1000));
+  if (diff < -1) return `${Math.abs(diff)} days overdue`;
+  if (diff === -1) return "Yesterday";
+  if (diff === 0) return "Due today";
+  if (diff === 1) return "Due tomorrow";
+  return date.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+}
+
+function isOverdue(value: string) {
+  if (!value) return false;
+  const today = new Date();
+  const todayKey = new Date(today.getFullYear(), today.getMonth(), today.getDate()).getTime();
+  return new Date(`${value}T00:00:00`).getTime() < todayKey;
 }
 
 function fileSize(size: number) {
@@ -436,21 +496,48 @@ function Shell({
   user: User;
   onLogout: () => void;
 }) {
+  const [searchOpen, setSearchOpen] = useState(false);
   const nav = [
-    ["dashboard", PanelsTopLeft, "Dashboard"],
+    ["dashboard", PanelsTopLeft, "Briefing"],
     ["contacts", UsersRound, "Stakeholders"],
     ["projects", BriefcaseBusiness, "Locations"],
     ["documents", FileText, "Diligence"],
     ["tasks", CalendarClock, "Next Steps"]
   ] as const;
 
+  useEffect(() => {
+    function handleShortcut(event: KeyboardEvent) {
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
+        event.preventDefault();
+        setSearchOpen((open) => !open);
+      }
+    }
+    window.addEventListener("keydown", handleShortcut);
+    return () => window.removeEventListener("keydown", handleShortcut);
+  }, []);
+
+  function openResult(result: SearchResult) {
+    setSearchOpen(false);
+    if (result.type === "contact") navigate("contacts", result.id);
+    else if (result.type === "project") navigate("projects", result.id);
+    else if (result.type === "task") navigate("tasks");
+    else navigate("documents");
+  }
+
   return (
     <div className="appShell">
       <aside className="sidebar">
         <button type="button" className="sidebarBrand" onClick={() => navigate("dashboard")} aria-label="Go to Command Center">
           <RangewayMark size={40} />
-          <strong>Rangeway</strong>
-          <span>Atlas</span>
+          <span className="sidebarWordmark">
+            <strong>Rangeway</strong>
+            <span>Atlas</span>
+          </span>
+        </button>
+        <button type="button" className="sidebarSearch" onClick={() => setSearchOpen(true)}>
+          <Search size={16} />
+          <span>Find anything</span>
+          <kbd>⌘ K</kbd>
         </button>
         <nav>
           {nav.map(([id, Icon, label]) => (
@@ -459,15 +546,24 @@ function Shell({
             </button>
           ))}
         </nav>
+        <button type="button" className="mobileSearch" title="Search Atlas" onClick={() => setSearchOpen(true)}><Search size={17} /></button>
         <div className="sidebarFoot">
-          <span>{user.name || user.email}</span>
+          <span className="userAvatar">{(user.name || user.email).slice(0, 1).toUpperCase()}</span>
+          <span className="userIdentity">
+            <strong>{user.name || "Atlas Admin"}</strong>
+            <small>{user.email}</small>
+          </span>
           <button title="Sign out" onClick={onLogout}>
             <LogOut size={17} />
           </button>
         </div>
       </aside>
       <main className="workspace">
-        {screen === "dashboard" && <DashboardView />}
+        <div className="workspaceRail">
+          <span>Internal network development system</span>
+          <span className="liveIndicator"><i /> Atlas online</span>
+        </div>
+        {screen === "dashboard" && <DashboardView navigate={navigate} user={user} />}
         {screen === "contacts" && (
           <ContactsView
             selectedId={contactSelectedId}
@@ -485,6 +581,93 @@ function Shell({
         {screen === "documents" && <DocumentsView />}
         {screen === "tasks" && <TasksView user={user} />}
       </main>
+      {searchOpen && <CommandPalette onClose={() => setSearchOpen(false)} onOpen={openResult} />}
+    </div>
+  );
+}
+
+function CommandPalette({ onClose, onOpen }: { onClose: () => void; onOpen: (result: SearchResult) => void }) {
+  const [query, setQuery] = useState("");
+  const [results, setResults] = useState<SearchResult[]>([]);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    function handleEscape(event: KeyboardEvent) {
+      if (event.key === "Escape") onClose();
+    }
+    window.addEventListener("keydown", handleEscape);
+    return () => window.removeEventListener("keydown", handleEscape);
+  }, [onClose]);
+
+  useEffect(() => {
+    const trimmed = query.trim();
+    if (trimmed.length < 2) {
+      setResults([]);
+      setBusy(false);
+      return;
+    }
+    let cancelled = false;
+    setBusy(true);
+    const timer = window.setTimeout(() => {
+      api<{ results: SearchResult[] }>(`/api/search?q=${encodeURIComponent(trimmed)}`)
+        .then((data) => {
+          if (!cancelled) setResults(data.results);
+        })
+        .finally(() => {
+          if (!cancelled) setBusy(false);
+        });
+    }, 160);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [query]);
+
+  const iconFor = {
+    contact: UserRound,
+    project: MapPin,
+    task: Check,
+    document: FileText
+  } as const;
+
+  return (
+    <div className="commandBackdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
+      <section className="commandPalette" role="dialog" aria-modal="true" aria-label="Search Atlas">
+        <div className="commandInput">
+          {busy ? <RefreshCw className="spin" size={19} /> : <Search size={19} />}
+          <input
+            autoFocus
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+            placeholder="Search locations, stakeholders, diligence, and next steps…"
+          />
+          <kbd>ESC</kbd>
+        </div>
+        <div className="commandResults">
+          {query.trim().length < 2 && (
+            <div className="commandHint">
+              <Command size={20} />
+              <div><strong>Atlas search</strong><span>Start typing to retrieve any record across the network.</span></div>
+            </div>
+          )}
+          {query.trim().length >= 2 && !busy && results.length === 0 && <Empty label="Nothing in Atlas matches that search" />}
+          {results.map((result) => {
+            const ResultIcon = iconFor[result.type];
+            return (
+              <button key={`${result.type}-${result.id}`} type="button" className="commandResult" onClick={() => onOpen(result)}>
+                <span className="commandResultIcon"><ResultIcon size={17} /></span>
+                <span className="commandResultBody">
+                  <small>{result.type}</small>
+                  <strong>{result.title}</strong>
+                  {result.subtitle && <span>{result.subtitle}</span>}
+                </span>
+                {result.meta && <em>{result.meta}</em>}
+                <ChevronRight size={17} />
+              </button>
+            );
+          })}
+        </div>
+      </section>
     </div>
   );
 }
@@ -555,7 +738,7 @@ function useCrmData() {
   return { contacts, projects, tasks, documents, users, busy, error, refresh };
 }
 
-function DashboardView() {
+function DashboardView({ navigate, user }: { navigate: (screen: Screen, recordId?: string | null) => void; user: User }) {
   const [dashboard, setDashboard] = useState<Dashboard | null>(null);
   const [error, setError] = useState("");
 
@@ -576,52 +759,174 @@ function DashboardView() {
   if (error) return <Notice type="error">{error}</Notice>;
   if (!dashboard) return <Notice>Loading dashboard</Notice>;
 
+  const today = new Date();
+  const dateLine = today.toLocaleDateString(undefined, { weekday: "long", month: "long", day: "numeric" });
+  const firstName = (user.name || "Zak").split(" ")[0];
+  const activeProjectTotal = dashboard.projectStatus.reduce((sum, row) => sum + row.count, 0);
+  const statusMax = Math.max(1, ...dashboard.projectStatus.map((row) => row.count));
+  const attentionTasks = dashboard.upcomingTasks.slice(0, 5);
+
   return (
-    <section className="view">
-      <Header
-        eyebrow="Network Development"
-        title="Command Center"
-        subhead="Active site pursuits, early-stage development, risk, and what's coming up next across the Rangeway network."
-      />
-      <div className="metricGrid">
-        <Metric label="Site Pursuits" value={dashboard.totals.projects} />
-        <Metric label="Active Early-Stage" value={dashboard.totals.activePursuits} />
-        <Metric label="Stakeholders" value={dashboard.totals.contacts} />
-        <Metric label="High-Risk Items" value={dashboard.totals.highRisk} />
+    <section className="view briefingView">
+      <header className="briefingHeader">
+        <div>
+          <span className="eyebrow">{dateLine} · Network development</span>
+          <h1>{dashboard.totals.projects === 0 ? "Build the network map." : `Good ${today.getHours() < 12 ? "morning" : today.getHours() < 18 ? "afternoon" : "evening"}, ${firstName}.`}</h1>
+          <p>
+            {dashboard.totals.projects === 0
+              ? "Atlas is ready for the first location pursuit, stakeholder relationship, and next step."
+              : `${dashboard.totals.activePursuits} active pursuits, ${dashboard.totals.openTasks} open next steps, and ${dashboard.totals.highRisk} items need close attention.`}
+          </p>
+        </div>
+        <div className="briefingActions">
+          <button type="button" className="textButton" onClick={() => navigate("contacts")}><UsersRound size={16} /> Stakeholder</button>
+          <button type="button" className="primaryButton" onClick={() => navigate("projects")}><Plus size={16} /> Location pursuit</button>
+        </div>
+      </header>
+
+      <div className="briefingMetrics">
+        <BriefMetric icon={Compass} label="Active pursuits" value={dashboard.totals.activePursuits} detail={`${dashboard.totals.projects} total mapped`} />
+        <BriefMetric icon={Clock3} label="Open next steps" value={dashboard.totals.openTasks} detail={`${dashboard.totals.dueToday} due today`} tone={dashboard.totals.overdueTasks > 0 ? "alert" : "default"} />
+        <BriefMetric icon={AlertTriangle} label="Needs attention" value={dashboard.totals.highRisk + dashboard.totals.overdueTasks} detail={`${dashboard.totals.overdueTasks} overdue · ${dashboard.totals.highRisk} high risk`} tone={dashboard.totals.highRisk + dashboard.totals.overdueTasks > 0 ? "alert" : "default"} />
+        <BriefMetric icon={CircleDollarSign} label="Active pipeline" value={compactMoney(dashboard.totals.activePipelineValue)} detail="Directional project value" />
       </div>
-      <div className="splitGrid">
-        <Panel title="Development Phase">
-          <div className="statusRows">
-            {dashboard.projectStatus.length === 0 && <Empty label="No location pursuits yet" />}
-            {dashboard.projectStatus.map((row) => (
-              <div key={row.status} className="statusRow">
-                <span>{row.status}</span>
-                <strong>{row.count}</strong>
-              </div>
-            ))}
+
+      <div className="briefingGrid">
+        <section className="fieldBoard">
+          <div className="sectionTitle">
+            <div><span className="eyebrow">Field board</span><h2>Priority pursuits</h2></div>
+            <button type="button" className="textButton quiet" onClick={() => navigate("projects")}>View all <ChevronRight size={15} /></button>
           </div>
-        </Panel>
-        <Panel title="Format Mix">
-          <div className="statusRows">
-            {dashboard.formatMix.length === 0 && <Empty label="No formats selected yet" />}
-            {dashboard.formatMix.map((row) => (
-              <div key={row.format} className="statusRow">
-                <span>{row.format}</span>
-                <strong>{row.count}</strong>
-              </div>
-            ))}
+          {dashboard.priorityProjects.length === 0 ? (
+            <button type="button" className="launchCard" onClick={() => navigate("projects")}>
+              <span className="launchIndex">01</span>
+              <span><strong>Map the first location pursuit</strong><small>Capture corridor, site fit, land position, utility status, and the next milestone.</small></span>
+              <ChevronRight size={20} />
+            </button>
+          ) : (
+            <div className="pursuitBoard">
+              {dashboard.priorityProjects.map((project, index) => (
+                <button key={project.id} type="button" className="pursuitCard" onClick={() => navigate("projects", project.id)}>
+                  <span className="pursuitNumber">{String(index + 1).padStart(2, "0")}</span>
+                  <span className="pursuitBody">
+                    <span className="pursuitMeta">{project.format} · {project.status}</span>
+                    <strong>{project.name}</strong>
+                    <small><MapPin size={13} /> {project.corridor || project.location || "Location not set"}</small>
+                    <span className="pursuitMilestone">{project.nextMilestone || "Next milestone not set"}</span>
+                  </span>
+                  <span className="pursuitSignals">
+                    <span className="statusPill" data-variant={project.riskLevel === "Blocked" || project.riskLevel === "High" ? "alert" : "sage"}>{project.riskLevel} risk</span>
+                    <small>{project.taskCount || 0} next steps</small>
+                  </span>
+                  <ChevronRight size={18} />
+                </button>
+              ))}
+            </div>
+          )}
+        </section>
+
+        <aside className="attentionRail">
+          <div className="sectionTitle compactTitle">
+            <div><span className="eyebrow">Follow through</span><h2>Attention queue</h2></div>
+            <button type="button" className="iconButton" title="Open next steps" onClick={() => navigate("tasks")}><ChevronRight size={17} /></button>
           </div>
-        </Panel>
+          {attentionTasks.length === 0 ? (
+            <div className="attentionEmpty"><Check size={21} /><strong>Queue clear</strong><span>Add a next step when the next commitment is known.</span></div>
+          ) : (
+            <div className="attentionList">
+              {attentionTasks.map((task) => (
+                <button key={task.id} type="button" onClick={() => navigate("tasks")} className={isOverdue(task.dueDate) ? "overdue" : ""}>
+                  <span className="statusDot" data-priority={task.priority} />
+                  <span><strong>{task.title}</strong><small>{task.projectName || task.contactName || "Unlinked"}</small></span>
+                  <em>{dueLabel(task.dueDate)}</em>
+                </button>
+              ))}
+            </div>
+          )}
+        </aside>
       </div>
-      <div className="splitGrid">
-        <Panel title="Next Steps">
-          <TaskList tasks={dashboard.upcomingTasks} compact />
-        </Panel>
-        <Panel title="Recent Diligence">
-          <DocumentList documents={dashboard.recentDocuments} />
-        </Panel>
+
+      <div className="intelligenceGrid">
+        <section className="panel pipelinePanel">
+          <div className="sectionTitle compactTitle">
+            <div><span className="eyebrow">Network shape</span><h2>Development runway</h2></div>
+            <span className="panelTotal">{activeProjectTotal} pursuits</span>
+          </div>
+          {dashboard.projectStatus.length === 0 ? (
+            <Empty label="The runway will appear as location pursuits move through development." />
+          ) : (
+            <div className="pipelineRows">
+              {dashboard.projectStatus.map((row) => (
+                <div className="pipelineRow" key={row.status}>
+                  <span>{row.status}</span>
+                  <i><b style={{ width: `${Math.max(8, (row.count / statusMax) * 100)}%` }} /></i>
+                  <strong>{row.count}</strong>
+                </div>
+              ))}
+            </div>
+          )}
+        </section>
+
+        <section className="panel activityBrief">
+          <div className="sectionTitle compactTitle">
+            <div><span className="eyebrow">Context stream</span><h2>What changed</h2></div>
+            <ActivityIcon size={18} />
+          </div>
+          {dashboard.recentActivity.length === 0 ? (
+            <Empty label="Calls, decisions, site visits, and risks will build the operating history here." />
+          ) : (
+            <div className="briefActivityList">
+              {dashboard.recentActivity.slice(0, 5).map((activity) => (
+                <button key={activity.id} type="button" onClick={() => navigate(activity.subjectType === "project" ? "projects" : "contacts", activity.subjectId)}>
+                  <span className="activityGlyph">{activity.activityType.slice(0, 1)}</span>
+                  <span><strong>{activity.subjectName || activity.activityType}</strong><small>{activity.body}</small></span>
+                  <time>{formatDayLabel(activity.createdAt)}</time>
+                </button>
+              ))}
+            </div>
+          )}
+        </section>
+
+        <section className="panel footprintPanel">
+          <div className="sectionTitle compactTitle">
+            <div><span className="eyebrow">Portfolio</span><h2>Format footprint</h2></div>
+          </div>
+          {dashboard.formatMix.length === 0 ? (
+            <Empty label="Trailheads, Waystations, Basecamps, and Summits will appear here." />
+          ) : (
+            <div className="formatFootprint">
+              {dashboard.formatMix.map((row) => <div key={row.format}><strong>{row.count}</strong><span>{row.format}</span></div>)}
+            </div>
+          )}
+          <button type="button" className="diligenceLink" onClick={() => navigate("documents")}>
+            <FileText size={16} /> {dashboard.totals.documents} diligence files <ChevronRight size={15} />
+          </button>
+        </section>
       </div>
     </section>
+  );
+}
+
+function BriefMetric({
+  icon: Icon,
+  label,
+  value,
+  detail,
+  tone = "default"
+}: {
+  icon: React.ComponentType<{ size?: number }>;
+  label: string;
+  value: number | string;
+  detail: string;
+  tone?: "default" | "alert";
+}) {
+  return (
+    <article className="briefMetric" data-tone={tone}>
+      <span className="briefMetricIcon"><Icon size={18} /></span>
+      <span className="briefMetricLabel">{label}</span>
+      <strong>{value}</strong>
+      <small>{detail}</small>
+    </article>
   );
 }
 

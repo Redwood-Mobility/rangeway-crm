@@ -27,6 +27,7 @@ if [[ ! -f "${ENV_FILE}" ]]; then
 fi
 
 npm run typecheck
+npm run build
 
 ssh "${SSH_OPTS[@]}" "${REMOTE_USER}@${REMOTE_HOST}" "mkdir -p '${REMOTE_DIR}'"
 
@@ -42,7 +43,7 @@ rsync -az --delete \
 
 rsync -az -e "${RSYNC_SSH}" "${ENV_FILE}" "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_DIR}/.env"
 
-ssh "${SSH_OPTS[@]}" "${REMOTE_USER}@${REMOTE_HOST}" "cd '${REMOTE_DIR}' && docker compose up -d --build && docker compose ps"
+ssh "${SSH_OPTS[@]}" "${REMOTE_USER}@${REMOTE_HOST}" "cd '${REMOTE_DIR}' && docker compose up -d --build --wait && docker compose ps"
 
 echo "Atlas deployed. Check logs with:"
 echo "ssh ${REMOTE_USER}@${REMOTE_HOST} \"cd ${REMOTE_DIR} && docker compose logs -f crm\""

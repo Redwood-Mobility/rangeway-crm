@@ -12,6 +12,8 @@ Atlas is Rangeway's internal relationship and site-development system. It is int
 - Next steps that can be tied to a stakeholder, location pursuit, or both.
 - Diligence document uploads for PDF, DOC, DOCX, XLS, and XLSX with document type and development phase.
 - Activity timelines for stakeholders and location pursuits, including notes, calls, meetings, site visits, decisions, risks, and milestones.
+- A daily network briefing with priority pursuits, overdue follow-through, high-risk items, pipeline position, and recent activity.
+- Global Atlas search across stakeholders, location pursuits, next steps, and diligence (`⌘K` / `Ctrl+K`).
 - CSV exports for stakeholders, location pursuits, and next steps.
 - Auth-protected downloads from local storage.
 - SQLite persistence with Docker volumes for `data` and `uploads`.
@@ -143,6 +145,8 @@ The important production data lives in Docker volumes. Compose names them after 
 
 - `atlas_crm-data`
 - `atlas_crm-uploads`
+
+The Compose project name is pinned to `atlas`, so these volume names remain stable even if the checkout directory changes.
 
 For a simple server-side backup:
 
