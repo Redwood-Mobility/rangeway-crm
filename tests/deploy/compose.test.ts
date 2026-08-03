@@ -103,6 +103,10 @@ describe("deterministic deployment source contract", () => {
   const dockerfile = readRepositoryFile("Dockerfile");
   const caddyfile = readRepositoryFile("deploy/Caddyfile");
   const deployScript = readRepositoryFile("deploy/deploy.sh");
+  const deploymentCoordinator = readRepositoryFile("deploy/deployment-coordinator.sh");
+  const deploymentGuardianUnit = readRepositoryFile(
+    "deploy/systemd/atlas-v2-deployment-guardian.service",
+  );
   const backupScript = readRepositoryFile("deploy/backup.sh");
   const restoreScript = readRepositoryFile("deploy/restore-test.sh");
   const roleInitializationScript = readRepositoryFile("deploy/postgres/init-roles.sh");
@@ -230,14 +234,19 @@ describe("deterministic deployment source contract", () => {
     expect(deployScript).not.toMatch(/git reset|git checkout|docker volume rm|docker compose down -v/);
   });
 
-  it("serializes durable preflight acknowledgment, lease recovery, and boundary transitions", () => {
-    expect(deployScript).toContain(".atlas-preflight-handoffs");
-    expect(deployScript).toContain("setsid --fork");
-    expect(deployScript.match(/flock -x 9/g)?.length).toBeGreaterThanOrEqual(4);
-    expect(deployScript).toContain("awaiting_ack|handed_off");
-    expect(deployScript).toContain("status=boundary");
-    expect(deployScript.indexOf("status=boundary")).toBeLessThan(
-      deployScript.indexOf("001-atlas-roles.sh", deployScript.indexOf("status=boundary")),
+  it("uses one durable, boot-reconciled coordinator around the compatibility boundary", () => {
+    expect(deployScript).toContain("atlas-v2-deployment-coordinator");
+    expect(deployScript).toMatch(/run_coordinator begin .*DEPLOYMENT_TOKEN/);
+    expect(deployScript).toContain('run_coordinator transition "${DEPLOYMENT_TOKEN}" quiesced boundary');
+    expect(deployScript).toContain('run_coordinator complete "${DEPLOYMENT_TOKEN}" "${LOCAL_COMMIT}"');
+    expect(deployScript).not.toMatch(/setsid|\.lease\.sh|\.atlas-preflight-handoffs/);
+    expect(deploymentCoordinator).toContain("flock -n 9");
+    expect(deploymentCoordinator).toContain('status="failed_closed"');
+    expect(deploymentCoordinator).toContain("restore_exact_writers");
+    expect(deploymentGuardianUnit).toContain("WantedBy=multi-user.target");
+    expect(deploymentGuardianUnit).toContain("Restart=on-failure");
+    expect(deployScript.indexOf("quiesced boundary")).toBeLessThan(
+      deployScript.indexOf("001-atlas-roles.sh"),
     );
   });
 

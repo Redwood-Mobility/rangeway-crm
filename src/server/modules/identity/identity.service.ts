@@ -323,7 +323,39 @@ export class IdentityService {
     await this.evidence.precommitHook?.(client);
   }
 
-  async createServiceActor(input: CreateServiceActorInput): Promise<CreatedServiceIdentity> {
+  private async requireServiceActorOwner(
+    initiatingActor: ActorContext,
+    organizationId: string,
+    client: Parameters<typeof recordAudit>[1],
+  ): Promise<HumanActorRecord> {
+    if (
+      initiatingActor.actorType !== "human" ||
+      !initiatingActor.userId ||
+      initiatingActor.organizationId !== organizationId
+    ) {
+      throw new ApiError(403, "FORBIDDEN", "Insufficient permission.");
+    }
+    const persisted = await this.repository.findHumanActorByUserId(
+      organizationId,
+      initiatingActor.userId,
+      client,
+    );
+    if (
+      !persisted ||
+      persisted.actorId !== initiatingActor.actorId ||
+      persisted.actorDisabledAt ||
+      persisted.userDisabledAt
+    ) {
+      throw new ApiError(403, "FORBIDDEN", "Insufficient permission.");
+    }
+    assertMinimumRole(persisted.role, "owner");
+    return persisted;
+  }
+
+  async createServiceActor(
+    initiatingActor: ActorContext,
+    input: CreateServiceActorInput,
+  ): Promise<CreatedServiceIdentity> {
     if (input.actorType !== "agent" && input.actorType !== "automation") {
       throw new ApiError(400, "INVALID_INPUT", "Service actors must be agents or automations.");
     }
@@ -332,14 +364,58 @@ export class IdentityService {
     const serviceKeyPrefix = secret.slice(0, 12);
     const serviceKey = `atlas_${serviceKeyPrefix}.${secret}`;
     const serviceKeyHash = hashServiceKey(serviceKey).toString("hex");
-    const created = await withTransaction(this.pool, (client) =>
-      this.repository.createServiceActor(
+    const created = await withTransaction(this.pool, async (client) => {
+      await this.requireServiceActorOwner(
+        initiatingActor,
+        input.organizationId,
+        client,
+      );
+      const serviceActor = await this.repository.createServiceActor(
         input,
         serviceKeyPrefix,
         serviceKeyHash,
         client,
-      ),
-    );
+      );
+      await this.evidence.recordAudit(
+        {
+          organizationId: input.organizationId,
+          actorId: initiatingActor.actorId,
+          requestId: initiatingActor.requestId,
+          action: "identity.service_actor.created",
+          resourceType: "actor",
+          resourceId: serviceActor.actorId,
+          before: null,
+          after: {
+            actorType: serviceActor.actorType,
+            displayName: serviceActor.actorName,
+            role: serviceActor.role,
+            disabled: false,
+          },
+          metadata: { source: "internal-guarded-identity-service" },
+        },
+        client,
+      );
+      await this.evidence.enqueueEvent(
+        {
+          organizationId: input.organizationId,
+          actorId: initiatingActor.actorId,
+          requestId: initiatingActor.requestId,
+          eventType: atlasEventTypes.identityServiceActorCreated,
+          aggregateType: "actor",
+          aggregateId: serviceActor.actorId,
+          schemaVersion: 1,
+          payload: {
+            organizationId: input.organizationId,
+            actorId: serviceActor.actorId,
+            actorType: serviceActor.actorType,
+            role: serviceActor.role,
+          },
+        },
+        client,
+      );
+      await this.evidence.precommitHook?.(client);
+      return serviceActor;
+    });
 
     return { ...publicServiceIdentity(created), actorType: created.actorType, serviceKey };
   }
@@ -407,17 +483,66 @@ export class IdentityService {
     return publicServiceIdentity(actor);
   }
 
-  async disableActor(
-    organizationId: string,
+  async disableServiceActor(
+    initiatingActor: ActorContext,
     actorId: string,
     disabledAt = new Date(),
-  ): Promise<void> {
-    const disabled = await this.repository.disableActor(
-      organizationId,
-      actorId,
-      disabledAt,
-      this.pool,
-    );
-    if (!disabled) throw new ApiError(404, "NOT_FOUND", "Actor not found.");
+  ): Promise<"disabled" | "unchanged"> {
+    return withTransaction(this.pool, async (client) => {
+      await this.requireServiceActorOwner(
+        initiatingActor,
+        initiatingActor.organizationId,
+        client,
+      );
+      const target = await this.repository.findServiceActorById(
+        initiatingActor.organizationId,
+        actorId,
+        client,
+        { forUpdate: true },
+      );
+      if (!target) throw new ApiError(404, "NOT_FOUND", "Actor not found.");
+      if (target.disabledAt) return "unchanged";
+
+      const disabled = await this.repository.disableServiceActor(
+        initiatingActor.organizationId,
+        actorId,
+        disabledAt,
+        client,
+      );
+      if (!disabled) throw new ApiError(409, "CONFLICT", "Actor state changed; retry the operation.");
+      await this.evidence.recordAudit(
+        {
+          organizationId: initiatingActor.organizationId,
+          actorId: initiatingActor.actorId,
+          requestId: initiatingActor.requestId,
+          action: "identity.service_actor.disabled",
+          resourceType: "actor",
+          resourceId: actorId,
+          before: { disabledAt: null },
+          after: { disabledAt: disabledAt.toISOString() },
+          metadata: { source: "internal-guarded-identity-service" },
+        },
+        client,
+      );
+      await this.evidence.enqueueEvent(
+        {
+          organizationId: initiatingActor.organizationId,
+          actorId: initiatingActor.actorId,
+          requestId: initiatingActor.requestId,
+          eventType: atlasEventTypes.identityServiceActorDisabled,
+          aggregateType: "actor",
+          aggregateId: actorId,
+          schemaVersion: 1,
+          payload: {
+            organizationId: initiatingActor.organizationId,
+            actorId,
+            actorType: target.actorType,
+          },
+        },
+        client,
+      );
+      await this.evidence.precommitHook?.(client);
+      return "disabled";
+    });
   }
 }

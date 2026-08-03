@@ -100,7 +100,13 @@ export interface IdentityRepositoryPort {
     serviceKeyPrefix: string,
     client: QueryClient,
   ): Promise<ServiceActorRecord | null>;
-  disableActor(
+  findServiceActorById(
+    organizationId: string,
+    actorId: string,
+    client: QueryClient,
+    options?: { forUpdate?: boolean },
+  ): Promise<ServiceActorRecord | null>;
+  disableServiceActor(
     organizationId: string,
     actorId: string,
     disabledAt: Date,
@@ -193,7 +199,7 @@ export class IdentityRepository implements IdentityRepositoryPort {
           AND m.organization_id = $1
           AND a.type = 'human'
           AND ${userPredicate}
-        ${forUpdate ? "FOR UPDATE OF a, u, m" : ""}`,
+        ${forUpdate ? "FOR UPDATE OF a, u" : ""}`,
       [organizationId, value],
     );
     return result.rows[0] ? mapHumanActor(result.rows[0]) : null;
@@ -419,7 +425,32 @@ export class IdentityRepository implements IdentityRepositoryPort {
     return result.rows[0] ? mapServiceActor(result.rows[0]) : null;
   }
 
-  async disableActor(
+  async findServiceActorById(
+    organizationId: string,
+    actorId: string,
+    client: QueryClient,
+    options: { forUpdate?: boolean } = {},
+  ): Promise<ServiceActorRecord | null> {
+    const result = await client.query<ServiceActorRow>(
+      `SELECT id AS actor_id,
+              type AS actor_type,
+              display_name AS actor_name,
+              organization_id,
+              role,
+              service_key_prefix,
+              service_key_hash,
+              disabled_at
+         FROM actors
+        WHERE organization_id = $1
+          AND id = $2
+          AND type IN ('agent', 'automation')
+        ${options.forUpdate ? "FOR UPDATE" : ""}`,
+      [organizationId, actorId],
+    );
+    return result.rows[0] ? mapServiceActor(result.rows[0]) : null;
+  }
+
+  async disableServiceActor(
     organizationId: string,
     actorId: string,
     disabledAt: Date,
@@ -430,6 +461,8 @@ export class IdentityRepository implements IdentityRepositoryPort {
           SET disabled_at = $3, updated_at = now()
         WHERE organization_id = $1
           AND id = $2
+          AND type IN ('agent', 'automation')
+          AND disabled_at IS NULL
         RETURNING id`,
       [organizationId, actorId, disabledAt],
     );

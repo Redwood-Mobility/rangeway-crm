@@ -5,6 +5,7 @@ import process from "node:process";
 import { pathToFileURL } from "node:url";
 import "dotenv/config";
 import type { Pool } from "pg";
+import { validateProductionPostgresUrl } from "../../../shared/postgres-url.js";
 import { createPool, withTransaction } from "./client.js";
 
 const defaultMigrationsDirectory = path.resolve(process.cwd(), "db", "migrations");
@@ -93,10 +94,22 @@ export async function runMigrations(
   });
 }
 
-async function main(): Promise<void> {
-  const databaseUrl = process.env.DATABASE_URL;
+export function readMigrationDatabaseUrl(env: NodeJS.ProcessEnv): string {
+  const databaseUrl = env.DATABASE_URL?.trim();
   if (!databaseUrl) throw new Error("DATABASE_URL is required to run migrations.");
+  if (env.NODE_ENV === "production") {
+    const issue = validateProductionPostgresUrl(databaseUrl, {
+      username: "atlas_migrator",
+      hostname: "db",
+      database: "atlas",
+    });
+    if (issue) throw new Error(`Production migration DATABASE_URL ${issue}.`);
+  }
+  return databaseUrl;
+}
 
+async function main(): Promise<void> {
+  const databaseUrl = readMigrationDatabaseUrl(process.env);
   const pool = createPool(databaseUrl);
   try {
     await runMigrations(pool);

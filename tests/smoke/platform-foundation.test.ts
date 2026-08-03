@@ -76,7 +76,16 @@ describe("Atlas V2 platform foundation smoke", () => {
         }),
         role: "owner",
       });
-      const agent = await identity.createServiceActor({
+      const ownerContext = {
+        actorId: owner.actorId,
+        actorType: "human" as const,
+        actorName: owner.actorName,
+        organizationId: rangewayOrganizationId,
+        role: "owner" as const,
+        userId: owner.userId,
+        requestId: randomUUID(),
+      };
+      const agent = await identity.createServiceActor(ownerContext, {
         organizationId: rangewayOrganizationId,
         actorType: "agent",
         displayName: "Foundation Agent",
@@ -88,7 +97,21 @@ describe("Atlas V2 platform foundation smoke", () => {
         "INSERT INTO organizations (id, slug, name) VALUES ($1, $2, $3)",
         [otherOrganizationId, `other-${randomUUID()}`, "Other organization"],
       );
+      const otherOwner = await identity.createHumanUser({
+        organizationId: otherOrganizationId,
+        email: `owner-${otherOrganizationId}@example.com`,
+        displayName: "Other Owner",
+        role: "owner",
+      });
       const otherAgent = await identity.createServiceActor({
+        actorId: otherOwner.actorId,
+        actorType: "human",
+        actorName: otherOwner.actorName,
+        organizationId: otherOrganizationId,
+        role: "owner",
+        userId: otherOwner.userId,
+        requestId: randomUUID(),
+      }, {
         organizationId: otherOrganizationId,
         actorType: "agent",
         displayName: "Other Organization Agent",
@@ -188,6 +211,7 @@ describe("Atlas V2 platform foundation smoke", () => {
         `SELECT actor_id, request_id, before, after
            FROM audit_events
           WHERE organization_id = $1
+            AND action = 'organization.updated'
           ORDER BY created_at, id`,
         [rangewayOrganizationId],
       );
@@ -201,6 +225,7 @@ describe("Atlas V2 platform foundation smoke", () => {
         `SELECT id, actor_id, request_id, event_type, published_at
            FROM outbox_events
           WHERE organization_id = $1
+            AND event_type = 'organization.updated.v1'
           ORDER BY created_at, id`,
         [rangewayOrganizationId],
       );
@@ -262,6 +287,7 @@ describe("Atlas V2 platform foundation smoke", () => {
         `SELECT id, published_at, last_error
            FROM outbox_events
           WHERE organization_id = $1
+            AND event_type = 'organization.updated.v1'
           ORDER BY created_at, id`,
         [rangewayOrganizationId],
       );

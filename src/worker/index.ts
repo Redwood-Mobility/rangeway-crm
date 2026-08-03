@@ -27,6 +27,8 @@ export function createProductionOutboxHandlers(): OutboxHandlerRegistry {
     [atlasEventTypes.identityOwnerProvisioned]: acknowledgeFoundationEvent,
     [atlasEventTypes.identityGoogleLinked]: acknowledgeFoundationEvent,
     [atlasEventTypes.identityGoogleProfileUpdated]: acknowledgeFoundationEvent,
+    [atlasEventTypes.identityServiceActorCreated]: acknowledgeFoundationEvent,
+    [atlasEventTypes.identityServiceActorDisabled]: acknowledgeFoundationEvent,
   } satisfies Record<AtlasEventType, OutboxHandler>;
 }
 

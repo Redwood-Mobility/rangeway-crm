@@ -9,15 +9,28 @@ set -euo pipefail
 : "${ATLAS_WORKER_PASSWORD:?ATLAS_WORKER_PASSWORD is required}"
 [[ "${POSTGRES_USER}" == "atlas" ]] \
   || { echo "Atlas bootstrap must run as the atlas database owner." >&2; exit 1; }
-for password_name in \
+password_names=(
   POSTGRES_BOOTSTRAP_PASSWORD \
   ATLAS_MIGRATOR_PASSWORD \
   ATLAS_WEB_PASSWORD \
-  ATLAS_WORKER_PASSWORD; do
+  ATLAS_WORKER_PASSWORD
+)
+password_values=()
+for password_name in "${password_names[@]}"; do
   password_value="${!password_name}"
   [[ "${password_value}" =~ ^[A-Za-z0-9_-]{24,128}$ ]] \
     || { echo "${password_name} must be a 24-128 character URL-safe credential using only letters, numbers, underscore, or hyphen." >&2; exit 1; }
+  password_values+=("${password_value}")
 done
+for ((password_index = 0; password_index < ${#password_names[@]}; password_index += 1)); do
+  for ((other_index = password_index + 1; other_index < ${#password_names[@]}; other_index += 1)); do
+    first_password="${password_values[password_index]}"
+    second_password="${password_values[other_index]}"
+    [[ "${first_password}" != "${second_password}" ]] \
+      || { echo "Atlas database role credentials must be pairwise distinct." >&2; exit 1; }
+  done
+done
+unset password_value password_values first_password second_password
 
 psql --variable=ON_ERROR_STOP=1 \
   --username="${POSTGRES_USER}" \

@@ -141,6 +141,8 @@ describe("outbox worker entrypoint lifecycle", () => {
       "identity.google-linked.v1",
       "identity.google-profile-updated.v1",
       "identity.owner-provisioned.v1",
+      "identity.service-actor-created.v1",
+      "identity.service-actor-disabled.v1",
       "organization.updated.v1",
     ]);
     for (const eventType of Object.keys(handlers)) {

@@ -105,6 +105,8 @@ Open `http://localhost:5173`. `npm run dev` is a convenience command for web plu
 
 An HTTP request may present one human session cookie or one Atlas bearer credential, never both. Every authenticated actor is organization-scoped and every mutation carries the actor and request ID into audit and outbox records.
 
+Service-actor creation and disablement currently exist only behind the internal guarded identity-service boundary. Each operation requires a current, enabled human owner in the same organization and commits the actor change, private audit record, and minimal outbox event in one transaction; creation returns the bearer secret exactly once. No public route or general-purpose operator CLI exposes this capability in the foundation. The reviewed creation, custody, rotation, and revocation ceremony is deferred to the Agent Platform milestone.
+
 Mutation routes that declare `Idempotency-Key` require a caller-generated key. Retrying the same operation, actor, organization, key, and request body returns the stored response without repeating business, audit, or outbox writes. Reusing that scope and key for a different request returns `409 CONFLICT`.
 
 Production uses `ATLAS_ORIGIN` as the browser return origin and `GOOGLE_REDIRECT_URI` as the exact OAuth callback. Both must be HTTPS, the callback must use the same origin, and the callback path is `/api/auth/google/callback`.

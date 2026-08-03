@@ -6,7 +6,10 @@ import path from "node:path";
 import type { Pool, PoolClient } from "pg";
 import { describe, expect, it, type TestContext } from "vitest";
 import { createPool } from "../../src/server/platform/db/client.js";
-import { runMigrations } from "../../src/server/platform/db/migrate.js";
+import {
+  readMigrationDatabaseUrl,
+  runMigrations,
+} from "../../src/server/platform/db/migrate.js";
 import {
   createTemporaryDatabase,
   isPostgreSqlUnreachable,
@@ -84,6 +87,31 @@ function fakePoolWithAppliedMigrations(
 }
 
 describe("PostgreSQL platform migrations", () => {
+  it("accepts only the exact least-privilege production migrator database contract", () => {
+    const valid = "postgresql://atlas_migrator:migrator-password-0123456789@db:5432/atlas";
+    expect(readMigrationDatabaseUrl({ NODE_ENV: "production", DATABASE_URL: valid })).toBe(valid);
+
+    for (const databaseUrl of [
+      "postgresql://atlas:bootstrap-password-0123456789@db:5432/atlas",
+      "postgresql://atlas_web:web-password-01234567890123@db:5432/atlas",
+      "postgresql://atlas_worker:worker-password-0123456789@db:5432/atlas",
+      "http://atlas_migrator:migrator-password-0123456789@db:5432/atlas",
+      "postgresql://atlas_migrator:migrator-password-0123456789@postgres:5432/atlas",
+      "postgresql://atlas_migrator:migrator-password-0123456789@db:5432/postgres",
+      "postgresql://atlas_migrator:migrator-password-0123456789@db:5432/atlas?sslmode=disable",
+      "postgresql://atlas_migrator:p%40ssword-with-reserved-chars@db:5432/atlas",
+    ]) {
+      expect(() =>
+        readMigrationDatabaseUrl({ NODE_ENV: "production", DATABASE_URL: databaseUrl }),
+      ).toThrow(/Production migration DATABASE_URL/);
+      try {
+        readMigrationDatabaseUrl({ NODE_ENV: "production", DATABASE_URL: databaseUrl });
+      } catch (error) {
+        expect(JSON.stringify(error)).not.toContain(databaseUrl);
+      }
+    }
+  });
+
   it("loads DATABASE_URL from a fresh-shell .env while preserving an explicit environment value", async () => {
     const directory = await mkdtemp(path.join(tmpdir(), "atlas-migrate-env-"));
     const migrationEntrypoint = path.join(

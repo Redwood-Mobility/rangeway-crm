@@ -33,6 +33,8 @@ paths:
         not create an Atlas session or link a Google subject.
       tags: [Identity]
       security: []
+      parameters:
+        - $ref: "#/components/parameters/RequestId"
       servers:
         - url: https://atlas.rangeway.app
           description: Atlas production origin
@@ -51,8 +53,13 @@ paths:
               description: Short-lived, HTTP-only OAuth state cookie.
               schema:
                 type: string
+            X-Request-Id:
+              $ref: "#/components/headers/RequestId"
         "503":
           description: Google OAuth is not configured.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/RequestId"
           content:
             text/plain:
               schema:
@@ -74,6 +81,7 @@ paths:
         - url: https://atlas.rangeway.app
           description: Atlas production origin
       parameters:
+        - $ref: "#/components/parameters/RequestId"
         - name: code
           in: query
           required: true
@@ -100,25 +108,47 @@ paths:
               description: Signed Atlas human session plus expiration of the OAuth state cookie.
               schema:
                 type: string
+            X-Request-Id:
+              $ref: "#/components/headers/RequestId"
         "400":
           description: Missing, malformed, expired, or mismatched OAuth state.
-          content:
-            text/plain:
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/RequestId"
+            Set-Cookie:
+              description: Expires the OAuth state cookie.
               schema:
                 type: string
-                const: Invalid Google sign-in state.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorBody"
         "401":
           description: The verified Google identity cannot authenticate an enabled Atlas human.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/RequestId"
+            Set-Cookie:
+              description: Expires the OAuth state cookie.
+              schema:
+                type: string
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/GoogleAuthError"
+                $ref: "#/components/schemas/ApiErrorBody"
         "500":
           description: Google exchange, verification, or identity persistence failed.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/RequestId"
+            Set-Cookie:
+              description: Expires the OAuth state cookie.
+              schema:
+                type: string
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/GoogleAuthError"
+                $ref: "#/components/schemas/ApiErrorBody"
   /health:
     get:
       operationId: getHealth
@@ -349,14 +379,6 @@ components:
           schema:
             $ref: "#/components/schemas/ApiErrorBody"
   schemas:
-    GoogleAuthError:
-      type: object
-      additionalProperties: false
-      required: [error]
-      properties:
-        error:
-          type: string
-          minLength: 1
     HealthResponse:
       type: object
       additionalProperties: false

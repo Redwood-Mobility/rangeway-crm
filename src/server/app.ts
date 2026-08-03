@@ -92,7 +92,12 @@ const v2Identity =
   options.v2Identity ?? new IdentityService(v2Pool);
 const v2Organizations =
   options.v2Organizations ?? new OrganizationService(v2Pool);
-const v2ErrorHandler = createApiErrorHandler(options.logger);
+const errorLogger: ErrorLogger = options.logger ?? {
+  error(message, context) {
+    console.error(message, context);
+  },
+};
+const v2ErrorHandler = createApiErrorHandler(errorLogger);
 const requireV1Auth = createRequireAuth(config.sessionSecret);
 const googleOAuth: GoogleOAuthGateway = options.googleOAuth ?? {
   async exchangeCode(code) {
@@ -401,7 +406,13 @@ app.get("/api/auth/google/callback", async (req, res, next) => {
     res.clearCookie("rw_oauth_state", { path: "/api/auth/google" });
 
     if (!code || !state || !expectedState || !constantTimeEqual(state, expectedState)) {
-      res.status(400).send("Invalid Google sign-in state.");
+      res.status(400).json({
+        error: {
+          code: "INVALID_INPUT",
+          message: "Google sign-in could not be completed.",
+          requestId: req.requestId,
+        },
+      });
       return;
     }
 
@@ -438,7 +449,21 @@ app.get("/api/auth/google/callback", async (req, res, next) => {
     );
     res.redirect(config.atlasOrigin);
   } catch (error) {
-    next(error);
+    errorLogger.error("Atlas Google callback failed.", {
+      requestId: req.requestId,
+      method: req.method,
+      path: req.path,
+      error,
+    });
+    const status = error instanceof ApiError ? error.status : 500;
+    const code = error instanceof ApiError ? error.code : "INTERNAL_ERROR";
+    res.status(status).json({
+      error: {
+        code,
+        message: "Google sign-in could not be completed.",
+        requestId: req.requestId,
+      },
+    });
   }
 });
 

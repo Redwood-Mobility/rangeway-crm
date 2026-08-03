@@ -393,6 +393,15 @@ describe("Atlas V2 API contract", () => {
     expect(googleSurface).toContain('"302":');
     expect(googleSurface).toContain('"400":');
     expect(googleSurface).toContain('"503":');
+    expect(googleSurface.match(/X-Request-Id:/g)?.length).toBeGreaterThanOrEqual(5);
+    const callbackSurface = googleSurface.slice(
+      googleSurface.indexOf("  /api/auth/google/callback:"),
+    );
+    for (const status of ['"400":', '"401":', '"500":']) {
+      const response = callbackSurface.slice(callbackSurface.indexOf(status));
+      expect(response.slice(0, response.indexOf("content:") + 8)).toContain("Set-Cookie:");
+      expect(response.slice(0, response.indexOf("content:") + 8)).toContain("X-Request-Id:");
+    }
   });
 
   it("does not issue a Google session when V2 actor validation rejects the human", async () => {
@@ -427,11 +436,91 @@ describe("Atlas V2 API contract", () => {
       .query({ code: "authorization-code", state: "known-oauth-state" })
       .set("Cookie", "rw_oauth_state=known-oauth-state");
 
+    const requestId = expectRequestId(response);
     expect(response.status).toBe(401);
-    expect(response.body).toEqual({ error: "Authentication required." });
+    expect(response.body).toEqual({
+      error: {
+        code: "UNAUTHENTICATED",
+        message: "Google sign-in could not be completed.",
+        requestId,
+      },
+    });
     expect(response.headers["set-cookie"] ?? []).not.toEqual(
       expect.arrayContaining([expect.stringMatching(/^rw_session=/)]),
     );
+    expect(response.headers["set-cookie"]).toEqual(
+      expect.arrayContaining([expect.stringMatching(/^rw_oauth_state=;/)]),
+    );
+  });
+
+  it.each([
+    ["provider", new Error("invalid_grant: provider diagnostic secret")],
+    [
+      "database",
+      Object.assign(new Error("SELECT google_subject FROM users WHERE private_sql = true"), {
+        code: "42P01",
+        detail: "private database detail",
+      }),
+    ],
+  ])("sanitizes %s failures on the public Google callback", async (_kind, failure) => {
+    const logged: Array<{ message: string; context: Record<string, unknown> }> = [];
+    const identity = new ContractIdentity();
+    const app = createApp({
+      config: {
+        ...config,
+        nodeEnv: "test",
+        authMode: "google",
+        isProduction: false,
+        sessionSecret: "contract-test-session-secret-at-least-32-characters",
+        googleClientId: "google-client-id",
+        googleClientSecret: "google-client-secret",
+      },
+      v2Identity: identity,
+      googleOAuth: {
+        exchangeCode: async () => {
+          throw failure;
+        },
+        verifyIdToken: async () => {
+          throw new Error("unreachable");
+        },
+      },
+      logger: {
+        error(message, context) {
+          logged.push({ message, context });
+        },
+      },
+    });
+
+    const response = await request(app)
+      .get("/api/auth/google/callback")
+      .query({ code: "authorization-code", state: "known-oauth-state" })
+      .set("Cookie", "rw_oauth_state=known-oauth-state");
+    const requestId = expectRequestId(response);
+
+    expect(response.status).toBe(500);
+    expect(response.body).toEqual({
+      error: {
+        code: "INTERNAL_ERROR",
+        message: "Google sign-in could not be completed.",
+        requestId,
+      },
+    });
+    expect(response.headers["set-cookie"]).toEqual(
+      expect.arrayContaining([expect.stringMatching(/^rw_oauth_state=;/)]),
+    );
+    expect(JSON.stringify(response.body)).not.toMatch(
+      /invalid_grant|provider diagnostic|SELECT|google_subject|42P01|private database/i,
+    );
+    expect(logged).toHaveLength(1);
+    expect(logged[0]).toMatchObject({
+      message: "Atlas Google callback failed.",
+      context: {
+        requestId,
+        path: "/api/auth/google/callback",
+        error: failure,
+      },
+    });
+    expect(JSON.stringify(logged)).not.toMatch(/authorization-code|known-oauth-state/);
   });
 
   it("does not expose local login outside local non-production mode", async () => {

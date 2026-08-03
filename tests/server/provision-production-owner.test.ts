@@ -113,6 +113,16 @@ function harness(initial: Partial<ProvisionState> = {}) {
 }
 
 describe("one-time production owner provisioning", () => {
+  it("relies on the organization lock without locking membership rows", async () => {
+    const source = await readFile(
+      new URL("../../src/server/platform/db/provision-production-owner.ts", import.meta.url),
+      "utf8",
+    );
+    expect(source).toContain("SELECT id FROM organizations WHERE id = $1 FOR UPDATE");
+    expect(source).toMatch(/FOR UPDATE OF a, u`/);
+    expect(source).not.toMatch(/FOR UPDATE OF a, u, m/);
+  });
+
   it("is an explicit command and is never part of web or worker startup", async () => {
     const packageJson = JSON.parse(await readFile("package.json", "utf8")) as {
       scripts: Record<string, string>;

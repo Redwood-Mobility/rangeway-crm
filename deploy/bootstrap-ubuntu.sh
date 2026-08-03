@@ -30,5 +30,12 @@ ufw allow 80/tcp
 ufw allow 443/tcp
 ufw --force enable
 
-mkdir -p /opt/atlas
-echo "Ubuntu is ready for Atlas deployment at /opt/atlas."
+install -m 0755 -d /opt/atlas-v2
+install -m 0700 -d /var/backups/atlas-v2
+install -m 0700 -d /var/lib/atlas-v2-deployment
+install -m 0755 deploy/deployment-coordinator.sh /usr/local/sbin/atlas-v2-deployment-coordinator
+install -m 0644 deploy/systemd/atlas-v2-deployment-guardian.service \
+  /etc/systemd/system/atlas-v2-deployment-guardian.service
+systemctl daemon-reload
+
+echo "Ubuntu is ready for Atlas V2 deployment at /opt/atlas-v2."

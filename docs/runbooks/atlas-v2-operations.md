@@ -121,6 +121,10 @@ docker compose exec -T db psql --username=atlas --dbname=atlas --command="SELECT
 
 The worker uses leases, `FOR UPDATE SKIP LOCKED`, idempotency keys, exponential backoff, and a bounded terminal state. Do not manually mark an event published. Before any operator-reviewed retry, identify and correct the handler failure, confirm idempotency, preserve the original record, and document the event IDs and decision.
 
+## Service-actor administration hold
+
+The foundation has a guarded internal service boundary for creating and disabling agent and automation actors. It requires a current, enabled human owner in the same organization; persists the actor change, private audit evidence, and minimal outbox evidence atomically; and returns a new bearer secret only once. There is intentionally no public API or operator CLI for this boundary yet. Do not create service actors with direct SQL or repurpose the development seed. The operator ceremony for identity approval, secret custody, rotation, and emergency revocation is deferred to the Agent Platform milestone and must be reviewed before a management surface is exposed.
+
 ## Backup invocation
 
 Backups contain both a PostgreSQL custom dump and the artifact archive. The script briefly stops only app services that were active, restarts that same subset, writes into a private pending directory, verifies non-empty artifacts, emits metadata and SHA-256 checksums, and publishes one final directory atomically.
@@ -150,7 +154,7 @@ This section documents the mechanism for a later approved release; it is not app
 3. Confirm the equipped foundation gates, Operating Core, representative acceptance projects, and cutover plan are approved.
 4. Confirm the production environment file contains no placeholders; uses `NODE_ENV=production` and `AUTH_MODE=google`; provides distinct 24-128 character `POSTGRES_BOOTSTRAP_PASSWORD`, `ATLAS_MIGRATOR_PASSWORD`, `ATLAS_WEB_PASSWORD`, and `ATLAS_WORKER_PASSWORD` values using only letters, numbers, underscore, or hyphen; and contains no shared `DATABASE_URL`. `ATLAS_ORIGIN` and `GOOGLE_REDIRECT_URI` must be HTTPS, use the same origin, and the callback must end at `/api/auth/google/callback`. Development-owner and one-time production-owner variables must be absent.
 5. Confirm the V1 archive and V1 volumes are intact.
-6. Confirm `setsid` and `flock` are installed on the Ubuntu host. If an Atlas V2 database already exists, the deployment script must create an exact fresh backup and run the deployed `deploy/restore-test.sh` against that exact `ATLAS_BACKUP_PATH` before any source synchronization or migration. Any missing or failed restore test stops deployment with the previous commit and exact backup path. A first-ever deployment with no V2 database has no prior state to back up and may proceed without this pre-deploy restore step.
+6. Confirm the bootstrap installed `/usr/local/sbin/atlas-v2-deployment-coordinator`, `atlas-v2-deployment-guardian.service`, and the private `/var/lib/atlas-v2-deployment` state directory. Confirm Docker and systemd are healthy. If an Atlas V2 database already exists, the deployment script must create an exact fresh backup and run the deployed `deploy/restore-test.sh` against that exact `ATLAS_BACKUP_PATH` before any source synchronization or migration. Any missing or failed restore test stops deployment with the previous commit and exact backup path. A first-ever deployment with no V2 database has no prior state to back up and may proceed without this pre-deploy restore step.
 7. Run the deploy script from the exact reviewed commit:
 
 ```bash
@@ -162,9 +166,11 @@ ATLAS_ENV_FILE=/etc/atlas-v2/production.env \
 ./deploy/deploy.sh
 ```
 
-The script validates the clean source tree, production password shape, and local gates; resolves remote paths before mutation; and captures the exact prior web and worker containers. For an existing V2 database it creates one backup with writers quiesced, proves that exact backup with a non-destructive restore test, and writes a private durable handoff record under the backup root. The local deployer must explicitly acknowledge that exact token, previous commit, backup, and container set. Until the compatibility boundary, a local failure attempts immediate recovery and a detached remote lease independently restarts the exact prior writers if the deployer disappears, including after acknowledgment. The default lease is 300 seconds; `ATLAS_PREFLIGHT_LEASE_SECONDS` may be set from 2 through 900 for a reviewed operation, and must exceed the reviewed pre-boundary synchronization/build window. Malformed or truncated state, a dropped connection, or a signal is a deployment failure.
+The script validates the clean source tree, pairwise-distinct production database credentials, local gates, and exact canonical remote paths. Its first remote release action asks the host-wide coordinator to acquire one durable token, capture the exact prior web and worker container set, persist the prior release marker, start the systemd guardian, and receive an acknowledgement for that same token. A concurrent deploy is refused. For an existing V2 database the script then creates one backup with writers quiesced, records the exact path in coordinator state before running the non-destructive restore test, and stops before synchronization if the proof fails.
 
-After synchronization and image build, the script marks the durable handoff at the compatibility boundary, rotates all database roles in one transaction, migrates through the operations-only migrator, starts the services, verifies target-bound and public HTTPS health, records `.atlas-release`, and marks the handoff complete. Once the boundary is marked, neither the lease nor failure handler restarts old writers; any credential or migration failure remains fail-closed.
+Before the compatibility boundary, an explicit failure or an expired lease makes the guardian restart only the exact writers that were active at acquisition. `ATLAS_DEPLOYMENT_LEASE_SECONDS` defaults to 900 and may be set from 2 through 900 for a reviewed operation; the deployer renews between bounded stages. Because the guardian is a boot-enabled systemd service with private host state, it reconciles again after host restart. Malformed state stops all writers and requires operator resolution rather than broad cleanup or a guessed restart.
+
+After synchronization and image build, the script atomically moves coordinator state from `quiesced` to `boundary`, rotates all database roles in one transaction, migrates through the operations-only migrator, starts the services, and verifies target-bound and public HTTPS health. At and after that boundary, expiration or failure stops web and worker and remains fail-closed on every reconciliation. Only after both health proofs does the coordinator atomically install `.atlas-release`, archive the completed state, and disable the guardian unit. A stale `recovery_failed` or `failed_closed` record blocks another deployment pending explicit operator resolution.
 
 Record the released commit, previous commit, exact backup path, target-bound health response, public health response, migration rows, and service status in the change record.
 
@@ -172,9 +178,9 @@ Record the released commit, previous commit, exact backup path, target-bound hea
 
 Rollback is manual and non-destructive. The deployment script deliberately does not auto-restore data.
 
-- **Before synchronization:** the backup/restore preflight restarts exactly the prior app containers if it had quiesced them. Investigate the local gate or preflight failure.
-- **After synchronization but before migration:** the deploy failure handler restarts exactly the captured prior-active containers. Inspect the synchronized source and failure evidence before retrying.
-- **At migration start or afterward:** the schema compatibility boundary has been crossed. The failure handler stops web and worker and leaves Atlas fail-closed. It never restarts the old containers automatically. Review the exact backup, migration prefix, and failed release before choosing a forward fix or an operator-approved recovery.
+- **Before synchronization:** the coordinator guardian restores exactly the prior-active writer containers if backup preflight had quiesced them. Investigate the local gate or preflight failure.
+- **After synchronization but before migration:** the same durable, boot-reconciled guardian restores exactly the captured prior-active writers when the owner fails or the lease expires. Inspect synchronized source and failure evidence before retrying.
+- **At the compatibility boundary or afterward:** the guardian stops web and worker and persists `failed_closed`. It repeats that stop on future reconciliation and never restarts old containers automatically. Review the exact backup, migration prefix, and failed release before choosing a forward fix or an operator-approved recovery.
 - **After writes on the new release:** do not overwrite the live database. Preserve it, identify the exact pre-deploy backup, run the non-destructive restore test, and convene an operator-reviewed recovery decision.
 - **Any V1/V2 ambiguity:** stop. Never attach a V2 service to a V1 volume and never treat the absence of V2 data as permission to migrate V1 implicitly.
 

@@ -145,7 +145,7 @@ async function findOwners(
         AND a.type = 'human'
         AND a.role = 'owner'
       ORDER BY a.created_at, a.id
-      FOR UPDATE OF a, u, m`,
+      FOR UPDATE OF a, u`,
     [organizationId],
   );
   return result.rows.map((row) => ({

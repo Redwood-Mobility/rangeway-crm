@@ -4,6 +4,8 @@ import argon2 from "argon2";
 import type { Pool, PoolClient } from "pg";
 import { describe, expect, it, type TestContext } from "vitest";
 import { ApiError } from "../../src/server/platform/http/api-error.js";
+import { recordAudit } from "../../src/server/modules/audit/audit.repository.js";
+import { enqueueEvent } from "../../src/server/modules/events/outbox.repository.js";
 import { createPool } from "../../src/server/platform/db/client.js";
 import { runMigrations } from "../../src/server/platform/db/migrate.js";
 import {
@@ -15,6 +17,9 @@ import {
   type ServiceActorRecord,
 } from "../../src/server/modules/identity/identity.repository.js";
 import { IdentityService } from "../../src/server/modules/identity/identity.service.js";
+import type { ActorContext } from "../../src/shared/identity.js";
+import type { AuditInput } from "../../src/server/modules/audit/audit.repository.js";
+import type { OutboxInput } from "../../src/server/modules/events/outbox.repository.js";
 import {
   createTemporaryDatabase,
   PostgreSqlUnavailableError,
@@ -47,6 +52,19 @@ function humanRecord(overrides: Partial<HumanActorRecord> = {}): HumanActorRecor
     localPasswordHash: null,
     actorDisabledAt: null,
     userDisabledAt: null,
+    ...overrides,
+  };
+}
+
+function actorContext(human: HumanActorRecord, overrides: Partial<ActorContext> = {}): ActorContext {
+  return {
+    actorId: human.actorId,
+    actorType: "human",
+    actorName: human.actorName,
+    organizationId: human.organizationId,
+    role: human.role,
+    userId: human.userId,
+    requestId: randomUUID(),
     ...overrides,
   };
 }
@@ -179,7 +197,17 @@ class MemoryIdentityRepository implements IdentityRepositoryPort {
     return this.service?.serviceKeyPrefix === prefix ? this.service : null;
   }
 
-  async disableActor(
+  async findServiceActorById(
+    scopedOrganizationId: string,
+    actorId: string,
+  ): Promise<ServiceActorRecord | null> {
+    return this.service?.organizationId === scopedOrganizationId &&
+      this.service.actorId === actorId
+      ? this.service
+      : null;
+  }
+
+  async disableServiceActor(
     scopedOrganizationId: string,
     actorId: string,
     disabledAt: Date,
@@ -318,9 +346,15 @@ describe("IdentityService", () => {
 
   it("creates agent credentials with a lookup prefix and only a SHA-256 hash at rest", async () => {
     const repository = new MemoryIdentityRepository();
-    const service = new IdentityService(fakePool(), repository);
+    repository.human = humanRecord();
+    const evidence = { audits: [] as AuditInput[], events: [] as OutboxInput[] };
+    const service = new IdentityService(fakePool(), repository, {
+      recordAudit: async (input) => { evidence.audits.push(input); },
+      enqueueEvent: async (input) => { evidence.events.push(input); },
+    });
+    const initiator = actorContext(repository.human);
 
-    const result = await service.createServiceActor({
+    const result = await service.createServiceActor(initiator, {
       organizationId,
       actorType: "agent",
       displayName: "Site diligence agent",
@@ -345,14 +379,38 @@ describe("IdentityService", () => {
     expect(repository.storedHash).toHaveLength(64);
     expect(repository.storedHash).not.toContain(result.serviceKey);
     expect(result).not.toHaveProperty("serviceKeyHash");
+    expect(evidence.audits).toEqual([
+      expect.objectContaining({
+        actorId: initiator.actorId,
+        requestId: initiator.requestId,
+        action: "identity.service_actor.created",
+        resourceType: "actor",
+        resourceId: result.actorId,
+      }),
+    ]);
+    expect(evidence.events).toEqual([
+      expect.objectContaining({
+        actorId: initiator.actorId,
+        eventType: "identity.service-actor-created.v1",
+        aggregateId: result.actorId,
+        payload: {
+          organizationId,
+          actorId: result.actorId,
+          actorType: "agent",
+          role: "member",
+        },
+      }),
+    ]);
+    expect(JSON.stringify(evidence)).not.toContain(result.serviceKey);
   });
 
   it("rejects human actors from the service credential creation path", async () => {
     const repository = new MemoryIdentityRepository();
+    repository.human = humanRecord();
     const service = new IdentityService(fakePool(), repository);
 
     await expect(
-      service.createServiceActor({
+      service.createServiceActor(actorContext(repository.human), {
         organizationId,
         actorType: "human" as "agent",
         displayName: "Not a service actor",
@@ -364,8 +422,9 @@ describe("IdentityService", () => {
 
   it("uses one indistinguishable error for missing, invalid, and disabled service credentials", async () => {
     const repository = new MemoryIdentityRepository();
+    repository.human = humanRecord();
     const service = new IdentityService(fakePool(), repository);
-    const created = await service.createServiceActor({
+    const created = await service.createServiceActor(actorContext(repository.human), {
       organizationId,
       actorType: "automation",
       displayName: "Report automation",
@@ -404,6 +463,83 @@ describe("IdentityService", () => {
     await expect(service.authenticateServiceKey(created.serviceKey)).rejects.toMatchObject(
       expected,
     );
+  });
+
+  it("requires a current human owner in the same organization for service actor changes", async () => {
+    const repository = new MemoryIdentityRepository();
+    repository.human = humanRecord({ role: "admin" });
+    const service = new IdentityService(fakePool(), repository);
+    const input = {
+      organizationId,
+      actorType: "agent" as const,
+      displayName: "Guarded agent",
+      role: "member" as const,
+    };
+
+    await expect(service.createServiceActor(actorContext(repository.human), input))
+      .rejects.toMatchObject({ status: 403, code: "FORBIDDEN" });
+    await expect(service.createServiceActor(
+      actorContext(repository.human, { role: "owner", organizationId: randomUUID() }),
+      input,
+    )).rejects.toMatchObject({ status: 403, code: "FORBIDDEN" });
+    expect(repository.createServiceInput).toBeNull();
+  });
+
+  it("rolls back service actor creation and evidence together", async () => {
+    const repository = new MemoryIdentityRepository();
+    repository.human = humanRecord();
+    const queries: string[] = [];
+    const service = new IdentityService(fakePool(queries), repository, {
+      recordAudit: async () => undefined,
+      enqueueEvent: async () => undefined,
+      precommitHook: async () => { throw new Error("forced service actor failure"); },
+    });
+
+    await expect(service.createServiceActor(actorContext(repository.human), {
+      organizationId,
+      actorType: "automation",
+      displayName: "Rollback automation",
+      role: "viewer",
+    })).rejects.toThrow("forced service actor failure");
+    expect(queries).toEqual(["BEGIN", "ROLLBACK"]);
+  });
+
+  it("disables a service actor atomically, then treats the exact repeat as a no-op", async () => {
+    const repository = new MemoryIdentityRepository();
+    repository.human = humanRecord();
+    const evidence = { audits: [] as AuditInput[], events: [] as OutboxInput[] };
+    const service = new IdentityService(fakePool(), repository, {
+      recordAudit: async (input) => { evidence.audits.push(input); },
+      enqueueEvent: async (input) => { evidence.events.push(input); },
+    });
+    const initiator = actorContext(repository.human);
+    const created = await service.createServiceActor(initiator, {
+      organizationId,
+      actorType: "agent",
+      displayName: "Disposable agent",
+      role: "member",
+    });
+    evidence.audits.length = 0;
+    evidence.events.length = 0;
+
+    await expect(service.disableServiceActor(initiator, created.actorId))
+      .resolves.toBe("disabled");
+    await expect(service.disableServiceActor(initiator, created.actorId))
+      .resolves.toBe("unchanged");
+    expect(evidence.audits).toEqual([
+      expect.objectContaining({
+        actorId: initiator.actorId,
+        action: "identity.service_actor.disabled",
+        resourceId: created.actorId,
+      }),
+    ]);
+    expect(evidence.events).toEqual([
+      expect.objectContaining({
+        actorId: initiator.actorId,
+        eventType: "identity.service-actor-disabled.v1",
+        aggregateId: created.actorId,
+      }),
+    ]);
   });
 
   it("rejects a disabled human actor with the same authentication error", async () => {
@@ -460,6 +596,27 @@ describe("IdentityService", () => {
 });
 
 describe("IdentityRepository organization scoping", () => {
+  it("locks only actor and user rows while reading the membership normally", async () => {
+    let observedSql = "";
+    const client = {
+      query: async (sql: string) => {
+        observedSql = sql;
+        return { rows: [], rowCount: 0 };
+      },
+    } as unknown as PoolClient;
+
+    await new IdentityRepository().findHumanActorByEmail(
+      organizationId,
+      "owner@rangeway.energy",
+      client,
+      { forUpdate: true },
+    );
+
+    expect(observedSql).toContain("JOIN organization_memberships m");
+    expect(observedSql).toMatch(/FOR UPDATE OF a, u\s*$/);
+    expect(observedSql).not.toMatch(/FOR UPDATE OF[^\n]*\bm\b/);
+  });
+
   it("defines persisted actor roles and organization-role integrity constraints", async () => {
     const migration = await readFile(
       new URL("../../db/migrations/0001_platform.sql", import.meta.url),
@@ -526,7 +683,7 @@ describe("IdentityRepository organization scoping", () => {
       },
     } as unknown as PoolClient;
 
-    const result = await new IdentityRepository().disableActor(
+    const result = await new IdentityRepository().disableServiceActor(
       organizationId,
       actorId,
       disabledAt,
@@ -552,6 +709,14 @@ describe("PostgreSQL identity lifecycle", () => {
         role: "owner",
       });
       const agent = await service.createServiceActor({
+        actorId: human.actorId,
+        actorType: "human",
+        actorName: human.actorName,
+        organizationId,
+        role: "owner",
+        userId: human.userId,
+        requestId: randomUUID(),
+      }, {
         organizationId,
         actorType: "agent",
         displayName: "Diligence agent",
@@ -595,6 +760,33 @@ describe("PostgreSQL identity lifecycle", () => {
         organizationId,
         role: "member",
       });
+
+      const rollbackService = new IdentityService(pool, new IdentityRepository(), {
+        recordAudit,
+        enqueueEvent,
+        precommitHook: async () => { throw new Error("forced disable rollback"); },
+      });
+      await expect(
+        rollbackService.disableServiceActor(
+          actorContext({
+            ...human,
+            googleSubject: null,
+            localPasswordHash: "argon2id-test-hash",
+            actorDisabledAt: null,
+            userDisabledAt: null,
+          }),
+          agent.actorId,
+        ),
+      ).rejects.toThrow("forced disable rollback");
+      const rolledBackDisable = await pool.query(
+        `SELECT disabled_at,
+                (SELECT count(*)::int FROM audit_events WHERE action = 'identity.service_actor.disabled') AS audits,
+                (SELECT count(*)::int FROM outbox_events WHERE event_type = 'identity.service-actor-disabled.v1') AS events
+           FROM actors
+          WHERE organization_id = $1 AND id = $2`,
+        [organizationId, agent.actorId],
+      );
+      expect(rolledBackDisable.rows).toEqual([{ disabled_at: null, audits: 0, events: 0 }]);
     });
   });
 

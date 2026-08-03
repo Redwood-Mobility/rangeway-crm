@@ -2,6 +2,7 @@ node_modules/
 dist/
 data/
 uploads/
+/artifacts/
 .env
 .env.*
 !.env.example

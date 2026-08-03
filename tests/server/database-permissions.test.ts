@@ -3,6 +3,8 @@ import type { Pool } from "pg";
 import { describe, expect, it, type TestContext } from "vitest";
 import { createPool } from "../../src/server/platform/db/client.js";
 import { runMigrations } from "../../src/server/platform/db/migrate.js";
+import { IdentityService } from "../../src/server/modules/identity/identity.service.js";
+import { provisionProductionOwnerWithPool } from "../../src/server/platform/db/provision-production-owner.js";
 import {
   createTemporaryDatabase,
   PostgreSqlUnavailableError,
@@ -47,6 +49,27 @@ async function withTemporaryPostgreSql(
 }
 
 describe("least-privilege PostgreSQL roles", () => {
+  it("narrows worker outbox updates to worker-managed columns in an additive migration", async () => {
+    const migration = await source("db/migrations/0004_worker_outbox_permissions.sql");
+    expect(migration).toContain("REVOKE UPDATE ON outbox_events FROM atlas_worker");
+    expect(migration).toMatch(/GRANT UPDATE\s*\([\s\S]*attempt_count[\s\S]*available_at[\s\S]*processing_started_at[\s\S]*processing_token[\s\S]*published_at[\s\S]*terminal_at[\s\S]*last_error[\s\S]*updated_at[\s\S]*\)\s*ON outbox_events TO atlas_worker/);
+    for (const immutableColumn of [
+      "id",
+      "organization_id",
+      "actor_id",
+      "request_id",
+      "event_type",
+      "aggregate_type",
+      "aggregate_id",
+      "schema_version",
+      "payload",
+      "created_at",
+    ]) {
+      const grant = migration.slice(migration.indexOf("GRANT UPDATE"));
+      expect(grant).not.toMatch(new RegExp(`\\b${immutableColumn}\\b`));
+    }
+  });
+
   it("defines separate bootstrap, migrator, web, and worker credentials without embedding secrets", async () => {
     const [compose, environment, bootstrap] = await Promise.all([
       source("docker-compose.yml"),
@@ -79,6 +102,20 @@ describe("least-privilege PostgreSQL roles", () => {
          VALUES ($1, $2, 'automation', 'member', 'permission01', $3, 'Permission test')`,
         [actorId, organizationId, "a".repeat(64)],
       );
+      const outboxId = "30000000-0000-4000-8000-000000000001";
+      await pool.query(
+        `INSERT INTO outbox_events
+           (id, organization_id, actor_id, request_id, event_type, aggregate_type,
+            aggregate_id, schema_version, payload)
+         VALUES ($1, $2, $3, $4, 'permission.test.v1', 'organization', $2, 1, $5)`,
+        [
+          outboxId,
+          organizationId,
+          actorId,
+          "40000000-0000-4000-8000-000000000001",
+          { private: "immutable" },
+        ],
+      );
       await pool.query(
         `INSERT INTO audit_events
            (organization_id, actor_id, request_id, action, resource_type, resource_id)
@@ -105,6 +142,31 @@ describe("least-privilege PostgreSQL roles", () => {
 
         await client.query("SET ROLE atlas_worker");
         await expect(client.query("SELECT id FROM outbox_events LIMIT 1")).resolves.toBeDefined();
+        await expect(client.query(
+          `UPDATE outbox_events
+              SET attempt_count = attempt_count + 1,
+                  available_at = now(),
+                  processing_started_at = now(),
+                  processing_token = $2,
+                  published_at = now(),
+                  terminal_at = now(),
+                  last_error = 'bounded',
+                  updated_at = now()
+            WHERE id = $1`,
+          [outboxId, "50000000-0000-4000-8000-000000000001"],
+        )).resolves.toMatchObject({ rowCount: 1 });
+        await expect(client.query(
+          "UPDATE outbox_events SET event_type = 'tampered.v1' WHERE id = $1",
+          [outboxId],
+        )).rejects.toMatchObject({ code: "42501" });
+        await expect(client.query(
+          "UPDATE outbox_events SET payload = '{}'::jsonb WHERE id = $1",
+          [outboxId],
+        )).rejects.toMatchObject({ code: "42501" });
+        await expect(client.query(
+          "UPDATE outbox_events SET organization_id = organization_id WHERE id = $1",
+          [outboxId],
+        )).rejects.toMatchObject({ code: "42501" });
         await expect(client.query("UPDATE organizations SET name = name"))
           .rejects.toMatchObject({ code: "42501" });
         await expect(client.query("SELECT * FROM schema_migrations"))
@@ -120,6 +182,53 @@ describe("least-privilege PostgreSQL roles", () => {
         .rejects.toMatchObject({ code: "P0001" });
       await expect(pool.query("TRUNCATE audit_events"))
         .rejects.toMatchObject({ code: "P0001" });
+    });
+  });
+
+  it("runs owner provisioning and verified Google linking under SET ROLE atlas_web", async (context) => {
+    await withTemporaryPostgreSql(context, async (pool) => {
+      const client = await pool.connect();
+      const rolePool = {
+        connect: async () => ({
+          query: client.query.bind(client),
+          release() {},
+        }),
+      } as unknown as Pool;
+      try {
+        await client.query("SET ROLE atlas_web");
+        await expect(provisionProductionOwnerWithPool(rolePool, {
+          databaseUrl: "postgresql://atlas_web:redacted-for-equipped-test@db:5432/atlas",
+          email: "owner@rangeway.energy",
+          displayName: "Rangeway Owner",
+          allowedDomain: "rangeway.energy",
+        })).resolves.toBe("created");
+
+        await expect(new IdentityService(rolePool).authenticateGoogle(
+          "00000000-0000-4000-8000-000000000001",
+          "google-subject-equipped-test",
+          "owner@rangeway.energy",
+          "Rangeway Owner",
+          "60000000-0000-4000-8000-000000000001",
+        )).resolves.toMatchObject({
+          actorType: "human",
+          actorName: "Rangeway Owner",
+          role: "owner",
+        });
+        await client.query("RESET ROLE");
+
+        const evidence = await pool.query<{ google_subject: string; count: string }>(
+          `SELECT u.google_subject,
+                  (SELECT count(*)::text FROM audit_events) AS count
+             FROM users u
+            WHERE u.email = 'owner@rangeway.energy'`,
+        );
+        expect(evidence.rows).toEqual([
+          { google_subject: "google-subject-equipped-test", count: "2" },
+        ]);
+      } finally {
+        await client.query("RESET ROLE").catch(() => undefined);
+        client.release();
+      }
     });
   });
 });
