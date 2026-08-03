@@ -1,9 +1,12 @@
 import type { QueryResultRow } from "pg";
+import type {
+  ActorType,
+  OrganizationRole,
+} from "../../../shared/identity.js";
 import type { DbClient } from "../../platform/db/client.js";
 
-export type ActorType = "human" | "agent" | "automation";
 export type ServiceActorType = Exclude<ActorType, "human">;
-export type OrganizationRole = "owner" | "admin" | "member" | "viewer";
+export type { ActorType, OrganizationRole } from "../../../shared/identity.js";
 
 export type QueryClient = Pick<DbClient, "query">;
 

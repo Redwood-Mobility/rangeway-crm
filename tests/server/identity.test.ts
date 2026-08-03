@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
+import argon2 from "argon2";
 import type { Pool, PoolClient } from "pg";
 import { describe, expect, it, type TestContext } from "vitest";
 import { ApiError } from "../../src/server/platform/http/api-error.js";
@@ -169,6 +170,52 @@ async function withTemporaryPostgreSql(
 }
 
 describe("IdentityService", () => {
+  it("verifies local human passwords only from an Argon2id hash", async () => {
+    const repository = new MemoryIdentityRepository();
+    repository.human = humanRecord({
+      localPasswordHash: await argon2.hash("correct-horse-battery-staple", {
+        type: argon2.argon2id,
+      }),
+    });
+    const service = new IdentityService(fakePool(), repository);
+
+    await expect(
+      service.authenticateLocal(
+        organizationId,
+        "ZAK@WINNICK.IO",
+        "correct-horse-battery-staple",
+      ),
+    ).resolves.toEqual({
+      actorId: repository.human.actorId,
+      actorType: "human",
+      actorName: "Zak Winnick",
+      organizationId,
+      role: "owner",
+      userId: repository.human.userId,
+    });
+
+    const expected = {
+      status: 401,
+      code: "UNAUTHENTICATED",
+      message: "Authentication required.",
+    };
+    await expect(
+      service.authenticateLocal(
+        organizationId,
+        "zak@winnick.io",
+        "wrong-password",
+      ),
+    ).rejects.toMatchObject(expected);
+    repository.human = humanRecord({ localPasswordHash: null });
+    await expect(
+      service.authenticateLocal(
+        organizationId,
+        "zak@winnick.io",
+        "correct-horse-battery-staple",
+      ),
+    ).rejects.toMatchObject(expected);
+  });
+
   it("lowercases human email, creates inside one transaction, and returns no password hash", async () => {
     const transactionStatements: string[] = [];
     const repository = new MemoryIdentityRepository();

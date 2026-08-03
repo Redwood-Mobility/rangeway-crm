@@ -1,16 +1,19 @@
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import argon2 from "argon2";
 import type { Pool } from "pg";
+import type {
+  ActorContext,
+  OrganizationRole,
+} from "../../../shared/identity.js";
 import { withTransaction } from "../../platform/db/client.js";
 import { ApiError } from "../../platform/http/api-error.js";
 import {
   IdentityRepository,
-  type ActorType,
   type CreatedHumanActorRecord,
   type CreateHumanUserInput,
   type CreateServiceActorInput,
   type HumanActorRecord,
   type IdentityRepositoryPort,
-  type OrganizationRole,
   type ServiceActorRecord,
 } from "./identity.repository.js";
 
@@ -24,14 +27,7 @@ const roleRank: Record<OrganizationRole, number> = {
 const unauthenticatedError = () =>
   new ApiError(401, "UNAUTHENTICATED", "Authentication required.");
 
-export interface ActorIdentity {
-  actorId: string;
-  actorType: ActorType;
-  actorName: string;
-  organizationId: string;
-  role: OrganizationRole;
-  userId?: string;
-}
+export type ActorIdentity = Omit<ActorContext, "requestId">;
 
 export interface CreatedHumanIdentity extends ActorIdentity {
   actorType: "human";
@@ -145,6 +141,36 @@ export class IdentityService {
     if (!actor || actor.actorDisabledAt || actor.userDisabledAt) {
       throw unauthenticatedError();
     }
+    return authenticatedHumanIdentity(actor);
+  }
+
+  async authenticateLocal(
+    organizationId: string,
+    email: string,
+    password: string,
+  ): Promise<ActorIdentity> {
+    const actor = await this.repository.findHumanActorByEmail(
+      organizationId,
+      email.toLowerCase(),
+      this.pool,
+    );
+    if (
+      !actor ||
+      actor.actorDisabledAt ||
+      actor.userDisabledAt ||
+      !actor.localPasswordHash ||
+      !actor.localPasswordHash.startsWith("$argon2id$")
+    ) {
+      throw unauthenticatedError();
+    }
+
+    let passwordMatches = false;
+    try {
+      passwordMatches = await argon2.verify(actor.localPasswordHash, password);
+    } catch {
+      throw unauthenticatedError();
+    }
+    if (!passwordMatches) throw unauthenticatedError();
     return authenticatedHumanIdentity(actor);
   }
 

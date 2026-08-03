@@ -10,6 +10,17 @@ import { ZodError } from "zod";
 import { config as defaultConfig } from "./config.js";
 import { clearSessionCookie, constantTimeEqual, currentUser, requireAuth, setSessionCookie } from "./auth.js";
 import { db, migrate, now, upsertUser } from "./db.js";
+import { IdentityService } from "./modules/identity/identity.service.js";
+import {
+  createIdentityRouter,
+  type V2IdentityPort,
+} from "./modules/identity/identity.routes.js";
+import { createPool } from "./platform/db/client.js";
+import {
+  createApiErrorHandler,
+  type ErrorLogger,
+} from "./platform/http/error-handler.js";
+import { assignRequestContext } from "./platform/http/request-context.js";
 import {
   contactSchema,
   activitySchema,
@@ -32,12 +43,21 @@ const allowedMimeTypes = new Set([
   "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 ]);
 
-export function createApp(options: { config?: typeof defaultConfig } = {}): express.Express {
+export interface CreateAppOptions {
+  config?: typeof defaultConfig;
+  v2Identity?: V2IdentityPort;
+  logger?: ErrorLogger;
+}
+
+export function createApp(options: CreateAppOptions = {}): express.Express {
 const config = options.config ?? defaultConfig;
 const app = express();
 const clientDir = path.join(process.cwd(), "dist", "client");
 const documentDir = path.join(config.uploadDir, "documents");
 const tempDir = path.join(config.uploadDir, "tmp");
+const v2Identity =
+  options.v2Identity ?? new IdentityService(createPool(config.databaseUrl));
+const v2ErrorHandler = createApiErrorHandler(options.logger);
 
 fs.mkdirSync(documentDir, { recursive: true });
 fs.mkdirSync(tempDir, { recursive: true });
@@ -56,12 +76,15 @@ const upload = multer({
   }
 });
 
+app.use(assignRequestContext);
 app.use(express.json({ limit: "1mb" }));
 app.use(cookieParser());
 
 if (!config.isProduction) {
   app.use(cors({ origin: "http://localhost:5173", credentials: true }));
 }
+
+app.use("/api/v2", createIdentityRouter(config, v2Identity));
 
 function normalizeRecord(row: Row) {
   const record: Row = {};
@@ -257,10 +280,6 @@ function getProject(id: string) {
 
 app.get("/api/health", (_req, res) => {
   res.json({ ok: true, time: now() });
-});
-
-app.get("/api/v2/health", (_req, res) => {
-  res.json({ status: "ok", service: "atlas-web", apiVersion: "v2" });
 });
 
 app.get("/api/me", (req, res) => {
@@ -927,7 +946,11 @@ app.delete("/api/tasks/:id", (req, res) => {
   res.json({ ok: true });
 });
 
-app.use((error: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+app.use((error: unknown, req: express.Request, res: express.Response, next: express.NextFunction) => {
+  if (req.originalUrl.startsWith("/api/v2")) {
+    v2ErrorHandler(error, req, res, next);
+    return;
+  }
   if (error instanceof ZodError) {
     res.status(400).json({ error: "Invalid input", details: error.flatten() });
     return;

@@ -1,0 +1,273 @@
+openapi: 3.1.0
+info:
+  title: Atlas V2 API
+  version: 2.0.0
+  summary: Rangeway's internal relationship and site-development API.
+  description: >-
+    The authenticated API boundary for Atlas. Clients may present either a signed
+    human session cookie or one Atlas bearer credential, but never both.
+  license:
+    name: Proprietary
+    identifier: LicenseRef-Proprietary
+servers:
+  - url: https://atlas.rangeway.app/api/v2
+    description: Atlas production
+tags:
+  - name: System
+    description: Service health and readiness.
+  - name: Identity
+    description: Actor authentication and session lifecycle.
+security:
+  - sessionCookie: []
+  - atlasBearer: []
+paths:
+  /health:
+    get:
+      operationId: getHealth
+      summary: Get API health
+      description: Returns the V2 web service identity without requiring authentication.
+      tags: [System]
+      security: []
+      parameters:
+        - $ref: "#/components/parameters/RequestId"
+      responses:
+        "200":
+          description: The API process is available.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+        "500":
+          $ref: "#/components/responses/ApiError"
+        4XX:
+          $ref: "#/components/responses/ApiError"
+  /me:
+    get:
+      operationId: getCurrentActor
+      summary: Get the current actor
+      description: Resolves the authenticated human, agent, or automation actor.
+      tags: [Identity]
+      parameters:
+        - $ref: "#/components/parameters/RequestId"
+      responses:
+        "200":
+          description: The current actor context.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [actor]
+                properties:
+                  actor:
+                    $ref: "#/components/schemas/ActorContext"
+        "401":
+          $ref: "#/components/responses/ApiError"
+        "500":
+          $ref: "#/components/responses/ApiError"
+  /auth/local/login:
+    post:
+      operationId: createLocalSession
+      summary: Create a local development session
+      description: >-
+        Verifies an Argon2id password and creates a signed human session. This route
+        is hidden with a 404 unless local authentication is enabled outside production.
+      tags: [Identity]
+      security: []
+      parameters:
+        - $ref: "#/components/parameters/RequestId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LocalLoginRequest"
+      responses:
+        "200":
+          description: The signed session was created.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/RequestId"
+            Set-Cookie:
+              description: Secure, HTTP-only signed human session cookie.
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [actor]
+                properties:
+                  actor:
+                    $ref: "#/components/schemas/ActorContext"
+        "400":
+          $ref: "#/components/responses/ApiError"
+        "401":
+          $ref: "#/components/responses/ApiError"
+        "404":
+          $ref: "#/components/responses/ApiError"
+        "500":
+          $ref: "#/components/responses/ApiError"
+  /auth/logout:
+    post:
+      operationId: deleteCurrentSession
+      summary: Clear the current human session
+      description: Clears the signed session cookie whether or not it is currently valid.
+      tags: [Identity]
+      security: []
+      parameters:
+        - $ref: "#/components/parameters/RequestId"
+      responses:
+        "200":
+          description: The human session cookie was cleared.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/RequestId"
+            Set-Cookie:
+              description: Expired human session cookie.
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [ok]
+                properties:
+                  ok:
+                    type: boolean
+                    const: true
+        "500":
+          $ref: "#/components/responses/ApiError"
+        4XX:
+          $ref: "#/components/responses/ApiError"
+components:
+  securitySchemes:
+    sessionCookie:
+      type: apiKey
+      in: cookie
+      name: rw_session
+      description: HMAC-signed, expiring human session cookie.
+    atlasBearer:
+      type: http
+      scheme: bearer
+      bearerFormat: atlas_<12-character-prefix>.<secret>
+      description: Atlas agent or automation credential.
+  parameters:
+    RequestId:
+      name: X-Request-Id
+      in: header
+      required: false
+      description: A valid caller-supplied UUID to retain for end-to-end tracing.
+      schema:
+        type: string
+        format: uuid
+  headers:
+    RequestId:
+      required: true
+      description: The retained or server-generated request UUID.
+      schema:
+        type: string
+        format: uuid
+  responses:
+    ApiError:
+      description: A stable, safe API error. Private and unknown resources both use NOT_FOUND.
+      headers:
+        X-Request-Id:
+          $ref: "#/components/headers/RequestId"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ApiErrorBody"
+  schemas:
+    HealthResponse:
+      type: object
+      additionalProperties: false
+      required: [status, service, apiVersion]
+      properties:
+        status:
+          type: string
+          const: ok
+        service:
+          type: string
+          const: atlas-web
+        apiVersion:
+          type: string
+          const: v2
+    LocalLoginRequest:
+      type: object
+      additionalProperties: false
+      required: [email, password]
+      properties:
+        email:
+          type: string
+          format: email
+        password:
+          type: string
+          format: password
+          minLength: 1
+    ActorContext:
+      type: object
+      additionalProperties: false
+      required:
+        - actorId
+        - actorType
+        - actorName
+        - organizationId
+        - role
+        - requestId
+      properties:
+        actorId:
+          type: string
+          format: uuid
+        actorType:
+          type: string
+          enum: [human, agent, automation]
+        actorName:
+          type: string
+          minLength: 1
+        organizationId:
+          type: string
+          format: uuid
+        role:
+          type: string
+          enum: [owner, admin, member, viewer]
+        requestId:
+          type: string
+          format: uuid
+        userId:
+          type: string
+          format: uuid
+    ApiErrorBody:
+      type: object
+      additionalProperties: false
+      required: [error]
+      properties:
+        error:
+          type: object
+          additionalProperties: false
+          required: [code, message, requestId]
+          properties:
+            code:
+              type: string
+              enum:
+                - INVALID_INPUT
+                - UNAUTHENTICATED
+                - FORBIDDEN
+                - NOT_FOUND
+                - CONFLICT
+                - RATE_LIMITED
+                - INTERNAL_ERROR
+            message:
+              type: string
+            requestId:
+              type: string
+              format: uuid
+            details: true
