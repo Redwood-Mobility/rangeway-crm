@@ -1,0 +1,147 @@
+/*
+ * Atlas design tokens.
+ *
+ * Direction: an industrial-utilitarian operating surface with editorial warmth.
+ * Explicit grids, durable borders, compact metadata, tabular numbers and status
+ * semantics; cream and paper canvases, charcoal ink, a limited amber accent and
+ * calm sage support.
+ *
+ * Feature CSS must reference the semantic tokens (`--surface-*`, `--text-*`,
+ * `--border-*`, `--status-*`), never the raw palette below.
+ */
+
+:root {
+  /* Palette seed. Not for direct use in feature CSS. */
+  --palette-ink: #171514;
+  --palette-charcoal: #2d2d2d;
+  --palette-amber: #f4a855;
+  --palette-amber-deep: #d77927;
+  --palette-sage: #4a5d52;
+  --palette-moss: #273b34;
+  --palette-cream: #f5f1eb;
+  --palette-paper: #fbf7f1;
+  --palette-alert: #b3261e;
+
+  /* Type. Barlow Condensed carries display, Plex Sans carries the interface,
+     Plex Mono carries identifiers, timestamps, checksums and metrics. */
+  --font-display: "Barlow Condensed", "Helvetica Neue", Arial, sans-serif;
+  --font-sans: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace;
+
+  --text-3xl: 2.25rem;
+  --text-2xl: 1.75rem;
+  --text-xl: 1.375rem;
+  --text-lg: 1.0625rem;
+  --text-base: 0.9375rem;
+  --text-sm: 0.8125rem;
+  --text-xs: 0.75rem;
+
+  /* Density. One persistent user preference, never inferred from viewport. */
+  --row-height: 2.75rem;
+  --control-height: 2.25rem;
+  --pad-block: 0.625rem;
+  --pad-inline: 0.875rem;
+  --section-gap: 1.5rem;
+
+  /* Restrained radii — operational, not decorative. */
+  --radius-sm: 3px;
+  --radius-md: 5px;
+  --radius-lg: 8px;
+
+  --border-width: 1px;
+  --shadow-panel: 0 1px 2px rgb(23 21 20 / 0.06);
+  --shadow-overlay: 0 12px 32px rgb(23 21 20 / 0.22);
+
+  --transition: 120ms ease;
+  --tap-target: 44px;
+}
+
+:root[data-density="compact"] {
+  --row-height: 2.25rem;
+  --control-height: 2rem;
+  --pad-block: 0.4375rem;
+  --pad-inline: 0.6875rem;
+  --section-gap: 1.125rem;
+  --text-base: 0.875rem;
+}
+
+/* Light theme. */
+:root,
+:root[data-theme="light"] {
+  color-scheme: light;
+
+  --surface-canvas: var(--palette-cream);
+  --surface-panel: var(--palette-paper);
+  --surface-raised: #ffffff;
+  --surface-sunken: #ece6dc;
+  --surface-inverse: var(--palette-ink);
+  --surface-hover: #ebe4d8;
+  --surface-selected: #f7e4cb;
+
+  --text-primary: var(--palette-ink);
+  --text-secondary: #4a423c;
+  --text-muted: #6b625b;
+  --text-inverse: var(--palette-paper);
+  /* #d77927 reaches only 2.8:1 on cream, so light-surface accent text is
+     darkened to #9a5214 (5.2:1). The bright amber stays a fill, not a text colour. */
+  --text-accent: #9a5214;
+
+  --border-default: #ded5c7;
+  --border-strong: #c3b8a6;
+  --border-subtle: #e9e2d6;
+
+  --accent: var(--palette-amber);
+  --accent-strong: var(--palette-amber-deep);
+  --accent-contrast: var(--palette-ink);
+  --focus: #7a4a12;
+
+  --status-neutral-fg: #57504a;
+  --status-neutral-bg: #e6dfd3;
+  --status-positive-fg: #33463c;
+  --status-positive-bg: #d9e3dc;
+  --status-caution-fg: #7d4a10;
+  --status-caution-bg: #f8e6cc;
+  --status-critical-fg: #8f1d17;
+  --status-critical-bg: #f6dcd9;
+  --status-active-fg: #2c4a63;
+  --status-active-bg: #d9e5ef;
+}
+
+/* Dark theme is a separately verified theme, not token substitution. */
+:root[data-theme="dark"] {
+  color-scheme: dark;
+
+  --surface-canvas: #14120f;
+  --surface-panel: #1d1a17;
+  --surface-raised: #262220;
+  --surface-sunken: #100e0c;
+  --surface-inverse: var(--palette-paper);
+  --surface-hover: #2c2724;
+  --surface-selected: #3d2f1d;
+
+  --text-primary: #f3eee7;
+  --text-secondary: #cdc4ba;
+  --text-muted: #a2988e;
+  --text-inverse: var(--palette-ink);
+  --text-accent: var(--palette-amber);
+
+  --border-default: #37312c;
+  --border-strong: #4d453e;
+  --border-subtle: #292420;
+
+  --accent: var(--palette-amber);
+  --accent-strong: #f7bd79;
+  --accent-contrast: #171514;
+  --focus: var(--palette-amber);
+
+  --status-neutral-fg: #c3bab0;
+  --status-neutral-bg: #2f2a26;
+  --status-positive-fg: #a9cbb8;
+  --status-positive-bg: #253530;
+  --status-caution-fg: #f0bd7c;
+  --status-caution-bg: #3a2c19;
+  --status-critical-fg: #f2a9a2;
+  --status-critical-bg: #3d2320;
+  --status-active-fg: #a8c8e0;
+  --status-active-bg: #1f2f3b;
+}
