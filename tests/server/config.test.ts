@@ -5,7 +5,7 @@ import { parseConfig } from "../../src/server/config.js";
 const productionEnv = {
   NODE_ENV: "production",
   PORT: "8081",
-  DATABASE_URL: "postgresql://atlas_web:web-password@db:5432/atlas",
+  DATABASE_URL: "postgresql://atlas_web:web-password-012345678901@db:5432/atlas",
   SESSION_SECRET: "a-secure-session-secret-that-is-at-least-32-characters",
   ATLAS_ORIGIN: "https://atlas.rangeway.app",
   ARTIFACT_DIR: "/var/lib/atlas/artifacts",
@@ -43,12 +43,39 @@ describe("parseConfig", () => {
     "rejects the privileged %s database role for the production web process",
     (username) => {
       expectConfigIssue(
-        { ...productionEnv, DATABASE_URL: `postgresql://${username}:secret@db:5432/atlas` },
+        { ...productionEnv, DATABASE_URL: `postgresql://${username}:safe-password-0123456789@db:5432/atlas` },
         ["databaseUrl"],
-        "DATABASE_URL must use the least-privilege atlas_web role in production.",
+        "DATABASE_URL must use the least-privilege atlas_web role.",
       );
     },
   );
+
+  it.each([
+    ["http://atlas_web:safe-password-0123456789@db:5432/atlas", /postgres.*protocol/i],
+    ["postgresql://atlas_web:safe-password-0123456789@postgres:5432/atlas", /db database host/i],
+    ["postgresql://atlas_web:safe-password-0123456789@db:5432/postgres", /atlas database/i],
+    ["postgresql://atlas_web:too-short@db:5432/atlas", /24-128 character/i],
+    ["postgresql://atlas_web:p%40ssword@db:5432/atlas", /URL-safe password/i],
+    ["postgresql://atlas_web:p%2Fssword@db:5432/atlas", /URL-safe password/i],
+    ["postgresql://atlas_web:safe-password-0123456789@db:6432/atlas", /port 5432/i],
+    ["postgresql://atlas_web:safe-password-0123456789@db:5432/atlas?sslmode=disable", /query parameters/i],
+  ])("rejects an unsafe production database URL: %s", (databaseUrl, message) => {
+    expect(() => parseConfig({ ...productionEnv, DATABASE_URL: databaseUrl })).toThrow(message);
+  });
+
+  it("never includes a rejected database password in configuration errors", () => {
+    const secret = "do%40not%2Flog";
+    try {
+      parseConfig({
+        ...productionEnv,
+        DATABASE_URL: `postgresql://atlas_web:${secret}@db:5432/atlas`,
+      });
+      throw new Error("expected parsing failure");
+    } catch (error) {
+      expect(JSON.stringify(error)).not.toContain(secret);
+      expect(String(error)).not.toContain(secret);
+    }
+  });
 
   it.each(["DATABASE_URL", "SESSION_SECRET", "ATLAS_ORIGIN", "GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET", "GOOGLE_REDIRECT_URI"])(
     "rejects a production configuration missing %s",

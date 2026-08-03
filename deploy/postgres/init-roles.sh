@@ -9,6 +9,15 @@ set -euo pipefail
 : "${ATLAS_WORKER_PASSWORD:?ATLAS_WORKER_PASSWORD is required}"
 [[ "${POSTGRES_USER}" == "atlas" ]] \
   || { echo "Atlas bootstrap must run as the atlas database owner." >&2; exit 1; }
+for password_name in \
+  POSTGRES_BOOTSTRAP_PASSWORD \
+  ATLAS_MIGRATOR_PASSWORD \
+  ATLAS_WEB_PASSWORD \
+  ATLAS_WORKER_PASSWORD; do
+  password_value="${!password_name}"
+  [[ "${password_value}" =~ ^[A-Za-z0-9_-]{24,128}$ ]] \
+    || { echo "${password_name} must be a 24-128 character URL-safe credential using only letters, numbers, underscore, or hyphen." >&2; exit 1; }
+done
 
 psql --variable=ON_ERROR_STOP=1 \
   --username="${POSTGRES_USER}" \
@@ -17,6 +26,8 @@ psql --variable=ON_ERROR_STOP=1 \
   --set=migrator_password="${ATLAS_MIGRATOR_PASSWORD}" \
   --set=web_password="${ATLAS_WEB_PASSWORD}" \
   --set=worker_password="${ATLAS_WORKER_PASSWORD}" <<'SQL'
+BEGIN;
+
 DO $roles$
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'atlas_migrator') THEN
@@ -90,4 +101,6 @@ SELECT format('GRANT CONNECT ON DATABASE %I TO atlas_web, atlas_worker', current
 REVOKE CREATE ON SCHEMA public FROM PUBLIC;
 GRANT USAGE, CREATE ON SCHEMA public TO atlas_migrator;
 GRANT USAGE ON SCHEMA public TO atlas_web, atlas_worker;
+
+COMMIT;
 SQL

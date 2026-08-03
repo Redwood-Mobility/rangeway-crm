@@ -2,6 +2,7 @@ import path from "node:path";
 import process from "node:process";
 import "dotenv/config";
 import { z } from "zod";
+import { validateProductionPostgresUrl } from "../shared/postgres-url.js";
 
 const developmentSessionSecret = "development-session-secret-change-me-please";
 const defaultDatabasePath = path.join(process.cwd(), "data", "rangeway-crm.sqlite");
@@ -42,12 +43,13 @@ const configSchema = z
     if (!value.databaseUrl) {
       context.addIssue({ code: "custom", path: ["databaseUrl"], message: "DATABASE_URL is required in production." });
     } else {
-      try {
-        if (new URL(value.databaseUrl).username !== "atlas_web") {
-          context.addIssue({ code: "custom", path: ["databaseUrl"], message: "DATABASE_URL must use the least-privilege atlas_web role in production." });
-        }
-      } catch {
-        context.addIssue({ code: "custom", path: ["databaseUrl"], message: "DATABASE_URL must be a valid PostgreSQL URL." });
+      const issue = validateProductionPostgresUrl(value.databaseUrl, {
+        username: "atlas_web",
+        hostname: "db",
+        database: "atlas",
+      });
+      if (issue) {
+        context.addIssue({ code: "custom", path: ["databaseUrl"], message: `DATABASE_URL ${issue}.` });
       }
     }
     if (value.sessionSecret === developmentSessionSecret) {

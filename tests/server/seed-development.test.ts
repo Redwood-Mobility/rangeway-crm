@@ -1,5 +1,5 @@
 import argon2 from "argon2";
-import { readFile } from "node:fs/promises";
+import { readFile, readdir } from "node:fs/promises";
 import type { Pool } from "pg";
 import { describe, expect, it, type TestContext } from "vitest";
 import { createPool } from "../../src/server/platform/db/client.js";
@@ -20,6 +20,15 @@ const validEnvironment = {
   ATLAS_DEV_OWNER_NAME: " Rangeway Owner ",
   ATLAS_DEV_OWNER_PASSWORD: "development-owner-password",
 };
+
+async function equippedMigrationCount(): Promise<string> {
+  const entries = await readdir("db/migrations", { withFileTypes: true });
+  return String(
+    entries.filter(
+      (entry) => entry.isFile() && /^\d{4}_.+\.sql$/.test(entry.name),
+    ).length,
+  );
+}
 
 async function withTemporaryPostgreSql(
   context: TestContext,
@@ -102,6 +111,7 @@ describe("development owner seed", () => {
 
   it("migrates first and idempotently creates one Argon2id Rangeway owner", async (context) => {
     await withTemporaryPostgreSql(context, async (pool, databaseUrl) => {
+      const expectedMigrationCount = await equippedMigrationCount();
       const input = readDevelopmentSeedInput({
         ...validEnvironment,
         DATABASE_URL: databaseUrl,
@@ -141,7 +151,7 @@ describe("development owner seed", () => {
         actor_type: "human",
         actor_role: "owner",
         membership_role: "owner",
-        migration_count: "1",
+        migration_count: expectedMigrationCount,
       });
       expect(result.rows[0]?.local_password_hash).toMatch(/^\$argon2id\$/);
       await expect(

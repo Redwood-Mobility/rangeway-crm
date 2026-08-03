@@ -106,28 +106,51 @@ describe("outbox worker entrypoint lifecycle", () => {
   it("requires the production worker database credential to use atlas_worker", () => {
     expect(parseWorkerConfig({
       NODE_ENV: "production",
-      DATABASE_URL: "postgresql://atlas_worker:worker-password@db:5432/atlas",
+      DATABASE_URL: "postgresql://atlas_worker:worker-password-0123456789@db:5432/atlas",
       WORKER_POLL_MS: "2500",
     })).toEqual({
-      databaseUrl: "postgresql://atlas_worker:worker-password@db:5432/atlas",
+      databaseUrl: "postgresql://atlas_worker:worker-password-0123456789@db:5432/atlas",
       workerPollMilliseconds: 2500,
     });
     expect(() => parseWorkerConfig({
       NODE_ENV: "production",
-      DATABASE_URL: "postgresql://atlas_migrator:migrator-password@db:5432/atlas",
+      DATABASE_URL: "postgresql://atlas_migrator:migrator-password-0123456789@db:5432/atlas",
     })).toThrow(/atlas_worker/);
+  });
+
+  it.each([
+    "http://atlas_worker:safe-password@db:5432/atlas",
+    "postgresql://atlas_worker:safe-password-0123456789@postgres:5432/atlas",
+    "postgresql://atlas_worker:safe-password-0123456789@db:5432/postgres",
+    "postgresql://atlas_worker:too-short@db:5432/atlas",
+    "postgresql://atlas_worker:p%40ssword@db:5432/atlas",
+  ])("rejects an unsafe production worker database URL without exposing it", (databaseUrl) => {
+    expect(() =>
+      parseWorkerConfig({ NODE_ENV: "production", DATABASE_URL: databaseUrl }),
+    ).toThrow(/Production worker DATABASE_URL/);
+    try {
+      parseWorkerConfig({ NODE_ENV: "production", DATABASE_URL: databaseUrl });
+    } catch (error) {
+      expect(JSON.stringify(error)).not.toContain(databaseUrl);
+    }
   });
 
   it("registers an explicit production handler for every event the foundation emits", async () => {
     const handlers = createProductionOutboxHandlers();
-    expect(Object.keys(handlers)).toEqual(["organization.updated.v1"]);
-    await expect(handlers["organization.updated.v1"]!(
-      {
+    expect(Object.keys(handlers).sort()).toEqual([
+      "identity.google-linked.v1",
+      "identity.google-profile-updated.v1",
+      "identity.owner-provisioned.v1",
+      "organization.updated.v1",
+    ]);
+    for (const eventType of Object.keys(handlers)) {
+      await expect(handlers[eventType as keyof typeof handlers]!(
+        {
         id: "10000000-0000-4000-8000-000000000001",
         organizationId: "00000000-0000-4000-8000-000000000001",
         actorId: "20000000-0000-4000-8000-000000000001",
         requestId: "30000000-0000-4000-8000-000000000001",
-        eventType: "organization.updated.v1",
+        eventType,
         aggregateType: "organization",
         aggregateId: "00000000-0000-4000-8000-000000000001",
         schemaVersion: 1,
@@ -137,9 +160,10 @@ describe("outbox worker entrypoint lifecycle", () => {
         processingStartedAt: new Date(),
         processingToken: randomUUID(),
         createdAt: new Date(),
-      },
-      { idempotencyKey: "10000000-0000-4000-8000-000000000001" },
-    )).resolves.toBeUndefined();
+        },
+        { idempotencyKey: "10000000-0000-4000-8000-000000000001" },
+      )).resolves.toBeUndefined();
+    }
   });
 
   it("publishes a foundation event through the actual production registry", async (context: TestContext) => {

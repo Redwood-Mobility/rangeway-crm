@@ -30,6 +30,7 @@ export interface V2IdentityPort extends IdentityAuthenticationPort {
     googleSubject: string,
     email: string,
     displayName: string,
+    requestId?: string,
   ): Promise<ActorIdentity>;
 }
 

@@ -24,6 +24,9 @@ const acknowledgeFoundationEvent: OutboxHandler = async () => undefined;
 export function createProductionOutboxHandlers(): OutboxHandlerRegistry {
   return {
     [atlasEventTypes.organizationUpdated]: acknowledgeFoundationEvent,
+    [atlasEventTypes.identityOwnerProvisioned]: acknowledgeFoundationEvent,
+    [atlasEventTypes.identityGoogleLinked]: acknowledgeFoundationEvent,
+    [atlasEventTypes.identityGoogleProfileUpdated]: acknowledgeFoundationEvent,
   } satisfies Record<AtlasEventType, OutboxHandler>;
 }
 

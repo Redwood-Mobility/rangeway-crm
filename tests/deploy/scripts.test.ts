@@ -43,10 +43,10 @@ function fakeTool(binDirectory: string, name: string, body: string): void {
 function productionEnvironment(): string {
   return [
     "NODE_ENV=production",
-    "POSTGRES_BOOTSTRAP_PASSWORD=bootstrap-password",
-    "ATLAS_MIGRATOR_PASSWORD=migrator-password",
-    "ATLAS_WEB_PASSWORD=web-password",
-    "ATLAS_WORKER_PASSWORD=worker-password",
+    "POSTGRES_BOOTSTRAP_PASSWORD=bootstrap-password-0123456789",
+    "ATLAS_MIGRATOR_PASSWORD=migrator-password-0123456789",
+    "ATLAS_WEB_PASSWORD=web-password-01234567890123",
+    "ATLAS_WORKER_PASSWORD=worker-password-0123456789",
     "SESSION_SECRET=a-production-session-secret-at-least-32-characters",
     "ATLAS_ORIGIN=https://atlas.rangeway.app",
     "AUTH_MODE=google",
@@ -109,6 +109,10 @@ counter=0
 counter=$((counter + 1))
 printf '%s\\n' "\${counter}" > "\${counter_file}"
 printf '%s\\n' "$@" > "\${FAKE_LOG_DIR}/rsync-\${counter}.args"
+if [[ "\${FAKE_RSYNC_SIGNAL:-}" =~ ^(TERM|INT|KILL)$ ]]; then
+  kill -"\${FAKE_RSYNC_SIGNAL}" "$PPID"
+  exit 70
+fi
 [[ "\${FAKE_RSYNC_FAIL_ON:-}" == "\${counter}" ]] && exit 42
 exit 0`);
   fakeTool(binDirectory, "curl", `
@@ -125,6 +129,10 @@ if [[ "\${1:-}" == "--check" ]]; then
 else
   /usr/bin/shasum -a 256 "$@"
 fi`);
+  fakeTool(binDirectory, "setsid", `
+printf '%s\n' "$*" >> "\${FAKE_LOG_DIR}/setsid.log"
+exit 0`);
+  fakeTool(binDirectory, "flock", "exit 0");
   fakeTool(binDirectory, "docker", `
 printf '%s\\n' "$*" >> "\${FAKE_LOG_DIR}/docker.log"
 if [[ "$*" == "volume inspect atlas-db" ]]; then
@@ -135,6 +143,7 @@ if [[ "$*" == "compose ps -q web" ]]; then printf '%s\\n' web-container; exit 0;
 if [[ "$*" == "compose ps -q worker" ]]; then printf '%s\\n' worker-container; exit 0; fi
 if [[ "$*" == *"State.Health.Status"* ]]; then printf '%s\\n' healthy; exit 0; fi
 if [[ "$*" == *"--profile operations run --rm migrator"* && "\${FAKE_MIGRATION_FAIL:-0}" == "1" ]]; then exit 59; fi
+if [[ "$*" == *"compose exec -T db /docker-entrypoint-initdb.d/001-atlas-roles.sh"* && "\${FAKE_ROLE_ROTATION_FAIL:-0}" == "1" ]]; then exit 60; fi
 exit 0`);
   fakeTool(binDirectory, "ssh", `
 printf '%s\\n' "$*" >> "\${FAKE_LOG_DIR}/ssh.log"
@@ -154,12 +163,34 @@ if [[ "\${1:-}" == "bash" && "\${2:-}" == "-s" && "\${3:-}" == "--" ]]; then
     printf '%s\\n' '--- remote script ---'
     /bin/cat "\${script_file}"
   } >> "\${FAKE_LOG_DIR}/ssh-scripts.log"
+  if /usr/bin/grep -q "ATLAS_PREFLIGHT_ACK_PROTOCOL" "\${script_file}" && [[ "\${FAKE_PREFLIGHT_ACK_FAIL:-0}" == "1" ]]; then
+    /bin/unlink "\${script_file}"
+    exit 65
+  fi
+  if /usr/bin/grep -q "ATLAS_PREFLIGHT_RECOVERY_PROTOCOL" "\${script_file}" && [[ "\${FAKE_PREFLIGHT_RECOVERY_FAIL:-0}" == "1" ]]; then
+    /bin/unlink "\${script_file}"
+    exit 66
+  fi
   if [[ -n "\${FAKE_REMOTE_SYMLINK_OUTPUT:-}" ]] && /usr/bin/grep -q "REMOTE_DIR=%s" "\${script_file}"; then
     printf '%b' "\${FAKE_REMOTE_SYMLINK_OUTPUT}"
     status=0
+  elif [[ -n "\${FAKE_PREFLIGHT_OUTPUT_MODE:-}" ]] && /usr/bin/grep -q "PREFLIGHT_TOKEN=%s" "\${script_file}"; then
+    set +e
+    output="$(/bin/bash "\${script_file}" "$@")"
+    status=$?
+    set -e
+    if [[ "\${status}" -eq 0 ]]; then
+      case "\${FAKE_PREFLIGHT_OUTPUT_MODE}" in
+        malformed) printf '%s\\n' 'PREVIOUS_COMMIT=malformed' ;;
+        truncated) printf '%s\\n' "$(printf '%s\\n' "\${output}" | /usr/bin/head -n 2)" ;;
+        *) printf '%s\\n' "\${output}" ;;
+      esac
+    fi
   else
+    set +e
     /bin/bash "\${script_file}" "$@"
     status=$?
+    set -e
   fi
   /bin/unlink "\${script_file}"
   exit "\${status}"
@@ -216,7 +247,52 @@ echo "simulated restore-test success" >&2
   return exactBackup;
 }
 
+function executeDurableLease(fixture: DeployFixture): void {
+  const handoffDirectory = path.join(fixture.backupRoot, ".atlas-preflight-handoffs");
+  const leaseScript = readdirSync(handoffDirectory)
+    .find((filename) => filename.endsWith(".lease.sh"));
+  const stateFile = readdirSync(handoffDirectory)
+    .find((filename) => filename.endsWith(".state"));
+  expect(leaseScript).toBeDefined();
+  expect(stateFile).toBeDefined();
+  const leaseResult = spawnSync(
+    "/bin/bash",
+    [path.join(handoffDirectory, leaseScript!), path.join(handoffDirectory, stateFile!)],
+    {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        PATH: `${fixture.binDirectory}:${process.env.PATH}`,
+        FAKE_LOG_DIR: fixture.logDirectory,
+      },
+    },
+  );
+  expect(leaseResult.status, `${leaseResult.stdout}\n${leaseResult.stderr}`).toBe(0);
+}
+
 describe("deploy.sh behavior", () => {
+  it.each([
+    "POSTGRES_BOOTSTRAP_PASSWORD",
+    "ATLAS_MIGRATOR_PASSWORD",
+    "ATLAS_WEB_PASSWORD",
+    "ATLAS_WORKER_PASSWORD",
+  ])("rejects a non-URL-safe %s before any remote action without logging the value", (field) => {
+    const fixture = createDeployFixture();
+    const secret = "unsafe%40password/with-reserved";
+    const environment = productionEnvironment().replace(
+      new RegExp(`^${field}=.*$`, "m"),
+      `${field}=${secret}`,
+    );
+    writeFileSync(fixture.environmentFile, environment);
+
+    const result = deploy(fixture);
+
+    expect(result.status).not.toBe(0);
+    expect(`${result.stdout}${result.stderr}`).toMatch(/URL-safe|credential/i);
+    expect(`${result.stdout}${result.stderr}`).not.toContain(secret);
+    expect(existsSync(path.join(fixture.logDirectory, "ssh.log"))).toBe(false);
+  });
+
   it("allows a first deployment with no existing V2 database and no backup restore", () => {
     const fixture = createDeployFixture();
     const result = deploy(fixture);
@@ -235,6 +311,104 @@ describe("deploy.sh behavior", () => {
       exactBackup,
     );
     expect(existsSync(path.join(fixture.logDirectory, "rsync-1.args"))).toBe(true);
+  });
+
+  it.each(["malformed", "truncated"])(
+    "recovers exact prior writers when preflight output is %s after quiescing",
+    (mode) => {
+      const fixture = createDeployFixture();
+      installRemoteBackup(fixture);
+      const result = deploy(fixture, {
+        FAKE_HAS_DB: "1",
+        FAKE_PREFLIGHT_OUTPUT_MODE: mode,
+        ATLAS_PREFLIGHT_LEASE_SECONDS: "2",
+      });
+
+      expect(result.status).not.toBe(0);
+      const dockerLog = readFileSync(path.join(fixture.logDirectory, "docker.log"), "utf8");
+      expect(dockerLog).toContain("start worker-container");
+      expect(dockerLog).toContain("start web-container");
+      expect(existsSync(path.join(fixture.logDirectory, "rsync-counter"))).toBe(false);
+    },
+  );
+
+  it("recovers exact prior writers when the acknowledgment connection is dropped", () => {
+    const fixture = createDeployFixture();
+    installRemoteBackup(fixture);
+    const result = deploy(fixture, {
+      FAKE_HAS_DB: "1",
+      FAKE_PREFLIGHT_ACK_FAIL: "1",
+      ATLAS_PREFLIGHT_LEASE_SECONDS: "2",
+    });
+
+    expect(result.status).not.toBe(0);
+    const dockerLog = readFileSync(path.join(fixture.logDirectory, "docker.log"), "utf8");
+    expect(dockerLog).toContain("start worker-container");
+    expect(dockerLog).toContain("start web-container");
+  });
+
+  it("recovers exact prior writers when a local signal interrupts after normal handoff", () => {
+    const fixture = createDeployFixture();
+    installRemoteBackup(fixture);
+    const result = deploy(fixture, {
+      FAKE_HAS_DB: "1",
+      FAKE_RSYNC_SIGNAL: "TERM",
+      ATLAS_PREFLIGHT_LEASE_SECONDS: "10",
+    });
+
+    expect(result.status).not.toBe(0);
+    const dockerLog = readFileSync(path.join(fixture.logDirectory, "docker.log"), "utf8");
+    expect(dockerLog).toContain("start worker-container");
+    expect(dockerLog).toContain("start web-container");
+  });
+
+  it("uses the durable lease when the deployer is killed after acknowledgment", () => {
+    const fixture = createDeployFixture();
+    installRemoteBackup(fixture);
+    const result = deploy(fixture, {
+      FAKE_HAS_DB: "1",
+      FAKE_RSYNC_SIGNAL: "KILL",
+      ATLAS_PREFLIGHT_LEASE_SECONDS: "10",
+    });
+
+    expect(result.status).not.toBe(0);
+    executeDurableLease(fixture);
+    const dockerLog = readFileSync(path.join(fixture.logDirectory, "docker.log"), "utf8");
+    expect(dockerLog).toContain("start worker-container");
+    expect(dockerLog).toContain("start web-container");
+  });
+
+  it("uses the durable lease when both acknowledgment and local recovery connections drop", () => {
+    const fixture = createDeployFixture();
+    installRemoteBackup(fixture);
+    const result = deploy(fixture, {
+      FAKE_HAS_DB: "1",
+      FAKE_PREFLIGHT_ACK_FAIL: "1",
+      FAKE_PREFLIGHT_RECOVERY_FAIL: "1",
+      ATLAS_PREFLIGHT_LEASE_SECONDS: "2",
+    });
+
+    expect(result.status).not.toBe(0);
+    executeDurableLease(fixture);
+    const dockerLog = readFileSync(path.join(fixture.logDirectory, "docker.log"), "utf8");
+    expect(dockerLog).toContain("start worker-container");
+    expect(dockerLog).toContain("start web-container");
+  });
+
+  it("acknowledges a normal preflight handoff without lease recovery", () => {
+    const fixture = createDeployFixture();
+    installRemoteBackup(fixture);
+    const result = deploy(fixture, {
+      FAKE_HAS_DB: "1",
+      ATLAS_PREFLIGHT_LEASE_SECONDS: "10",
+    });
+
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+    const dockerLog = readFileSync(path.join(fixture.logDirectory, "docker.log"), "utf8");
+    expect(dockerLog).not.toContain("start worker-container");
+    expect(dockerLog).not.toContain("start web-container");
+    expect(readFileSync(path.join(fixture.logDirectory, "ssh-scripts.log"), "utf8"))
+      .toContain("ATLAS_PREFLIGHT_ACK_PROTOCOL");
   });
 
   it("fails closed with recovery evidence before sync when the fresh backup restore test fails", () => {
@@ -344,6 +518,40 @@ describe("deploy.sh behavior", () => {
     expect(result.stderr).toContain(`Exact pre-deploy backup: ${exactBackup}`);
     expect(result.stderr).toMatch(/migration compatibility boundary crossed|fail closed/i);
     const dockerLog = readFileSync(path.join(fixture.logDirectory, "docker.log"), "utf8");
+    expect(dockerLog).not.toContain("start worker-container");
+    expect(dockerLog).not.toContain("start web-container");
+  });
+
+  it("crosses the fail-closed boundary before role rotation and never restarts old writers on a partial role failure", () => {
+    const fixture = createDeployFixture();
+    installRemoteBackup(fixture);
+    const result = deploy(fixture, {
+      FAKE_HAS_DB: "1",
+      FAKE_ROLE_ROTATION_FAIL: "1",
+    });
+
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toMatch(/compatibility boundary crossed|fail closed/i);
+    const dockerLog = readFileSync(path.join(fixture.logDirectory, "docker.log"), "utf8");
+    expect(dockerLog).toContain("001-atlas-roles.sh");
+    expect(dockerLog).not.toContain("start worker-container");
+    expect(dockerLog).not.toContain("start web-container");
+  });
+
+  it("keeps old writers stopped when a forced failure occurs after successful role rotation", () => {
+    const fixture = createDeployFixture();
+    installRemoteBackup(fixture);
+    const result = deploy(fixture, {
+      FAKE_HAS_DB: "1",
+      FAKE_MIGRATION_FAIL: "1",
+    });
+
+    expect(result.status).not.toBe(0);
+    const dockerLog = readFileSync(path.join(fixture.logDirectory, "docker.log"), "utf8");
+    expect(dockerLog.indexOf("001-atlas-roles.sh")).toBeGreaterThanOrEqual(0);
+    expect(dockerLog.indexOf("--profile operations run --rm migrator")).toBeGreaterThan(
+      dockerLog.indexOf("001-atlas-roles.sh"),
+    );
     expect(dockerLog).not.toContain("start worker-container");
     expect(dockerLog).not.toContain("start web-container");
   });

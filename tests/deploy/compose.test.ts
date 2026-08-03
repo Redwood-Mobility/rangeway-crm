@@ -105,6 +105,7 @@ describe("deterministic deployment source contract", () => {
   const deployScript = readRepositoryFile("deploy/deploy.sh");
   const backupScript = readRepositoryFile("deploy/backup.sh");
   const restoreScript = readRepositoryFile("deploy/restore-test.sh");
+  const roleInitializationScript = readRepositoryFile("deploy/postgres/init-roles.sh");
   const packageJson = JSON.parse(readRepositoryFile("package.json")) as {
     scripts: Record<string, string>;
   };
@@ -177,6 +178,28 @@ describe("deterministic deployment source contract", () => {
     expect(productionEnvironment).not.toMatch(/^POSTGRES_PASSWORD=/m);
   });
 
+  it("constrains interpolated role passwords to one documented URL-safe alphabet", () => {
+    expect(productionEnvironment).toMatch(/letters, numbers, underscore, or hyphen/i);
+    expect(deployScript).toContain("^[A-Za-z0-9_-]{24,128}$");
+    expect(roleInitializationScript).toContain("^[A-Za-z0-9_-]{24,128}$");
+    for (const role of ["atlas_web", "atlas_worker", "atlas_migrator"] ) {
+      expect(composeSource).toMatch(
+        new RegExp(`postgresql://${role}:\\$\\{ATLAS_[A-Z_]+_PASSWORD:-\\}@db:5432/atlas`),
+      );
+    }
+  });
+
+  it("rotates every database role password in one PostgreSQL transaction", () => {
+    const begin = roleInitializationScript.indexOf("BEGIN;");
+    const firstPassword = roleInitializationScript.indexOf("ALTER ROLE atlas PASSWORD");
+    const lastPassword = roleInitializationScript.indexOf("ALTER ROLE atlas_worker PASSWORD");
+    const commit = roleInitializationScript.lastIndexOf("COMMIT;");
+    expect(begin).toBeGreaterThan(0);
+    expect(firstPassword).toBeGreaterThan(begin);
+    expect(lastPassword).toBeGreaterThan(firstPassword);
+    expect(commit).toBeGreaterThan(lastPassword);
+  });
+
   it("proxies the production domain to the V2 web service", () => {
     expect(caddyfile).toMatch(/^atlas\.rangeway\.app \{$/m);
     expect(caddyfile).toContain("encode gzip zstd");
@@ -205,6 +228,17 @@ describe("deterministic deployment source contract", () => {
     expect(deployScript).toContain("apiVersion");
     expect(deployScript).toContain("PREVIOUS_COMMIT");
     expect(deployScript).not.toMatch(/git reset|git checkout|docker volume rm|docker compose down -v/);
+  });
+
+  it("serializes durable preflight acknowledgment, lease recovery, and boundary transitions", () => {
+    expect(deployScript).toContain(".atlas-preflight-handoffs");
+    expect(deployScript).toContain("setsid --fork");
+    expect(deployScript.match(/flock -x 9/g)?.length).toBeGreaterThanOrEqual(4);
+    expect(deployScript).toContain("awaiting_ack|handed_off");
+    expect(deployScript).toContain("status=boundary");
+    expect(deployScript.indexOf("status=boundary")).toBeLessThan(
+      deployScript.indexOf("001-atlas-roles.sh", deployScript.indexOf("status=boundary")),
+    );
   });
 
   it("creates complete, checksummed PostgreSQL and artifact backups without retention deletion", () => {

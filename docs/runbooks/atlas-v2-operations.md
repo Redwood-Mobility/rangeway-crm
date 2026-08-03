@@ -61,7 +61,7 @@ npm run build
 npm run db:migrate
 ```
 
-For the Compose image, initialize or rotate the three application-role credentials, then run migrations only through the operations profile:
+For a manual maintenance window, initialize or rotate the three application-role credentials transactionally, then run migrations only through the operations profile:
 
 ```bash
 docker compose build web worker
@@ -70,7 +70,34 @@ docker compose exec -T db /docker-entrypoint-initdb.d/001-atlas-roles.sh
 docker compose --profile operations run --rm migrator
 ```
 
-The migration runner serializes concurrent runs with a PostgreSQL advisory lock and is idempotent. `atlas_migrator` owns migration capability; `atlas_web` cannot access `schema_migrations`, and `atlas_worker` can only claim and finish outbox rows. Audit rows reject updates and deletes even from the table owner. Before any approved production migration, create an exact backup and pass its restore test. If migration reports a checksum or history-prefix mismatch, stop; do not alter `schema_migrations` to force progress.
+The role script validates every credential before contacting PostgreSQL and applies all role password, ownership, and grant changes inside one SQL transaction. The deployment path runs it only after the explicit compatibility boundary, so any role-rotation or subsequent migration failure leaves old writers stopped. The migration runner serializes concurrent runs with a PostgreSQL advisory lock and is idempotent. `atlas_migrator` owns migration capability; `atlas_web` cannot access `schema_migrations`, and `atlas_worker` can only claim and finish outbox rows. Audit rows reject updates and deletes even from the table owner. Before any approved production migration, create an exact backup and pass its restore test. If migration reports a checksum or history-prefix mismatch, stop; do not alter `schema_migrations` to force progress.
+
+## One-time production owner provisioning
+
+Run this only after the approved production schema is migrated and before the intended owner attempts their first Google sign-in. Replace the example identity with the approved exact owner. Do not add these one-time fields to the persistent production environment file:
+
+```bash
+ATLAS_PRODUCTION_OWNER_EMAIL=owner@rangeway.energy \
+ATLAS_PRODUCTION_OWNER_NAME='Approved Owner' \
+ATLAS_PRODUCTION_OWNER_CONFIRM=PROVISION_ATLAS_PRODUCTION_OWNER \
+docker compose run --rm --no-deps \
+  -e ATLAS_PRODUCTION_OWNER_EMAIL \
+  -e ATLAS_PRODUCTION_OWNER_NAME \
+  -e ATLAS_PRODUCTION_OWNER_CONFIRM \
+  web npm run db:provision:production-owner
+```
+
+Expected output is either `Atlas production owner provisioned. Google identity remains unlinked until verified sign-in.` or the exact-idempotent no-change message. The command refuses non-production or non-Google mode, a non-`atlas_web@db:5432/atlas` connection, an unsafe database password, a non-Workspace email, an explicit Google subject, a conflicting owner, or a conflicting email identity. User, actor, owner membership, audit evidence, and outbox evidence commit atomically. The outbox payload contains IDs and role only; private audit evidence contains the email and display name.
+
+Verify one enabled owner, one provisioning audit row, and one matching outbox event without modifying any record:
+
+```bash
+docker compose exec -T db psql --username=atlas --dbname=atlas --command="SELECT u.email, a.display_name, m.role, u.google_subject IS NOT NULL AS google_linked FROM users u JOIN actors a ON a.user_id = u.id JOIN organization_memberships m ON m.organization_id = a.organization_id AND m.user_id = u.id WHERE a.type = 'human' AND m.role = 'owner';"
+docker compose exec -T db psql --username=atlas --dbname=atlas --command="SELECT action, resource_type, request_id, created_at FROM audit_events WHERE action = 'identity.owner.provisioned' ORDER BY created_at DESC;"
+docker compose exec -T db psql --username=atlas --dbname=atlas --command="SELECT event_type, aggregate_type, request_id, created_at FROM outbox_events WHERE event_type = 'identity.owner-provisioned.v1' ORDER BY created_at DESC;"
+```
+
+Before first sign-in, `google_linked` must be false. Only the public `/api/auth/google` redirect followed by the verified `/api/auth/google/callback` may link Google's immutable subject. A subject/email mismatch fails authentication and emits no identity-change evidence.
 
 Inspect recorded migration evidence:
 
@@ -121,9 +148,9 @@ This section documents the mechanism for a later approved release; it is not app
 1. Confirm the worktree is clean and the intended commit is reviewed.
 2. Confirm all automated gates pass, including PostgreSQL integration tests with zero skips, OpenAPI lint, Compose resolution, Bash syntax, and YAML parsing.
 3. Confirm the equipped foundation gates, Operating Core, representative acceptance projects, and cutover plan are approved.
-4. Confirm the production environment file contains no placeholders; uses `NODE_ENV=production` and `AUTH_MODE=google`; provides distinct `POSTGRES_BOOTSTRAP_PASSWORD`, `ATLAS_MIGRATOR_PASSWORD`, `ATLAS_WEB_PASSWORD`, and `ATLAS_WORKER_PASSWORD` values; and contains no shared `DATABASE_URL`. `ATLAS_ORIGIN` and `GOOGLE_REDIRECT_URI` must be HTTPS, use the same origin, and the callback must end at `/api/auth/google/callback`. Development-owner seed variables must be absent.
+4. Confirm the production environment file contains no placeholders; uses `NODE_ENV=production` and `AUTH_MODE=google`; provides distinct 24-128 character `POSTGRES_BOOTSTRAP_PASSWORD`, `ATLAS_MIGRATOR_PASSWORD`, `ATLAS_WEB_PASSWORD`, and `ATLAS_WORKER_PASSWORD` values using only letters, numbers, underscore, or hyphen; and contains no shared `DATABASE_URL`. `ATLAS_ORIGIN` and `GOOGLE_REDIRECT_URI` must be HTTPS, use the same origin, and the callback must end at `/api/auth/google/callback`. Development-owner and one-time production-owner variables must be absent.
 5. Confirm the V1 archive and V1 volumes are intact.
-6. If an Atlas V2 database already exists, the deployment script must create an exact fresh backup and run the deployed `deploy/restore-test.sh` against that exact `ATLAS_BACKUP_PATH` before any source synchronization or migration. Any missing or failed restore test stops deployment with the previous commit and exact backup path. A first-ever deployment with no V2 database has no prior state to back up and may proceed without this pre-deploy restore step.
+6. Confirm `setsid` and `flock` are installed on the Ubuntu host. If an Atlas V2 database already exists, the deployment script must create an exact fresh backup and run the deployed `deploy/restore-test.sh` against that exact `ATLAS_BACKUP_PATH` before any source synchronization or migration. Any missing or failed restore test stops deployment with the previous commit and exact backup path. A first-ever deployment with no V2 database has no prior state to back up and may proceed without this pre-deploy restore step.
 7. Run the deploy script from the exact reviewed commit:
 
 ```bash
@@ -135,7 +162,9 @@ ATLAS_ENV_FILE=/etc/atlas-v2/production.env \
 ./deploy/deploy.sh
 ```
 
-The script validates the clean source tree, runs the local gates, resolves remote paths before mutation, and captures the exact prior web and worker containers. For an existing V2 database it creates one backup with writers quiesced, proves that exact backup with a non-destructive restore test, and keeps the writers stopped through source synchronization. It then initializes least-privilege roles, migrates through the operations-only migrator, starts the services, verifies target-bound and public HTTPS health, and records `.atlas-release`.
+The script validates the clean source tree, production password shape, and local gates; resolves remote paths before mutation; and captures the exact prior web and worker containers. For an existing V2 database it creates one backup with writers quiesced, proves that exact backup with a non-destructive restore test, and writes a private durable handoff record under the backup root. The local deployer must explicitly acknowledge that exact token, previous commit, backup, and container set. Until the compatibility boundary, a local failure attempts immediate recovery and a detached remote lease independently restarts the exact prior writers if the deployer disappears, including after acknowledgment. The default lease is 300 seconds; `ATLAS_PREFLIGHT_LEASE_SECONDS` may be set from 2 through 900 for a reviewed operation, and must exceed the reviewed pre-boundary synchronization/build window. Malformed or truncated state, a dropped connection, or a signal is a deployment failure.
+
+After synchronization and image build, the script marks the durable handoff at the compatibility boundary, rotates all database roles in one transaction, migrates through the operations-only migrator, starts the services, verifies target-bound and public HTTPS health, records `.atlas-release`, and marks the handoff complete. Once the boundary is marked, neither the lease nor failure handler restarts old writers; any credential or migration failure remains fail-closed.
 
 Record the released commit, previous commit, exact backup path, target-bound health response, public health response, migration rows, and service status in the change record.
 

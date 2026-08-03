@@ -162,7 +162,7 @@ describe("production legacy isolation", () => {
     expect(existsSync(uploadDir)).toBe(false);
   });
 
-  it("keeps development persistence lazy until a legacy operation uses it", () => {
+  it("keeps development V2 local and Google login isolated until an explicit V1 route uses SQLite", () => {
     const root = temporaryDirectory();
     const databasePath = path.join(root, "data", "legacy.sqlite");
     const uploadDir = path.join(root, "uploads");
@@ -171,16 +171,36 @@ describe("production legacy isolation", () => {
       import request from "supertest";
       const { createApp } = await import("./src/server/app.ts");
       const beforeApp = [fs.existsSync(process.env.DATABASE_PATH), fs.existsSync(process.env.UPLOAD_DIR)];
-      const app = createApp();
+      const organizationId = "00000000-0000-4000-8000-000000000001";
+      const identity = {
+        authenticateHumanSession: async () => ({ actorId: "10000000-0000-4000-8000-000000000001", actorType: "human", actorName: "Atlas V2 Owner", organizationId, role: "owner", userId: "20000000-0000-4000-8000-000000000001" }),
+        authenticateServiceKey: async () => { throw new Error("not used"); },
+        authenticateLocal: async () => ({ actorId: "10000000-0000-4000-8000-000000000001", actorType: "human", actorName: "Atlas V2 Owner", organizationId, role: "owner", userId: "20000000-0000-4000-8000-000000000001" }),
+        authenticateGoogle: async () => ({ actorId: "10000000-0000-4000-8000-000000000001", actorType: "human", actorName: "Atlas V2 Owner", organizationId, role: "owner", userId: "20000000-0000-4000-8000-000000000001" }),
+      };
+      const app = createApp({
+        v2Identity: identity,
+        googleOAuth: {
+          exchangeCode: async () => "verified-token",
+          verifyIdToken: async () => ({ subject: "subject", email: "owner@rangeway.energy", name: "Atlas V2 Owner", picture: "" }),
+        },
+      });
       const afterApp = [fs.existsSync(process.env.DATABASE_PATH), fs.existsSync(process.env.UPLOAD_DIR)];
-      await request(app).get("/api/health");
-      const afterHealth = [fs.existsSync(process.env.DATABASE_PATH), fs.existsSync(process.env.UPLOAD_DIR)];
-      const login = await request(app).post("/api/login").send({ email: "admin@rangeway.energy", password: "rangeway-dev" });
-      const cookie = login.headers["set-cookie"][0].split(";")[0];
-      const afterLogin = [fs.existsSync(process.env.DATABASE_PATH), fs.existsSync(process.env.UPLOAD_DIR)];
+      await request(app).get("/api/v2/health");
+      const afterV2Health = [fs.existsSync(process.env.DATABASE_PATH), fs.existsSync(process.env.UPLOAD_DIR)];
+      await request(app).post("/api/v2/auth/local/login").send({ email: "owner@rangeway.energy", password: "development-owner-password" });
+      const afterV2LocalLogin = [fs.existsSync(process.env.DATABASE_PATH), fs.existsSync(process.env.UPLOAD_DIR)];
+      const beginGoogle = await request(app).get("/api/auth/google");
+      const stateCookie = beginGoogle.headers["set-cookie"][0].split(";")[0];
+      const state = new URL(beginGoogle.headers.location).searchParams.get("state");
+      await request(app).get("/api/auth/google/callback").query({ code: "code", state }).set("Cookie", stateCookie);
+      const afterV2GoogleLogin = [fs.existsSync(process.env.DATABASE_PATH), fs.existsSync(process.env.UPLOAD_DIR)];
+      const legacyLogin = await request(app).post("/api/login").send({ email: "admin@rangeway.energy", password: "rangeway-dev" });
+      const cookie = legacyLogin.headers["set-cookie"][0].split(";")[0];
+      const afterV1Login = [fs.existsSync(process.env.DATABASE_PATH), fs.existsSync(process.env.UPLOAD_DIR)];
       await request(app).post("/api/documents").set("Cookie", cookie).attach("file", Buffer.from("pdf"), { filename: "test.pdf", contentType: "application/pdf" });
       const afterUpload = [fs.existsSync(process.env.DATABASE_PATH), fs.existsSync(process.env.UPLOAD_DIR)];
-      console.log(JSON.stringify({ beforeApp, afterApp, afterHealth, afterLogin, afterUpload }));
+      console.log(JSON.stringify({ beforeApp, afterApp, afterV2Health, afterV2LocalLogin, afterV2GoogleLogin, afterV1Login, afterUpload }));
     `;
     const result = spawnSync(
       process.execPath,
@@ -193,6 +213,9 @@ describe("production legacy isolation", () => {
           NODE_ENV: "development",
           DATABASE_PATH: databasePath,
           UPLOAD_DIR: uploadDir,
+          GOOGLE_CLIENT_ID: "google-client",
+          GOOGLE_CLIENT_SECRET: "google-secret",
+          GOOGLE_REDIRECT_URI: "http://localhost:8080/api/auth/google/callback",
         },
       },
     );
@@ -201,8 +224,10 @@ describe("production legacy isolation", () => {
     expect(JSON.parse(result.stdout.trim())).toEqual({
       beforeApp: [false, false],
       afterApp: [false, false],
-      afterHealth: [false, false],
-      afterLogin: [true, false],
+      afterV2Health: [false, false],
+      afterV2LocalLogin: [false, false],
+      afterV2GoogleLogin: [false, false],
+      afterV1Login: [true, false],
       afterUpload: [true, true],
     });
   });

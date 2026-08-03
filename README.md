@@ -109,6 +109,23 @@ Mutation routes that declare `Idempotency-Key` require a caller-generated key. R
 
 Production uses `ATLAS_ORIGIN` as the browser return origin and `GOOGLE_REDIRECT_URI` as the exact OAuth callback. Both must be HTTPS, the callback must use the same origin, and the callback path is `/api/auth/google/callback`.
 
+### One-time production owner provisioning
+
+Production startup never creates a human or owner implicitly. After an approved first V2 release has completed its migrations, replace the example identity with the approved exact owner and run the explicit provisioning command once from the deployed Compose repository:
+
+```bash
+ATLAS_PRODUCTION_OWNER_EMAIL=owner@rangeway.energy \
+ATLAS_PRODUCTION_OWNER_NAME='Approved Owner' \
+ATLAS_PRODUCTION_OWNER_CONFIRM=PROVISION_ATLAS_PRODUCTION_OWNER \
+docker compose run --rm --no-deps \
+  -e ATLAS_PRODUCTION_OWNER_EMAIL \
+  -e ATLAS_PRODUCTION_OWNER_NAME \
+  -e ATLAS_PRODUCTION_OWNER_CONFIRM \
+  web npm run db:provision:production-owner
+```
+
+The command requires `NODE_ENV=production`, `AUTH_MODE=google`, the configured Workspace domain, the least-privilege `atlas_web` database URL, and the exact confirmation phrase. It creates the user, human actor, owner membership, private audit evidence, and minimal outbox event in one PostgreSQL transaction. An exact rerun is a no-op; any competing owner or email identity fails without changing data. It never accepts or writes a Google subject—the subject is linked only after that owner completes a verified Google callback. Supply the three one-time variables to the command rather than storing them in the production environment file.
+
 ## Verification commands
 
 ```bash

@@ -149,15 +149,12 @@ app.use(
   createIdentityRouter(
     config,
     v2Identity,
-    (identity, email) =>
-      sessionUser(
-        upsertUser({
-          email,
-          name: identity.actorName,
-          picture: "",
-          provider: "local",
-        }),
-      ),
+    (identity, email) => ({
+      id: identity.userId,
+      email: email.toLowerCase(),
+      name: identity.actorName,
+      picture: "",
+    }),
   ),
 );
 app.use("/api/v2", createOrganizationRouter(v2Organizations));
@@ -419,18 +416,17 @@ app.get("/api/auth/google/callback", async (req, res, next) => {
       googleUser.subject,
       googleUser.email,
       googleUser.name,
+      req.requestId,
     );
     if (actor.actorType !== "human" || !actor.userId) {
       throw new ApiError(401, "UNAUTHENTICATED", "Authentication required.");
     }
-    const session = config.isProduction
-      ? {
-          id: actor.userId,
-          email: googleUser.email,
-          name: googleUser.name,
-          picture: googleUser.picture,
-        }
-      : sessionUser(upsertUser({ ...googleUser, provider: "google" }));
+    const session = {
+      id: actor.userId,
+      email: googleUser.email,
+      name: googleUser.name,
+      picture: googleUser.picture,
+    };
     setSessionCookie(
       res,
       {

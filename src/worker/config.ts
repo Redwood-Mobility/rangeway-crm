@@ -1,5 +1,6 @@
 import "dotenv/config";
 import { z } from "zod";
+import { validateProductionPostgresUrl } from "../shared/postgres-url.js";
 
 const workerConfigSchema = z
   .object({
@@ -9,19 +10,16 @@ const workerConfigSchema = z
   })
   .superRefine((value, context) => {
     if (value.nodeEnv !== "production") return;
-    try {
-      if (new URL(value.databaseUrl).username !== "atlas_worker") {
-        context.addIssue({
-          code: "custom",
-          path: ["databaseUrl"],
-          message: "Production worker DATABASE_URL must use atlas_worker.",
-        });
-      }
-    } catch {
+    const issue = validateProductionPostgresUrl(value.databaseUrl, {
+      username: "atlas_worker",
+      hostname: "db",
+      database: "atlas",
+    });
+    if (issue) {
       context.addIssue({
         code: "custom",
         path: ["databaseUrl"],
-        message: "Production worker DATABASE_URL must be a valid PostgreSQL URL.",
+        message: `Production worker DATABASE_URL ${issue}.`,
       });
     }
   });

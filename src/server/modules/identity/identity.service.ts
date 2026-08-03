@@ -1,4 +1,9 @@
-import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import {
+  createHash,
+  randomBytes,
+  randomUUID,
+  timingSafeEqual,
+} from "node:crypto";
 import argon2 from "argon2";
 import type { Pool } from "pg";
 import type {
@@ -7,6 +12,15 @@ import type {
 } from "../../../shared/identity.js";
 import { withTransaction } from "../../platform/db/client.js";
 import { ApiError } from "../../platform/http/api-error.js";
+import { atlasEventTypes } from "../../../shared/events.js";
+import {
+  recordAudit,
+  type AuditInput,
+} from "../audit/audit.repository.js";
+import {
+  enqueueEvent,
+  type OutboxInput,
+} from "../events/outbox.repository.js";
 import {
   IdentityRepository,
   type CreatedHumanActorRecord,
@@ -38,6 +52,12 @@ export interface CreatedHumanIdentity extends ActorIdentity {
 export interface CreatedServiceIdentity extends ActorIdentity {
   actorType: "agent" | "automation";
   serviceKey: string;
+}
+
+export interface IdentityEvidenceDependencies {
+  recordAudit: (input: AuditInput, client: Parameters<typeof recordAudit>[1]) => Promise<void>;
+  enqueueEvent: (input: OutboxInput, client: Parameters<typeof enqueueEvent>[1]) => Promise<void>;
+  precommitHook?: (client: Parameters<typeof recordAudit>[1]) => void | Promise<void>;
 }
 
 function publicHumanIdentity(record: CreatedHumanActorRecord): CreatedHumanIdentity {
@@ -94,6 +114,10 @@ export class IdentityService {
   constructor(
     private readonly pool: Pool,
     private readonly repository: IdentityRepositoryPort = new IdentityRepository(),
+    private readonly evidence: IdentityEvidenceDependencies = {
+      recordAudit,
+      enqueueEvent,
+    },
   ) {}
 
   async createHumanUser(input: CreateHumanUserInput): Promise<CreatedHumanIdentity> {
@@ -116,6 +140,7 @@ export class IdentityService {
     googleSubject: string,
     email: string,
     displayName: string,
+    requestId = randomUUID(),
   ): Promise<ActorIdentity> {
     const normalizedSubject = googleSubject.trim();
     const normalizedEmail = email.trim().toLowerCase();
@@ -145,7 +170,18 @@ export class IdentityService {
           if (emailActor && emailActor.userId !== subjectActor.userId) {
             throw unauthenticatedError();
           }
-          return this.repository.updateHumanGoogleProfile(
+          const changedFields = [
+            ...(subjectActor.email === normalizedEmail ? [] : ["email"]),
+            ...(subjectActor.actorName === normalizedDisplayName
+              ? []
+              : ["displayName"]),
+          ];
+          if (changedFields.length === 0) return subjectActor;
+          const beforeProfile = {
+            email: subjectActor.email,
+            displayName: subjectActor.actorName,
+          };
+          const updated = await this.repository.updateHumanGoogleProfile(
             organizationId,
             subjectActor.userId,
             normalizedSubject,
@@ -153,6 +189,18 @@ export class IdentityService {
             normalizedDisplayName,
             client,
           );
+          if (!updated) throw unauthenticatedError();
+          await this.recordGoogleIdentityEvidence(
+            client,
+            updated,
+            requestId,
+            "profile",
+            changedFields,
+            beforeProfile,
+            { email: updated.email, displayName: updated.actorName },
+            normalizedSubject,
+          );
+          return updated;
         }
 
         const emailActor = await this.repository.findHumanActorByEmail(
@@ -171,17 +219,19 @@ export class IdentityService {
           throw unauthenticatedError();
         }
 
-        if (emailActor.googleSubject === normalizedSubject) {
-          return this.repository.updateHumanGoogleProfile(
-            organizationId,
-            emailActor.userId,
-            normalizedSubject,
-            normalizedEmail,
-            normalizedDisplayName,
-            client,
-          );
-        }
-        return this.repository.linkHumanActorToGoogle(
+        const changedFields = [
+          "googleSubject",
+          ...(emailActor.email === normalizedEmail ? [] : ["email"]),
+          ...(emailActor.actorName === normalizedDisplayName
+            ? []
+              : ["displayName"]),
+        ];
+        const beforeProfile = {
+          email: emailActor.email,
+          displayName: emailActor.actorName,
+          googleLinked: false,
+        };
+        const linked = await this.repository.linkHumanActorToGoogle(
           organizationId,
           emailActor.userId,
           normalizedSubject,
@@ -189,6 +239,22 @@ export class IdentityService {
           normalizedDisplayName,
           client,
         );
+        if (!linked) throw unauthenticatedError();
+        await this.recordGoogleIdentityEvidence(
+          client,
+          linked,
+          requestId,
+          "link",
+          changedFields,
+          beforeProfile,
+          {
+            email: linked.email,
+            displayName: linked.actorName,
+            googleLinked: true,
+          },
+          normalizedSubject,
+        );
+        return linked;
       });
       if (!actor || actor.actorDisabledAt || actor.userDisabledAt) {
         throw unauthenticatedError();
@@ -198,6 +264,63 @@ export class IdentityService {
       if (isUniqueViolation(error)) throw unauthenticatedError();
       throw error;
     }
+  }
+
+  private async recordGoogleIdentityEvidence(
+    client: Parameters<typeof recordAudit>[1],
+    actor: HumanActorRecord,
+    requestId: string,
+    change: "link" | "profile",
+    changedFields: string[],
+    before: Record<string, unknown>,
+    after: Record<string, unknown>,
+    googleSubject: string,
+  ): Promise<void> {
+    await this.evidence.recordAudit(
+      {
+        organizationId: actor.organizationId,
+        actorId: actor.actorId,
+        requestId,
+        action:
+          change === "link"
+            ? "identity.google.linked"
+            : "identity.google.profile_updated",
+        resourceType: "user",
+        resourceId: actor.userId,
+        before,
+        after,
+        metadata: {
+          changedFields,
+          subjectFingerprint: createHash("sha256")
+            .update(googleSubject)
+            .digest("hex"),
+          source: "verified-google-login",
+        },
+      },
+      client,
+    );
+    await this.evidence.enqueueEvent(
+      {
+        organizationId: actor.organizationId,
+        actorId: actor.actorId,
+        requestId,
+        eventType:
+          change === "link"
+            ? atlasEventTypes.identityGoogleLinked
+            : atlasEventTypes.identityGoogleProfileUpdated,
+        aggregateType: "user",
+        aggregateId: actor.userId,
+        schemaVersion: 1,
+        payload: {
+          organizationId: actor.organizationId,
+          actorId: actor.actorId,
+          userId: actor.userId,
+          changedFields,
+        },
+      },
+      client,
+    );
+    await this.evidence.precommitHook?.(client);
   }
 
   async createServiceActor(input: CreateServiceActorInput): Promise<CreatedServiceIdentity> {

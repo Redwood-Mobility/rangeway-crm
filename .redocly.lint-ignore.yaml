@@ -1,0 +1,9 @@
+# Redirect-only browser authentication surfaces intentionally return 302 on
+# success. The begin route has no caller-input 4XX response; missing server OAuth
+# configuration is 503. Keep these exceptions scoped to the exact response nodes.
+openapi/atlas-v2.yaml:
+  operation-2xx-response:
+    - '#/paths/~1api~1auth~1google/get/responses'
+    - '#/paths/~1api~1auth~1google~1callback/get/responses'
+  operation-4xx-response:
+    - '#/paths/~1api~1auth~1google/get/responses'

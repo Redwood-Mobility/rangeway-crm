@@ -111,6 +111,18 @@ for required_key in \
   grep -Eq "^${required_key}=.+$" "${ENV_FILE}" \
     || fail "production environment file is missing ${required_key}."
 done
+for password_key in \
+  POSTGRES_BOOTSTRAP_PASSWORD \
+  ATLAS_MIGRATOR_PASSWORD \
+  ATLAS_WEB_PASSWORD \
+  ATLAS_WORKER_PASSWORD; do
+  password_count="$(grep -Ec "^${password_key}=" "${ENV_FILE}")"
+  [[ "${password_count}" -eq 1 ]] \
+    || fail "production environment must contain ${password_key} exactly once."
+  password_value="$(sed -n "s/^${password_key}=//p" "${ENV_FILE}")"
+  [[ "${password_value}" =~ ^[A-Za-z0-9_-]{24,128}$ ]] \
+    || fail "${password_key} must be a 24-128 character URL-safe credential using only letters, numbers, underscore, or hyphen."
+done
 grep -Fxq 'NODE_ENV=production' "${ENV_FILE}" \
   || fail "production environment must set NODE_ENV=production."
 grep -Fxq 'AUTH_MODE=google' "${ENV_FILE}" \
@@ -154,6 +166,14 @@ npm run build
 npx --yes @redocly/cli lint openapi/atlas-v2.yaml
 
 REMOTE_TARGET="${REMOTE_USER}@${REMOTE_HOST}"
+PREFLIGHT_LEASE_SECONDS="${ATLAS_PREFLIGHT_LEASE_SECONDS:-300}"
+[[ "${PREFLIGHT_LEASE_SECONDS}" =~ ^[0-9]+$ ]] \
+  || fail "ATLAS_PREFLIGHT_LEASE_SECONDS must be an integer."
+[[ "${PREFLIGHT_LEASE_SECONDS}" -ge 2 && "${PREFLIGHT_LEASE_SECONDS}" -le 900 ]] \
+  || fail "ATLAS_PREFLIGHT_LEASE_SECONDS must be between 2 and 900 seconds."
+PREFLIGHT_TOKEN="$(node --input-type=module -e 'console.log(crypto.randomUUID())')"
+[[ "${PREFLIGHT_TOKEN}" =~ ^[0-9a-f-]{36}$ ]] \
+  || fail "could not create a preflight handoff token."
 
 resolve_remote_paths() {
   ssh "${SSH_OPTS[@]}" "${REMOTE_TARGET}" bash -s -- \
@@ -215,11 +235,22 @@ REMOTE_MKDIR
 
 run_remote_preflight() {
   ssh "${SSH_OPTS[@]}" "${REMOTE_TARGET}" bash -s -- \
-    "${REMOTE_DIR}" "${REMOTE_BACKUP_ROOT}" <<'REMOTE_PREFLIGHT'
+    "${REMOTE_DIR}" "${REMOTE_BACKUP_ROOT}" "${PREFLIGHT_TOKEN}" \
+    "${PREFLIGHT_LEASE_SECONDS}" <<'REMOTE_PREFLIGHT'
 set -euo pipefail
 
 remote_dir="$1"
 backup_root="$2"
+preflight_token="$3"
+lease_seconds="$4"
+[[ "${preflight_token}" =~ ^[0-9a-f-]{36}$ ]] || exit 1
+[[ "${lease_seconds}" =~ ^[0-9]+$ && "${lease_seconds}" -ge 2 && "${lease_seconds}" -le 900 ]] || exit 1
+handoff_directory="${backup_root}/.atlas-preflight-handoffs"
+handoff_state="${handoff_directory}/${preflight_token}.state"
+command -v setsid >/dev/null 2>&1 \
+  || { echo "Remote preflight requires setsid for its recovery lease." >&2; exit 1; }
+command -v flock >/dev/null 2>&1 \
+  || { echo "Remote preflight requires flock for atomic handoff transitions." >&2; exit 1; }
 previous_commit="none"
 exact_backup="none"
 web_container="none"
@@ -267,6 +298,8 @@ if docker volume inspect atlas-db >/dev/null 2>&1; then
     || { echo "Could not capture the exact prior web container." >&2; exit 1; }
   [[ -z "${prior_worker_container}" || "${prior_worker_container}" =~ ^[A-Za-z0-9_.-]+$ ]] \
     || { echo "Could not capture the exact prior worker container." >&2; exit 1; }
+  [[ -z "${prior_web_container}" ]] || web_container="${prior_web_container}"
+  [[ -z "${prior_worker_container}" ]] || worker_container="${prior_worker_container}"
 
   backup_output="$({
     cd "${remote_dir}"
@@ -308,11 +341,15 @@ if docker volume inspect atlas-db >/dev/null 2>&1; then
     web_container="${prior_web_container}"
     [[ "${web_container}" =~ ^[A-Za-z0-9_.-]+$ ]] \
       || { echo "Could not capture the exact prior web container." >&2; exit 1; }
+  else
+    web_container="none"
   fi
   if [[ "${worker_was_active}" -eq 1 ]]; then
     worker_container="${prior_worker_container}"
     [[ "${worker_container}" =~ ^[A-Za-z0-9_.-]+$ ]] \
       || { echo "Could not capture the exact prior worker container." >&2; exit 1; }
+  else
+    worker_container="none"
   fi
 
   if [[ ! -x "${remote_dir}/deploy/restore-test.sh" ]]; then
@@ -335,25 +372,174 @@ if docker volume inspect atlas-db >/dev/null 2>&1; then
   echo "Fresh pre-deploy backup passed its non-destructive restore test: ${exact_backup}" >&2
 fi
 
-trap - EXIT
+umask 077
+mkdir -p -- "${handoff_directory}"
+chmod 700 "${handoff_directory}"
+handoff_next="${handoff_state}.next"
+{
+  printf 'token=%s\n' "${preflight_token}"
+  printf 'status=awaiting_ack\n'
+  printf 'previous_commit=%s\n' "${previous_commit}"
+  printf 'exact_backup=%s\n' "${exact_backup}"
+  printf 'web_container=%s\n' "${web_container}"
+  printf 'worker_container=%s\n' "${worker_container}"
+} > "${handoff_next}"
+mv -- "${handoff_next}" "${handoff_state}"
+: > "${handoff_state}.lock"
+chmod 600 "${handoff_state}.lock"
+
+lease_script="${handoff_directory}/${preflight_token}.lease.sh"
+cat > "${lease_script}" <<'REMOTE_LEASE'
+#!/usr/bin/env bash
+set -euo pipefail
+trap 'unlink "$0" 2>/dev/null || true' EXIT
+state_file="$1"
+umask 077
+exec 9>"${state_file}.lock"
+flock -x 9
+
+read_state_value() {
+  local key="$1"
+  local count
+  count="$(grep -Ec "^${key}=" "${state_file}" 2>/dev/null || true)"
+  [[ "${count}" -eq 1 ]] || return 1
+  sed -n "s/^${key}=//p" "${state_file}"
+}
+
+[[ -f "${state_file}" ]] || exit 0
+state_status="$(read_state_value status)" || exit 1
+case "${state_status}" in
+  awaiting_ack|handed_off) ;;
+  *) exit 0 ;;
+esac
+state_token="$(read_state_value token)" || exit 1
+web_to_start="$(read_state_value web_container)" || exit 1
+worker_to_start="$(read_state_value worker_container)" || exit 1
+[[ "${state_token}" =~ ^[0-9a-f-]{36}$ ]] || exit 1
+[[ "${web_to_start}" == "none" || "${web_to_start}" =~ ^[A-Za-z0-9_.-]+$ ]] || exit 1
+[[ "${worker_to_start}" == "none" || "${worker_to_start}" =~ ^[A-Za-z0-9_.-]+$ ]] || exit 1
+restart_status=0
+[[ "${worker_to_start}" == "none" ]] || docker start "${worker_to_start}" >/dev/null || restart_status=1
+[[ "${web_to_start}" == "none" ]] || docker start "${web_to_start}" >/dev/null || restart_status=1
+status_next="${state_file}.next"
+if [[ "${restart_status}" -eq 0 ]]; then
+  sed 's/^status=.*/status=recovered/' "${state_file}" > "${status_next}"
+else
+  sed 's/^status=.*/status=recovery_failed/' "${state_file}" > "${status_next}"
+fi
+mv -- "${status_next}" "${state_file}"
+exit "${restart_status}"
+REMOTE_LEASE
+chmod 700 "${lease_script}"
+setsid --fork /bin/bash -c \
+  'sleep "$1"; exec /bin/bash "$2" "$3"' \
+  atlas-preflight-lease "${lease_seconds}" "${lease_script}" "${handoff_state}" \
+  </dev/null >/dev/null 2>&1
+
 printf 'PREVIOUS_COMMIT=%s\n' "${previous_commit}"
 printf 'EXACT_BACKUP=%s\n' "${exact_backup}"
 printf 'WEB_CONTAINER=%s\n' "${web_container}"
 printf 'WORKER_CONTAINER=%s\n' "${worker_container}"
+printf 'PREFLIGHT_TOKEN=%s\n' "${preflight_token}"
 REMOTE_PREFLIGHT
 }
-
-# Back up only the explicitly named V2 volumes before source or containers change.
-REMOTE_STATE="$(run_remote_preflight 2> >(tee /dev/stderr >/dev/null))"
 
 PREVIOUS_COMMIT="none"
 EXACT_BACKUP="none"
 WEB_CONTAINER="none"
 WORKER_CONTAINER="none"
+
+recover_remote_preflight_handoff() {
+  ssh "${SSH_OPTS[@]}" "${REMOTE_TARGET}" bash -s -- \
+    "${REMOTE_BACKUP_ROOT}" "${PREFLIGHT_TOKEN}" <<'REMOTE_PREFLIGHT_RECOVER'
+# ATLAS_PREFLIGHT_RECOVERY_PROTOCOL
+set -euo pipefail
+backup_root="$1"
+preflight_token="$2"
+[[ "${preflight_token}" =~ ^[0-9a-f-]{36}$ ]] || exit 1
+state_file="${backup_root}/.atlas-preflight-handoffs/${preflight_token}.state"
+[[ -f "${state_file}" ]] || exit 3
+umask 077
+exec 9>"${state_file}.lock"
+flock -x 9
+
+read_state_value() {
+  local key="$1"
+  local count
+  count="$(grep -Ec "^${key}=" "${state_file}")"
+  [[ "${count}" -eq 1 ]] || return 1
+  sed -n "s/^${key}=//p" "${state_file}"
+}
+
+state_token="$(read_state_value token)"
+state_status="$(read_state_value status)"
+previous_commit="$(read_state_value previous_commit)"
+exact_backup="$(read_state_value exact_backup)"
+web_container="$(read_state_value web_container)"
+worker_container="$(read_state_value worker_container)"
+[[ "${state_token}" == "${preflight_token}" ]] || exit 1
+[[ "${previous_commit}" == "none" || "${previous_commit}" =~ ^[0-9a-f]{40}$ ]] || exit 1
+[[ "${exact_backup}" == "none" || "${exact_backup}" == "${backup_root}/"* ]] || exit 1
+[[ "${web_container}" == "none" || "${web_container}" =~ ^[A-Za-z0-9_.-]+$ ]] || exit 1
+[[ "${worker_container}" == "none" || "${worker_container}" =~ ^[A-Za-z0-9_.-]+$ ]] || exit 1
+case "${state_status}" in
+  recovered|complete|boundary) exit 0 ;;
+  awaiting_ack|handed_off|recovery_failed) ;;
+  *) exit 1 ;;
+esac
+
+restart_status=0
+[[ "${worker_container}" == "none" ]] || docker start "${worker_container}" >/dev/null || restart_status=1
+[[ "${web_container}" == "none" ]] || docker start "${web_container}" >/dev/null || restart_status=1
+status_next="${state_file}.next"
+if [[ "${restart_status}" -eq 0 ]]; then
+  sed 's/^status=.*/status=recovered/' "${state_file}" > "${status_next}"
+else
+  sed 's/^status=.*/status=recovery_failed/' "${state_file}" > "${status_next}"
+fi
+mv -- "${status_next}" "${state_file}"
+echo "Preflight recovery evidence: previous commit ${previous_commit}; exact backup ${exact_backup}." >&2
+exit "${restart_status}"
+REMOTE_PREFLIGHT_RECOVER
+}
+
+recover_preflight_or_fallback() {
+  if recover_remote_preflight_handoff; then
+    return 0
+  fi
+  ssh "${SSH_OPTS[@]}" "${REMOTE_TARGET}" bash -s -- \
+    "${WEB_CONTAINER}" "${WORKER_CONTAINER}" <<'REMOTE_RESTART_PRIOR'
+set -euo pipefail
+web_container="$1"
+worker_container="$2"
+[[ "${worker_container}" == "none" ]] || docker start "${worker_container}" >/dev/null
+[[ "${web_container}" == "none" ]] || docker start "${web_container}" >/dev/null
+REMOTE_RESTART_PRIOR
+}
+
+on_unacknowledged_preflight_exit() {
+  local failure_status="$?"
+  trap - EXIT
+  if [[ "${failure_status}" -ne 0 ]]; then
+    set +e
+    if recover_preflight_or_fallback; then
+      echo "Unacknowledged preflight recovered exact prior-active services." >&2
+    else
+      echo "Unacknowledged preflight recovery could not be confirmed; the remote lease remains authoritative." >&2
+    fi
+  fi
+  exit "${failure_status}"
+}
+trap on_unacknowledged_preflight_exit EXIT
+
+# Back up only the explicitly named V2 volumes before source or containers change.
+REMOTE_STATE="$(run_remote_preflight 2> >(tee /dev/stderr >/dev/null))"
+
 PREVIOUS_COMMIT_COUNT=0
 EXACT_BACKUP_COUNT=0
 WEB_CONTAINER_COUNT=0
 WORKER_CONTAINER_COUNT=0
+PREFLIGHT_TOKEN_COUNT=0
 while IFS='=' read -r state_key state_value; do
   case "${state_key}" in
     PREVIOUS_COMMIT)
@@ -372,11 +558,17 @@ while IFS='=' read -r state_key state_value; do
       WORKER_CONTAINER_COUNT=$((WORKER_CONTAINER_COUNT + 1))
       WORKER_CONTAINER="${state_value}"
       ;;
+    PREFLIGHT_TOKEN)
+      PREFLIGHT_TOKEN_COUNT=$((PREFLIGHT_TOKEN_COUNT + 1))
+      [[ "${state_value}" == "${PREFLIGHT_TOKEN}" ]] \
+        || fail "remote preflight returned a mismatched handoff token."
+      ;;
     *) fail "remote preflight response contained an unexpected key: ${state_key}." ;;
   esac
 done <<< "${REMOTE_STATE}"
 [[ "${PREVIOUS_COMMIT_COUNT}" -eq 1 && "${EXACT_BACKUP_COUNT}" -eq 1 \
-  && "${WEB_CONTAINER_COUNT}" -eq 1 && "${WORKER_CONTAINER_COUNT}" -eq 1 ]] \
+  && "${WEB_CONTAINER_COUNT}" -eq 1 && "${WORKER_CONTAINER_COUNT}" -eq 1 \
+  && "${PREFLIGHT_TOKEN_COUNT}" -eq 1 ]] \
   || fail "remote preflight values must each be returned exactly once."
 [[ "${PREVIOUS_COMMIT}" == "none" || "${PREVIOUS_COMMIT}" =~ ^[0-9a-f]{40}$ ]] \
   || fail "remote preflight returned an invalid previous commit."
@@ -387,6 +579,43 @@ done <<< "${REMOTE_STATE}"
 [[ "${WORKER_CONTAINER}" == "none" || "${WORKER_CONTAINER}" =~ ^[A-Za-z0-9_.-]+$ ]] \
   || fail "remote preflight returned an invalid worker container."
 
+ssh "${SSH_OPTS[@]}" "${REMOTE_TARGET}" bash -s -- \
+  "${REMOTE_BACKUP_ROOT}" "${PREFLIGHT_TOKEN}" "${PREVIOUS_COMMIT}" \
+  "${EXACT_BACKUP}" "${WEB_CONTAINER}" "${WORKER_CONTAINER}" <<'REMOTE_PREFLIGHT_ACK'
+# ATLAS_PREFLIGHT_ACK_PROTOCOL
+set -euo pipefail
+backup_root="$1"
+preflight_token="$2"
+expected_commit="$3"
+expected_backup="$4"
+expected_web="$5"
+expected_worker="$6"
+[[ "${preflight_token}" =~ ^[0-9a-f-]{36}$ ]] || exit 1
+state_file="${backup_root}/.atlas-preflight-handoffs/${preflight_token}.state"
+[[ -f "${state_file}" ]] || exit 1
+umask 077
+exec 9>"${state_file}.lock"
+flock -x 9
+
+read_state_value() {
+  local key="$1"
+  local count
+  count="$(grep -Ec "^${key}=" "${state_file}")"
+  [[ "${count}" -eq 1 ]] || return 1
+  sed -n "s/^${key}=//p" "${state_file}"
+}
+
+[[ "$(read_state_value token)" == "${preflight_token}" ]] || exit 1
+[[ "$(read_state_value status)" == "awaiting_ack" ]] || exit 1
+[[ "$(read_state_value previous_commit)" == "${expected_commit}" ]] || exit 1
+[[ "$(read_state_value exact_backup)" == "${expected_backup}" ]] || exit 1
+[[ "$(read_state_value web_container)" == "${expected_web}" ]] || exit 1
+[[ "$(read_state_value worker_container)" == "${expected_worker}" ]] || exit 1
+status_next="${state_file}.next"
+sed 's/^status=.*/status=handed_off/' "${state_file}" > "${status_next}"
+mv -- "${status_next}" "${state_file}"
+REMOTE_PREFLIGHT_ACK
+
 GUIDANCE_PRINTED=0
 MIGRATION_STARTED=0
 DEPLOYMENT_COMPLETE=0
@@ -394,7 +623,7 @@ recover_failed_deployment() {
   local failure_status="$1"
   [[ "${GUIDANCE_PRINTED}" -eq 0 ]] || return 0
   GUIDANCE_PRINTED=1
-  trap - ERR EXIT
+  trap - ERR EXIT INT TERM
   set +e
   {
     echo "Atlas V2 deployment failed with status ${failure_status}."
@@ -403,15 +632,7 @@ recover_failed_deployment() {
   } >&2
 
   if [[ "${MIGRATION_STARTED}" -eq 0 ]]; then
-    if ssh "${SSH_OPTS[@]}" "${REMOTE_TARGET}" bash -s -- \
-      "${WEB_CONTAINER}" "${WORKER_CONTAINER}" <<'REMOTE_RESTART_PRIOR'
-set -euo pipefail
-web_container="$1"
-worker_container="$2"
-[[ "${worker_container}" == "none" ]] || docker start "${worker_container}" >/dev/null
-[[ "${web_container}" == "none" ]] || docker start "${web_container}" >/dev/null
-REMOTE_RESTART_PRIOR
-    then
+    if recover_preflight_or_fallback; then
       echo "Failure occurred before migration; exact prior-active services restarted." >&2
     else
       echo "Failure occurred before migration, but one or more exact prior-active services could not be restarted." >&2
@@ -438,7 +659,13 @@ on_deploy_exit() {
     recover_failed_deployment "${failure_status}"
   fi
 }
+on_deploy_signal() {
+  local failure_status="$1"
+  recover_failed_deployment "${failure_status}"
+}
 trap on_deploy_exit EXIT
+trap 'on_deploy_signal 130' INT
+trap 'on_deploy_signal 143' TERM
 
 RSYNC_TREE_ARGS=(
   -az --delete-delay
@@ -485,18 +712,32 @@ done
 [[ "$(docker inspect --format '{{.State.Health.Status}}' "${db_container}")" == "healthy" ]] \
   || { echo "Atlas V2 database did not become healthy." >&2; docker compose logs db >&2; exit 1; }
 
-docker compose exec -T db /docker-entrypoint-initdb.d/001-atlas-roles.sh
 REMOTE_PREPARE
 
-# From this exact point onward, an old application image may be incompatible
-# with the migrated schema. Any failure must keep all writers stopped.
+# From this exact point onward, credentials and then schema may become
+# incompatible with old application containers. Any failure must keep every
+# writer stopped; old containers must never be restarted past this boundary.
 MIGRATION_STARTED=1
+ssh "${SSH_OPTS[@]}" "${REMOTE_TARGET}" bash -s -- \
+  "${REMOTE_BACKUP_ROOT}" "${PREFLIGHT_TOKEN}" <<'REMOTE_PREFLIGHT_BOUNDARY'
+set -euo pipefail
+state_file="$1/.atlas-preflight-handoffs/$2.state"
+[[ -f "${state_file}" ]] || exit 1
+umask 077
+exec 9>"${state_file}.lock"
+flock -x 9
+grep -Fxq 'status=handed_off' "${state_file}" || exit 1
+status_next="${state_file}.next"
+sed 's/^status=.*/status=boundary/' "${state_file}" > "${status_next}"
+mv -- "${status_next}" "${state_file}"
+REMOTE_PREFLIGHT_BOUNDARY
 ssh "${SSH_OPTS[@]}" "${REMOTE_TARGET}" bash -s -- "${REMOTE_DIR}" <<'REMOTE_MIGRATE_AND_START'
 set -euo pipefail
 
 remote_dir="$1"
 cd "${remote_dir}"
 
+docker compose exec -T db /docker-entrypoint-initdb.d/001-atlas-roles.sh
 docker compose --profile operations run --rm migrator
 docker compose up -d web worker caddy
 docker compose up -d --wait --wait-timeout 180
@@ -543,8 +784,22 @@ printf '%s\n' "${release_commit}" > "${remote_dir}/.atlas-release.next"
 mv -- "${remote_dir}/.atlas-release.next" "${remote_dir}/.atlas-release"
 REMOTE_RELEASE
 
+ssh "${SSH_OPTS[@]}" "${REMOTE_TARGET}" bash -s -- \
+  "${REMOTE_BACKUP_ROOT}" "${PREFLIGHT_TOKEN}" <<'REMOTE_PREFLIGHT_COMPLETE'
+set -euo pipefail
+state_file="$1/.atlas-preflight-handoffs/$2.state"
+[[ -f "${state_file}" ]] || exit 1
+umask 077
+exec 9>"${state_file}.lock"
+flock -x 9
+grep -Fxq 'status=boundary' "${state_file}" || exit 1
+status_next="${state_file}.next"
+sed 's/^status=.*/status=complete/' "${state_file}" > "${status_next}"
+mv -- "${status_next}" "${state_file}"
+REMOTE_PREFLIGHT_COMPLETE
+
 DEPLOYMENT_COMPLETE=1
-trap - EXIT
+trap - EXIT INT TERM
 echo "Atlas V2 release ${LOCAL_COMMIT} passed target-bound and public HTTPS health verification."
 echo "No rollback was run automatically."
 echo "Previous Git commit: ${PREVIOUS_COMMIT}"

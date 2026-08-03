@@ -23,6 +23,102 @@ security:
   - sessionCookie: []
   - atlasBearer: []
 paths:
+  /api/auth/google:
+    get:
+      operationId: beginGoogleWorkspaceSignIn
+      summary: Begin Google Workspace sign-in
+      description: >-
+        Public browser redirect surface outside the /api/v2 namespace. Creates a
+        short-lived, HTTP-only OAuth state cookie and redirects to Google. It does
+        not create an Atlas session or link a Google subject.
+      tags: [Identity]
+      security: []
+      servers:
+        - url: https://atlas.rangeway.app
+          description: Atlas production origin
+      # Browser redirect endpoint: a successful OAuth start is intentionally 302,
+      # and its only configured failure is 503 rather than a fabricated 4XX.
+      responses:
+        "302":
+          description: Redirect to the configured Google OAuth authorization endpoint.
+          headers:
+            Location:
+              description: Google OAuth authorization URL.
+              schema:
+                type: string
+                format: uri
+            Set-Cookie:
+              description: Short-lived, HTTP-only OAuth state cookie.
+              schema:
+                type: string
+        "503":
+          description: Google OAuth is not configured.
+          content:
+            text/plain:
+              schema:
+                type: string
+                const: Google SSO is not configured.
+  /api/auth/google/callback:
+    get:
+      operationId: completeGoogleWorkspaceSignIn
+      summary: Complete Google Workspace sign-in
+      description: >-
+        Public Google OAuth callback outside the /api/v2 namespace. Validates the
+        state cookie, exchanges and verifies Google's ID token, then atomically
+        links or updates the pre-provisioned Atlas human identity. Only a verified
+        callback may persist Google's immutable subject. Success creates the
+        canonical signed human session and redirects to ATLAS_ORIGIN.
+      tags: [Identity]
+      security: []
+      servers:
+        - url: https://atlas.rangeway.app
+          description: Atlas production origin
+      parameters:
+        - name: code
+          in: query
+          required: true
+          schema:
+            type: string
+            minLength: 1
+        - name: state
+          in: query
+          required: true
+          schema:
+            type: string
+            minLength: 1
+      # Browser redirect endpoint: a successful verified callback is intentionally 302.
+      responses:
+        "302":
+          description: Session created and browser redirected to the configured Atlas origin.
+          headers:
+            Location:
+              description: Configured Atlas browser origin.
+              schema:
+                type: string
+                format: uri
+            Set-Cookie:
+              description: Signed Atlas human session plus expiration of the OAuth state cookie.
+              schema:
+                type: string
+        "400":
+          description: Missing, malformed, expired, or mismatched OAuth state.
+          content:
+            text/plain:
+              schema:
+                type: string
+                const: Invalid Google sign-in state.
+        "401":
+          description: The verified Google identity cannot authenticate an enabled Atlas human.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GoogleAuthError"
+        "500":
+          description: Google exchange, verification, or identity persistence failed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GoogleAuthError"
   /health:
     get:
       operationId: getHealth
@@ -253,6 +349,14 @@ components:
           schema:
             $ref: "#/components/schemas/ApiErrorBody"
   schemas:
+    GoogleAuthError:
+      type: object
+      additionalProperties: false
+      required: [error]
+      properties:
+        error:
+          type: string
+          minLength: 1
     HealthResponse:
       type: object
       additionalProperties: false

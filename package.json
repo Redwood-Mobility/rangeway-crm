@@ -16,7 +16,8 @@
     "test:watch": "vitest",
     "test:integration": "vitest run tests/server tests/worker",
     "db:migrate": "node dist/server/platform/db/migrate.js",
-    "db:seed:development": "node dist/server/platform/db/seed-development.js"
+    "db:seed:development": "node dist/server/platform/db/seed-development.js",
+    "db:provision:production-owner": "node dist/server/platform/db/provision-production-owner.js"
   },
   "dependencies": {
     "argon2": "^0.44.0",

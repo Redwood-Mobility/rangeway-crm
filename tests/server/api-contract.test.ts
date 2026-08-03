@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
+import path from "node:path";
 import request from "supertest";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createApp } from "../../src/server/app.js";
@@ -24,6 +26,10 @@ const serviceIdentity = {
 const serviceKey = "atlas_abcdefghijkl.ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopq";
 const disabledServiceKey = "atlas_disabledkey1.ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopq";
 const internalFailureKey = "atlas_internalerr1.ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopq";
+const openApiContract = readFileSync(
+  path.resolve(import.meta.dirname, "../../openapi/atlas-v2.yaml"),
+  "utf8",
+);
 
 class ContractIdentity {
   async authenticateHumanSession(scopedOrganizationId: string, userId: string) {
@@ -364,12 +370,29 @@ describe("Atlas V2 API contract", () => {
       "google-subject-001",
       "admin@rangeway.energy",
       "Atlas Admin",
+      callback.headers["x-request-id"],
     );
 
     const me = await request(app).get("/api/v2/me").set("Cookie", sessionCookie);
     const requestId = expectRequestId(me);
     expect(me.status).toBe(200);
     expect(me.body).toEqual({ actor: { ...humanIdentity, requestId } });
+  });
+
+  it("documents the public Google redirect and callback surfaces outside /api/v2", () => {
+    expect(openApiContract).toMatch(/^  \/api\/auth\/google:$/m);
+    expect(openApiContract).toMatch(/^  \/api\/auth\/google\/callback:$/m);
+    expect(openApiContract).toContain("operationId: beginGoogleWorkspaceSignIn");
+    expect(openApiContract).toContain("operationId: completeGoogleWorkspaceSignIn");
+    expect(openApiContract.match(/url: https:\/\/atlas\.rangeway\.app$/gm)).toHaveLength(2);
+    const googleSurface = openApiContract.slice(
+      openApiContract.indexOf("  /api/auth/google:"),
+      openApiContract.indexOf("  /health:"),
+    );
+    expect(googleSurface.match(/^      security: \[\]$/gm)).toHaveLength(2);
+    expect(googleSurface).toContain('"302":');
+    expect(googleSurface).toContain('"400":');
+    expect(googleSurface).toContain('"503":');
   });
 
   it("does not issue a Google session when V2 actor validation rejects the human", async () => {
