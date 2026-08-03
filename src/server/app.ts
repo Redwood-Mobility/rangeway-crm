@@ -15,7 +15,7 @@ import {
   currentUser,
   setSessionCookie,
 } from "./auth.js";
-import { db, migrate, now, upsertUser } from "./db.js";
+import { db, now, upsertUser } from "./db.js";
 import { IdentityService } from "./modules/identity/identity.service.js";
 import {
   createIdentityRouter,
@@ -104,22 +104,22 @@ const googleOAuth: GoogleOAuthGateway = options.googleOAuth ?? {
   verifyIdToken: verifyGoogleIdToken,
 };
 
-fs.mkdirSync(documentDir, { recursive: true });
-fs.mkdirSync(tempDir, { recursive: true });
-migrate();
-
-const upload = multer({
-  dest: tempDir,
-  limits: { fileSize: config.maxUploadBytes },
-  fileFilter(_req, file, cb) {
-    const extension = path.extname(file.originalname).toLowerCase();
-    if (allowedExtensions.has(extension) && allowedMimeTypes.has(file.mimetype)) {
-      cb(null, true);
-      return;
-    }
-    cb(new Error("Only PDF, DOC, DOCX, XLS, and XLSX files are supported."));
-  }
-});
+const receiveLegacyUpload: express.RequestHandler = (req, res, next) => {
+  fs.mkdirSync(documentDir, { recursive: true });
+  fs.mkdirSync(tempDir, { recursive: true });
+  multer({
+    dest: tempDir,
+    limits: { fileSize: config.maxUploadBytes },
+    fileFilter(_req, file, callback) {
+      const extension = path.extname(file.originalname).toLowerCase();
+      if (allowedExtensions.has(extension) && allowedMimeTypes.has(file.mimetype)) {
+        callback(null, true);
+        return;
+      }
+      callback(new Error("Only PDF, DOC, DOCX, XLS, and XLSX files are supported."));
+    },
+  }).single("file")(req, res, next);
+};
 
 app.use(assignRequestContext);
 app.use(express.json({ limit: "1mb" }));
@@ -335,9 +335,11 @@ function getProject(id: string) {
   };
 }
 
-app.get("/api/health", (_req, res) => {
-  res.json({ ok: true, time: now() });
-});
+if (!config.isProduction) {
+  app.get("/api/health", (_req, res) => {
+    res.json({ ok: true, time: now() });
+  });
+}
 
 app.get("/api/me", (req, res) => {
   res.json({ user: currentUser(req, config.sessionSecret) });
@@ -394,11 +396,18 @@ app.get("/api/auth/google/callback", async (req, res, next) => {
     if (actor.actorType !== "human" || !actor.userId) {
       throw new ApiError(401, "UNAUTHENTICATED", "Authentication required.");
     }
-    const user = upsertUser({ ...googleUser, provider: "google" });
+    const session = config.isProduction
+      ? {
+          id: actor.userId,
+          email: googleUser.email,
+          name: googleUser.name,
+          picture: googleUser.picture,
+        }
+      : sessionUser(upsertUser({ ...googleUser, provider: "google" }));
     setSessionCookie(
       res,
       {
-        ...sessionUser(user),
+        ...session,
         organizationId: actor.organizationId,
       },
       config.sessionSecret,
@@ -408,6 +417,19 @@ app.get("/api/auth/google/callback", async (req, res, next) => {
     next(error);
   }
 });
+
+app.post("/api/logout", (_req, res) => {
+  clearSessionCookie(res);
+  res.json({ ok: true });
+});
+
+if (config.isProduction) {
+  const legacyNotFound: express.RequestHandler = (_req, res) => {
+    res.status(404).json({ error: "Not found" });
+  };
+  app.use("/api", legacyNotFound);
+  app.use("/documents", legacyNotFound);
+}
 
 app.post("/api/login", (req, res) => {
   if (config.authMode !== "local" || config.isProduction) {
@@ -428,11 +450,6 @@ app.post("/api/login", (req, res) => {
     config.sessionSecret,
   );
   res.json({ user: payload });
-});
-
-app.post("/api/logout", (_req, res) => {
-  clearSessionCookie(res);
-  res.json({ ok: true });
 });
 
 app.use("/api", requireV1Auth);
@@ -883,7 +900,7 @@ app.get("/api/documents", (_req, res) => {
   res.json({ documents: normalizeRows(rows) });
 });
 
-app.post("/api/documents", upload.single("file"), (req, res) => {
+app.post("/api/documents", receiveLegacyUpload, (req, res) => {
   if (!req.file) {
     res.status(400).json({ error: "A document file is required" });
     return;

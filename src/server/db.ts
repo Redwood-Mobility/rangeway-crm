@@ -4,14 +4,34 @@ import Database from "better-sqlite3";
 import { nanoid } from "nanoid";
 import { config } from "./config.js";
 
-fs.mkdirSync(path.dirname(config.databasePath), { recursive: true });
+let legacyDatabase: Database.Database | undefined;
 
-export const db = new Database(config.databasePath);
-db.pragma("journal_mode = WAL");
-db.pragma("foreign_keys = ON");
+function getLegacyDatabase(): Database.Database {
+  if (legacyDatabase) return legacyDatabase;
+
+  fs.mkdirSync(path.dirname(config.databasePath), { recursive: true });
+  const database = new Database(config.databasePath);
+  database.pragma("journal_mode = WAL");
+  database.pragma("foreign_keys = ON");
+  migrateDatabase(database);
+  legacyDatabase = database;
+  return database;
+}
+
+export const db = new Proxy({} as Database.Database, {
+  get(_target, property) {
+    const database = getLegacyDatabase();
+    const value = Reflect.get(database, property, database) as unknown;
+    return typeof value === "function" ? value.bind(database) : value;
+  },
+});
 
 export function migrate() {
-  db.exec(`
+  getLegacyDatabase();
+}
+
+function migrateDatabase(database: Database.Database) {
+  database.exec(`
     CREATE TABLE IF NOT EXISTS contacts (
       id TEXT PRIMARY KEY,
       name TEXT NOT NULL,
@@ -115,31 +135,31 @@ export function migrate() {
     CREATE INDEX IF NOT EXISTS idx_activities_subject ON activities(subject_type, subject_id, created_at);
   `);
 
-  addColumn("projects", "corridor", "TEXT DEFAULT ''");
-  addColumn("projects", "site_fit", "TEXT DEFAULT ''");
-  addColumn("projects", "land_status", "TEXT DEFAULT ''");
-  addColumn("projects", "utility_status", "TEXT DEFAULT ''");
-  addColumn("projects", "power_strategy", "TEXT DEFAULT ''");
-  addColumn("projects", "hospitality_scope", "TEXT DEFAULT ''");
-  addColumn("projects", "next_milestone", "TEXT DEFAULT ''");
-  addColumn("projects", "risk_level", "TEXT DEFAULT 'Medium'");
-  addColumn("documents", "document_category", "TEXT DEFAULT 'General'");
-  addColumn("documents", "phase", "TEXT DEFAULT 'General'");
-  addColumn("contacts", "created_by_user_id", "TEXT REFERENCES users(id) ON DELETE SET NULL");
-  addColumn("projects", "created_by_user_id", "TEXT REFERENCES users(id) ON DELETE SET NULL");
-  addColumn("documents", "uploaded_by_user_id", "TEXT REFERENCES users(id) ON DELETE SET NULL");
-  addColumn("tasks", "assigned_to_user_id", "TEXT REFERENCES users(id) ON DELETE SET NULL");
-  addColumn("tasks", "created_by_user_id", "TEXT REFERENCES users(id) ON DELETE SET NULL");
+  addColumn(database, "projects", "corridor", "TEXT DEFAULT ''");
+  addColumn(database, "projects", "site_fit", "TEXT DEFAULT ''");
+  addColumn(database, "projects", "land_status", "TEXT DEFAULT ''");
+  addColumn(database, "projects", "utility_status", "TEXT DEFAULT ''");
+  addColumn(database, "projects", "power_strategy", "TEXT DEFAULT ''");
+  addColumn(database, "projects", "hospitality_scope", "TEXT DEFAULT ''");
+  addColumn(database, "projects", "next_milestone", "TEXT DEFAULT ''");
+  addColumn(database, "projects", "risk_level", "TEXT DEFAULT 'Medium'");
+  addColumn(database, "documents", "document_category", "TEXT DEFAULT 'General'");
+  addColumn(database, "documents", "phase", "TEXT DEFAULT 'General'");
+  addColumn(database, "contacts", "created_by_user_id", "TEXT REFERENCES users(id) ON DELETE SET NULL");
+  addColumn(database, "projects", "created_by_user_id", "TEXT REFERENCES users(id) ON DELETE SET NULL");
+  addColumn(database, "documents", "uploaded_by_user_id", "TEXT REFERENCES users(id) ON DELETE SET NULL");
+  addColumn(database, "tasks", "assigned_to_user_id", "TEXT REFERENCES users(id) ON DELETE SET NULL");
+  addColumn(database, "tasks", "created_by_user_id", "TEXT REFERENCES users(id) ON DELETE SET NULL");
 }
 
 export function now() {
   return new Date().toISOString();
 }
 
-function addColumn(table: string, column: string, definition: string) {
-  const columns = db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
+function addColumn(database: Database.Database, table: string, column: string, definition: string) {
+  const columns = database.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
   if (!columns.some((item) => item.name === column)) {
-    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+    database.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
   }
 }
 

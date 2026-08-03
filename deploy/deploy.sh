@@ -6,9 +6,9 @@ cd "${REPOSITORY_ROOT}"
 
 REMOTE_HOST="${ATLAS_HOST:-}"
 REMOTE_USER="${ATLAS_USER:-root}"
-REMOTE_DIR="${ATLAS_DIR:-/opt/atlas-v2}"
-REMOTE_BACKUP_ROOT="${ATLAS_BACKUP_ROOT:-${REMOTE_DIR}/backups}"
-ENV_FILE="${ATLAS_ENV_FILE:-}"
+REMOTE_DIR_INPUT="${ATLAS_DIR:-/opt/atlas-v2}"
+REMOTE_BACKUP_ROOT_INPUT="${ATLAS_BACKUP_ROOT:-/var/backups/atlas-v2}"
+ENV_FILE_INPUT="${ATLAS_ENV_FILE:-}"
 SSH_KEY="${ATLAS_SSH_KEY:-}"
 SSH_OPTS=(-o BatchMode=yes -o StrictHostKeyChecking=accept-new)
 RSYNC_RSH="ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new"
@@ -18,25 +18,69 @@ fail() {
   exit 1
 }
 
-validate_remote_path() {
+canonicalize_absolute_path() {
+  local candidate="$1"
+  local component
+  local -a components=()
+  local -a canonical=()
+
+  [[ "${candidate}" == /* ]] || return 1
+  IFS='/' read -r -a components <<< "${candidate}"
+  for component in "${components[@]}"; do
+    case "${component}" in
+      ""|.) ;;
+      ..)
+        if [[ "${#canonical[@]}" -gt 0 ]]; then
+          unset 'canonical[${#canonical[@]}-1]'
+        fi
+        ;;
+      *) canonical+=("${component}") ;;
+    esac
+  done
+
+  if [[ "${#canonical[@]}" -eq 0 ]]; then
+    printf '/\n'
+  else
+    local joined
+    joined="$(IFS=/; printf '%s' "${canonical[*]}")"
+    printf '/%s\n' "${joined}"
+  fi
+}
+
+validate_remote_path_input() {
   local candidate="$1"
   local label="$2"
-  [[ "${candidate}" == /* ]] || fail "${label} must be an absolute path."
-  [[ "${candidate}" != "/" ]] || fail "${label} cannot be the filesystem root."
-  [[ "${candidate}" != *".."* ]] || fail "${label} cannot contain '..'."
   [[ "${candidate}" != *'*'* && "${candidate}" != *'?'* && "${candidate}" != *'['* ]] \
     || fail "${label} cannot contain a glob."
   [[ "${candidate}" =~ ^/[A-Za-z0-9._/-]+$ ]] || fail "${label} contains unsupported characters."
 }
 
+path_is_equal_or_descendant() {
+  local candidate="$1"
+  local ancestor="$2"
+  [[ "${candidate}" == "${ancestor}" || "${candidate}" == "${ancestor}/"* ]]
+}
+
 [[ -n "${REMOTE_HOST}" ]] || fail "set ATLAS_HOST to the target VPS hostname or IP."
 [[ "${REMOTE_HOST}" =~ ^[A-Za-z0-9._:-]+$ ]] || fail "ATLAS_HOST contains unsupported characters."
 [[ "${REMOTE_USER}" =~ ^[A-Za-z0-9._-]+$ ]] || fail "ATLAS_USER contains unsupported characters."
-validate_remote_path "${REMOTE_DIR}" "ATLAS_DIR"
-validate_remote_path "${REMOTE_BACKUP_ROOT}" "ATLAS_BACKUP_ROOT"
+validate_remote_path_input "${REMOTE_DIR_INPUT}" "ATLAS_DIR"
+validate_remote_path_input "${REMOTE_BACKUP_ROOT_INPUT}" "ATLAS_BACKUP_ROOT"
+REMOTE_DIR="$(canonicalize_absolute_path "${REMOTE_DIR_INPUT}")" \
+  || fail "ATLAS_DIR must be an absolute path."
+REMOTE_BACKUP_ROOT="$(canonicalize_absolute_path "${REMOTE_BACKUP_ROOT_INPUT}")" \
+  || fail "ATLAS_BACKUP_ROOT must be an absolute path."
+[[ "${REMOTE_DIR}" != "/" ]] || fail "ATLAS_DIR cannot resolve to the filesystem root."
+[[ "${REMOTE_BACKUP_ROOT}" != "/" ]] || fail "ATLAS_BACKUP_ROOT cannot resolve to the filesystem root."
+if path_is_equal_or_descendant "${REMOTE_BACKUP_ROOT}" "${REMOTE_DIR}"; then
+  fail "ATLAS_BACKUP_ROOT must be outside the synchronized ATLAS_DIR tree."
+fi
 
-[[ -n "${ENV_FILE}" ]] || fail "set ATLAS_ENV_FILE to the production environment file."
-[[ -f "${ENV_FILE}" ]] || fail "production environment file not found: ${ENV_FILE}"
+[[ -n "${ENV_FILE_INPUT}" ]] || fail "set ATLAS_ENV_FILE to the production environment file."
+[[ -f "${ENV_FILE_INPUT}" ]] || fail "production environment file is not a regular file: ${ENV_FILE_INPUT}"
+command -v realpath >/dev/null 2>&1 || fail "required local command is unavailable: realpath"
+ENV_FILE="$(realpath "${ENV_FILE_INPUT}")"
+[[ -f "${ENV_FILE}" ]] || fail "canonical production environment path is not a regular file: ${ENV_FILE}"
 if grep -q "REPLACE_WITH" "${ENV_FILE}"; then
   fail "production environment file still contains REPLACE_WITH placeholders."
 fi
@@ -46,6 +90,13 @@ for required_key in POSTGRES_PASSWORD DATABASE_URL SESSION_SECRET ATLAS_ORIGIN A
 done
 grep -Eq '^DATABASE_URL=postgres(ql)?://[^@]+@db:5432/atlas(\?.*)?$' "${ENV_FILE}" \
   || fail "DATABASE_URL must target the Compose service db:5432/atlas."
+
+ENV_SOURCE_EXCLUDE=""
+case "${ENV_FILE}" in
+  "${REPOSITORY_ROOT}"/*)
+    ENV_SOURCE_EXCLUDE="/${ENV_FILE#"${REPOSITORY_ROOT}/"}"
+    ;;
+esac
 
 if [[ -n "${SSH_KEY}" ]]; then
   [[ -f "${SSH_KEY}" ]] || fail "SSH key not found: ${SSH_KEY}"
@@ -70,11 +121,46 @@ npm run build
 npx --yes @redocly/cli lint openapi/atlas-v2.yaml
 
 REMOTE_TARGET="${REMOTE_USER}@${REMOTE_HOST}"
+
+resolve_remote_paths() {
+  ssh "${SSH_OPTS[@]}" "${REMOTE_TARGET}" bash -s -- \
+    "${REMOTE_DIR}" "${REMOTE_BACKUP_ROOT}" <<'REMOTE_PATHS'
+set -euo pipefail
+remote_dir="$(realpath -m -- "$1")"
+backup_root="$(realpath -m -- "$2")"
+[[ "${remote_dir}" != "/" && "${backup_root}" != "/" ]] || exit 1
+case "${backup_root}" in
+  "${remote_dir}"|"${remote_dir}"/*)
+    echo "ATLAS_BACKUP_ROOT resolves inside the synchronized ATLAS_DIR tree." >&2
+    exit 1
+    ;;
+esac
+printf 'REMOTE_DIR=%s\n' "${remote_dir}"
+printf 'REMOTE_BACKUP_ROOT=%s\n' "${backup_root}"
+REMOTE_PATHS
+}
+
+# Resolve remote symlinks and dot segments before the first remote mutation.
+REMOTE_PATH_STATE="$(resolve_remote_paths 2> >(tee /dev/stderr))"
+
+REMOTE_DIR=""
+REMOTE_BACKUP_ROOT=""
+while IFS='=' read -r path_key path_value; do
+  case "${path_key}" in
+    REMOTE_DIR) REMOTE_DIR="${path_value}" ;;
+    REMOTE_BACKUP_ROOT) REMOTE_BACKUP_ROOT="${path_value}" ;;
+  esac
+done <<< "${REMOTE_PATH_STATE}"
+[[ -n "${REMOTE_DIR}" && -n "${REMOTE_BACKUP_ROOT}" ]] \
+  || fail "remote deployment paths could not be canonicalized."
+if path_is_equal_or_descendant "${REMOTE_BACKUP_ROOT}" "${REMOTE_DIR}"; then
+  fail "canonical ATLAS_BACKUP_ROOT must be outside the synchronized ATLAS_DIR tree."
+fi
+
 ssh "${SSH_OPTS[@]}" "${REMOTE_TARGET}" \
   "mkdir -p -- '${REMOTE_DIR}' '${REMOTE_BACKUP_ROOT}'"
 
-# Back up only the explicitly named V2 volumes before source or containers change.
-REMOTE_STATE="$({
+run_remote_preflight() {
   ssh "${SSH_OPTS[@]}" "${REMOTE_TARGET}" bash -s -- \
     "${REMOTE_DIR}" "${REMOTE_BACKUP_ROOT}" <<'REMOTE_PREFLIGHT'
 set -euo pipefail
@@ -82,7 +168,7 @@ set -euo pipefail
 remote_dir="$1"
 backup_root="$2"
 previous_commit="none"
-latest_backup="none"
+exact_backup="none"
 
 if [[ -f "${remote_dir}/.atlas-release" ]]; then
   previous_commit="$(tr -d '[:space:]' < "${remote_dir}/.atlas-release")"
@@ -96,50 +182,101 @@ if docker volume inspect atlas-db >/dev/null 2>&1; then
   [[ "${previous_commit}" =~ ^[0-9a-f]{40}$ ]] \
     || { echo "Existing Atlas V2 database has no valid recorded release commit; refusing replacement." >&2; exit 1; }
 
-  (
+  backup_output="$({
     cd "${remote_dir}"
     BACKUP_ROOT="${backup_root}" \
       COMPOSE_PROJECT_NAME="atlas-v2" \
       ATLAS_GIT_COMMIT="${previous_commit}" \
       ./deploy/backup.sh
-  ) >&2
+  })"
+  [[ "$(printf '%s\n' "${backup_output}" | wc -l | tr -d '[:space:]')" == "1" ]] \
+    || { echo "Backup script did not emit exactly one machine-readable path." >&2; exit 1; }
+  case "${backup_output}" in
+    ATLAS_BACKUP_PATH=*) exact_backup="${backup_output#ATLAS_BACKUP_PATH=}" ;;
+    *) echo "Backup script did not emit ATLAS_BACKUP_PATH." >&2; exit 1 ;;
+  esac
 
-  latest_backup="$(
-    find "${backup_root}" -mindepth 1 -maxdepth 1 -type d -name '20*' -print \
-      | LC_ALL=C sort \
-      | tail -n 1
-  )"
-  [[ -n "${latest_backup}" ]] || { echo "Backup completed without a discoverable backup directory." >&2; exit 1; }
+  exact_backup="$(realpath -m -- "${exact_backup}")"
+  backup_root="$(realpath -m -- "${backup_root}")"
+  case "${exact_backup}" in
+    "${backup_root}"/*) ;;
+    *) echo "Backup path escaped the configured backup root." >&2; exit 1 ;;
+  esac
+  for backup_file in atlas-postgres.dump atlas-artifacts.tgz metadata.txt manifest.sha256; do
+    [[ -s "${exact_backup}/${backup_file}" ]] \
+      || { echo "Exact backup is incomplete: ${backup_file}." >&2; exit 1; }
+  done
+  (cd "${exact_backup}" && sha256sum --check manifest.sha256) >&2
 fi
 
 printf 'PREVIOUS_COMMIT=%s\n' "${previous_commit}"
-printf 'LATEST_BACKUP=%s\n' "${latest_backup}"
+printf 'EXACT_BACKUP=%s\n' "${exact_backup}"
 REMOTE_PREFLIGHT
-} 2> >(tee /dev/stderr))"
+}
+
+# Back up only the explicitly named V2 volumes before source or containers change.
+REMOTE_STATE="$(run_remote_preflight 2> >(tee /dev/stderr))"
 
 PREVIOUS_COMMIT="none"
-LATEST_BACKUP="none"
+EXACT_BACKUP="none"
 while IFS='=' read -r state_key state_value; do
   case "${state_key}" in
     PREVIOUS_COMMIT) PREVIOUS_COMMIT="${state_value}" ;;
-    LATEST_BACKUP) LATEST_BACKUP="${state_value}" ;;
+    EXACT_BACKUP) EXACT_BACKUP="${state_value}" ;;
   esac
 done <<< "${REMOTE_STATE}"
+[[ "${PREVIOUS_COMMIT}" == "none" || "${PREVIOUS_COMMIT}" =~ ^[0-9a-f]{40}$ ]] \
+  || fail "remote preflight returned an invalid previous commit."
+[[ "${EXACT_BACKUP}" == "none" || "${EXACT_BACKUP}" == "${REMOTE_BACKUP_ROOT}/"* ]] \
+  || fail "remote preflight returned an invalid backup path."
 
-rsync -az --delete-delay \
-  -e "${RSYNC_RSH}" \
-  --exclude ".git/" \
-  --exclude ".env" \
-  --exclude ".atlas-release" \
-  --exclude "node_modules/" \
-  --exclude "dist/" \
-  --exclude "backups/" \
-  --exclude "artifacts/" \
-  --exclude "atlas-db/" \
-  --exclude "atlas-artifacts/" \
-  --exclude "data/" \
-  --exclude "uploads/" \
-  ./ "${REMOTE_TARGET}:${REMOTE_DIR}/"
+GUIDANCE_PRINTED=0
+print_recovery_guidance() {
+  local failure_status="$1"
+  [[ "${GUIDANCE_PRINTED}" -eq 0 ]] || return 0
+  GUIDANCE_PRINTED=1
+  {
+    echo "Atlas V2 deployment failed with status ${failure_status}."
+    echo "No rollback was run automatically."
+    echo "Previous Git commit: ${PREVIOUS_COMMIT}"
+    echo "Exact pre-deploy backup: ${EXACT_BACKUP}"
+    echo "Manual recovery: inspect the failed services and backup manifest before creating a clean worktree at the previous commit or performing any operator-reviewed restore."
+  } >&2
+}
+on_deploy_error() {
+  local failure_status="$?"
+  print_recovery_guidance "${failure_status}"
+  return "${failure_status}"
+}
+on_deploy_exit() {
+  local failure_status="$?"
+  if [[ "${failure_status}" -ne 0 ]]; then
+    print_recovery_guidance "${failure_status}"
+  fi
+}
+trap on_deploy_error ERR
+trap on_deploy_exit EXIT
+
+RSYNC_TREE_ARGS=(
+  -az --delete-delay
+  -e "${RSYNC_RSH}"
+  --exclude ".git/"
+  --exclude ".env"
+  --exclude ".env.*"
+  --exclude ".atlas-release"
+  --exclude "node_modules/"
+  --exclude "dist/"
+  --exclude "backups/"
+  --exclude "artifacts/"
+  --exclude "atlas-db/"
+  --exclude "atlas-artifacts/"
+  --exclude "data/"
+  --exclude "uploads/"
+)
+if [[ -n "${ENV_SOURCE_EXCLUDE}" ]]; then
+  RSYNC_TREE_ARGS+=(--exclude "${ENV_SOURCE_EXCLUDE}")
+fi
+rsync "${RSYNC_TREE_ARGS[@]}" ./ "${REMOTE_TARGET}:${REMOTE_DIR}/"
 
 rsync -az --chmod=F600 -e "${RSYNC_RSH}" \
   "${ENV_FILE}" "${REMOTE_TARGET}:${REMOTE_DIR}/.env"
@@ -171,15 +308,32 @@ docker compose up -d --wait --wait-timeout 180
 docker compose ps
 REMOTE_DEPLOY
 
-HEALTH_RESPONSE="$(
+TARGET_HEALTH_RESPONSE="$({
+  ssh "${SSH_OPTS[@]}" "${REMOTE_TARGET}" bash -s -- <<'REMOTE_HEALTH'
+set -euo pipefail
+curl --fail --silent --show-error \
+  --retry 12 --retry-delay 5 --retry-all-errors --max-time 10 \
+  --noproxy '*' \
+  --resolve atlas.rangeway.app:443:127.0.0.1 \
+  https://atlas.rangeway.app/api/v2/health
+REMOTE_HEALTH
+})"
+HEALTH_JSON="${TARGET_HEALTH_RESPONSE}" node --input-type=module -e '
+  const health = JSON.parse(process.env.HEALTH_JSON ?? "null");
+  if (health?.apiVersion !== "v2") {
+    throw new Error("Target-bound Atlas health response did not report apiVersion=v2.");
+  }
+'
+
+PUBLIC_HEALTH_RESPONSE="$({
   curl --fail --silent --show-error \
     --retry 12 --retry-delay 5 --retry-all-errors --max-time 10 \
     https://atlas.rangeway.app/api/v2/health
-)"
-HEALTH_JSON="${HEALTH_RESPONSE}" node --input-type=module -e '
+})"
+HEALTH_JSON="${PUBLIC_HEALTH_RESPONSE}" node --input-type=module -e '
   const health = JSON.parse(process.env.HEALTH_JSON ?? "null");
   if (health?.apiVersion !== "v2") {
-    throw new Error("Atlas health response did not report apiVersion=v2.");
+    throw new Error("Public Atlas health response did not report apiVersion=v2.");
   }
 '
 
@@ -194,17 +348,18 @@ printf '%s\n' "${release_commit}" > "${remote_dir}/.atlas-release.next"
 mv -- "${remote_dir}/.atlas-release.next" "${remote_dir}/.atlas-release"
 REMOTE_RELEASE
 
-echo "Atlas V2 release ${LOCAL_COMMIT} passed HTTPS health verification."
+trap - ERR EXIT
+echo "Atlas V2 release ${LOCAL_COMMIT} passed target-bound and public HTTPS health verification."
 echo "No rollback was run automatically."
 echo "Previous Git commit: ${PREVIOUS_COMMIT}"
-echo "Latest pre-deploy backup: ${LATEST_BACKUP}"
+echo "Exact pre-deploy backup: ${EXACT_BACKUP}"
 if [[ "${PREVIOUS_COMMIT}" =~ ^[0-9a-f]{40}$ ]]; then
   echo "Rollback guidance: create a clean worktree at ${PREVIOUS_COMMIT}, review it, and run this deploy script from that worktree."
 else
   echo "Rollback guidance: no previous Atlas V2 Git commit was recorded; do not attempt an automated code rollback."
 fi
-if [[ "${LATEST_BACKUP}" != "none" ]]; then
-  echo "Data rollback guidance: first verify ${LATEST_BACKUP} with deploy/restore-test.sh, then restore only through an operator-reviewed procedure."
+if [[ "${EXACT_BACKUP}" != "none" ]]; then
+  echo "Data rollback guidance: first verify ${EXACT_BACKUP} with deploy/restore-test.sh, then restore only through an operator-reviewed procedure."
 else
   echo "Data rollback guidance: no pre-deploy Atlas V2 backup exists because this was the first V2 database release."
 fi

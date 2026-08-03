@@ -34,8 +34,8 @@ COPY --from=build --chown=node:node /app/dist ./dist
 COPY --chown=node:node db/migrations ./db/migrations
 COPY --chown=node:node openapi ./openapi
 
-RUN mkdir -p /app/artifacts /app/data /app/uploads \
-  && chown node:node /app/artifacts /app/data /app/uploads
+RUN mkdir -p /app/artifacts \
+  && chown node:node /app/artifacts
 
 USER node
 EXPOSE 8080

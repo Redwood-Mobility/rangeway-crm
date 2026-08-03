@@ -142,8 +142,8 @@ describe("deterministic deployment source contract", () => {
     expect(dockerfile).toContain("RUN npm run build");
     expect(dockerfile).toContain("npm ci --omit=dev");
     expect(dockerfile).toContain("/app/artifacts");
-    expect(dockerfile).toContain("/app/data");
-    expect(dockerfile).toContain("/app/uploads");
+    expect(dockerfile).not.toContain("mkdir -p /app/data");
+    expect(dockerfile).not.toContain("mkdir -p /app/uploads");
     expect(dockerfile).toMatch(/^USER node$/m);
     for (const runtimePath of ["./dist", "./db/migrations", "./openapi"]) {
       expect(dockerfile).toContain(runtimePath);
@@ -166,7 +166,7 @@ describe("deterministic deployment source contract", () => {
 
   it("backs up before replacement and verifies migration, startup, and live V2 health", () => {
     const backupPosition = deployScript.indexOf("deploy/backup.sh");
-    const syncPosition = deployScript.indexOf("rsync -az --delete-delay");
+    const syncPosition = deployScript.indexOf('rsync "${RSYNC_TREE_ARGS[@]}"');
     expect(backupPosition).toBeGreaterThan(0);
     expect(syncPosition).toBeGreaterThan(backupPosition);
     expect(deployScript).toContain("npm test");
