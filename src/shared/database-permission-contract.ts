@@ -4,9 +4,10 @@ type RelationContract = {
   relation: string;
   select: boolean;
   insert: boolean;
+  delete: boolean;
 };
 
-export const atlasRuntimeRelations = [
+const platformRelations = [
   "schema_migrations",
   "organizations",
   "users",
@@ -17,11 +18,105 @@ export const atlasRuntimeRelations = [
   "api_idempotency_keys",
 ] as const;
 
+/** Every Operating Core relation created by migration 0007. */
+const operatingCoreRelations = [
+  "project_rooms",
+  "project_memberships",
+  "project_health_updates",
+  "workstreams",
+  "work_items",
+  "work_item_dependencies",
+  "labels",
+  "work_item_labels",
+  "decisions",
+  "decision_projects",
+  "risks",
+  "blockers",
+  "milestones",
+  "activities",
+  "people",
+  "counterparty_organizations",
+  "person_organization_affiliations",
+  "project_people",
+  "project_counterparties",
+  "saved_views",
+] as const;
+
+export const atlasRuntimeRelations = [
+  ...platformRelations,
+  ...operatingCoreRelations,
+] as const;
+
+/** Link rows are removed outright; every other relation archives in place. */
+const webDeleteRelations = new Set<string>([
+  "project_memberships",
+  "work_item_dependencies",
+  "work_item_labels",
+  "decision_projects",
+]);
+
 export const webUpdateColumns = {
   organizations: ["name", "updated_at"],
   users: ["email", "display_name", "google_subject", "updated_at"],
   actors: ["display_name", "updated_at", "disabled_at"],
   api_idempotency_keys: ["response_body", "completed_at"],
+  project_rooms: [
+    "name", "objective", "template_type", "status", "health", "priority",
+    "strategic_area", "owner_user_id", "current_focus", "blocker_summary",
+    "next_decision", "next_action", "updated_by_actor_id", "updated_at",
+    "archived_at", "archived_by_actor_id",
+  ],
+  project_memberships: ["role", "updated_at"],
+  workstreams: [
+    "name", "description", "owner_user_id", "status", "position",
+    "updated_by_actor_id", "updated_at", "archived_at", "archived_by_actor_id",
+  ],
+  work_items: [
+    "workstream_id", "parent_id", "type", "title", "description", "owner_user_id",
+    "status", "priority", "due_at", "position", "completed_at",
+    "completed_by_actor_id", "updated_by_actor_id", "updated_at", "archived_at",
+    "archived_by_actor_id",
+  ],
+  decisions: [
+    "question", "state", "outcome", "rationale", "owner_user_id", "decision_at",
+    "updated_by_actor_id", "updated_at", "archived_at", "merged_into_id",
+  ],
+  risks: [
+    "workstream_id", "title", "description", "likelihood", "impact",
+    "owner_user_id", "mitigation", "state", "updated_by_actor_id", "updated_at",
+    "archived_at",
+  ],
+  blockers: [
+    "condition", "target_type", "target_id", "owner_user_id", "resolved_at",
+    "updated_by_actor_id", "updated_at", "archived_at",
+  ],
+  milestones: [
+    "workstream_id", "outcome", "owner_user_id", "target_at", "state",
+    "completed_at", "calendar_event_id", "updated_by_actor_id", "updated_at",
+    "archived_at",
+  ],
+  people: [
+    "display_name", "given_name", "family_name", "email", "phone", "title",
+    "notes", "provenance", "updated_by_actor_id", "updated_at", "archived_at",
+    "merged_into_id", "merged_at",
+  ],
+  counterparty_organizations: [
+    "name", "kind", "website", "notes", "provenance", "updated_by_actor_id",
+    "updated_at", "archived_at", "merged_into_id", "merged_at",
+  ],
+  person_organization_affiliations: ["person_id", "counterparty_id", "archived_at"],
+  project_people: [
+    "person_id", "role", "influence", "sentiment", "relevance", "notes",
+    "visibility", "updated_by_actor_id", "updated_at", "archived_at",
+  ],
+  project_counterparties: [
+    "counterparty_id", "role", "influence", "sentiment", "relevance", "notes",
+    "visibility", "updated_by_actor_id", "updated_at", "archived_at",
+  ],
+  saved_views: [
+    "name", "surface", "filters", "is_default", "updated_by_actor_id",
+    "updated_at", "archived_at",
+  ],
 } as const;
 
 export const workerUpdateColumns = {
@@ -65,20 +160,27 @@ const outboxImmutableColumns = [
 ] as const;
 
 const webRelations: readonly RelationContract[] = [
-  { relation: "schema_migrations", select: false, insert: false },
-  { relation: "organizations", select: true, insert: false },
-  { relation: "users", select: true, insert: true },
-  { relation: "actors", select: true, insert: true },
-  { relation: "organization_memberships", select: true, insert: true },
-  { relation: "audit_events", select: false, insert: true },
-  { relation: "outbox_events", select: false, insert: true },
-  { relation: "api_idempotency_keys", select: true, insert: true },
+  { relation: "schema_migrations", select: false, insert: false, delete: false },
+  { relation: "organizations", select: true, insert: false, delete: false },
+  { relation: "users", select: true, insert: true, delete: false },
+  { relation: "actors", select: true, insert: true, delete: false },
+  { relation: "organization_memberships", select: true, insert: true, delete: false },
+  { relation: "audit_events", select: false, insert: true, delete: false },
+  { relation: "outbox_events", select: false, insert: true, delete: false },
+  { relation: "api_idempotency_keys", select: true, insert: true, delete: false },
+  ...operatingCoreRelations.map((relation) => ({
+    relation,
+    select: true,
+    insert: true,
+    delete: webDeleteRelations.has(relation),
+  })),
 ];
 
 const workerRelations: readonly RelationContract[] = atlasRuntimeRelations.map((relation) => ({
   relation,
   select: relation === "outbox_events",
   insert: false,
+  delete: false,
 }));
 
 function sqlLiteral(value: string): string {
@@ -108,11 +210,11 @@ export function buildPermissionContractSql(role: AtlasRuntimeRole): string {
   const relations = role === "atlas_web" ? webRelations : workerRelations;
   const columns = role === "atlas_web" ? webUpdateColumns : workerUpdateColumns;
   const relationRows = relations
-    .map(({ relation, select, insert }) =>
-      `(${sqlLiteral(relation)}, ${select ? "true" : "false"}, ${insert ? "true" : "false"})`)
+    .map(({ relation, select, insert, delete: allowDelete }) =>
+      `(${sqlLiteral(relation)}, ${select ? "true" : "false"}, ${insert ? "true" : "false"}, ${allowDelete ? "true" : "false"})`)
     .join(",\n        ");
 
-  return `WITH relation_contract(table_name, allow_select, allow_insert) AS (
+  return `WITH relation_contract(table_name, allow_select, allow_insert, allow_delete) AS (
       VALUES
         ${relationRows}
     ),
@@ -159,7 +261,7 @@ export function buildPermissionContractSql(role: AtlasRuntimeRole): string {
         has_table_privilege(${sqlLiteral(role)}, format('public.%I', table_name), 'SELECT') = allow_select
         AND has_table_privilege(${sqlLiteral(role)}, format('public.%I', table_name), 'INSERT') = allow_insert
         AND NOT has_table_privilege(${sqlLiteral(role)}, format('public.%I', table_name), 'UPDATE')
-        AND NOT has_table_privilege(${sqlLiteral(role)}, format('public.%I', table_name), 'DELETE')
+        AND has_table_privilege(${sqlLiteral(role)}, format('public.%I', table_name), 'DELETE') = allow_delete
         AND NOT has_table_privilege(${sqlLiteral(role)}, format('public.%I', table_name), 'TRUNCATE')
         AND NOT has_table_privilege(${sqlLiteral(role)}, format('public.%I', table_name), 'REFERENCES')
         AND NOT has_table_privilege(${sqlLiteral(role)}, format('public.%I', table_name), 'TRIGGER')

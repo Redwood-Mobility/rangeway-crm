@@ -5,12 +5,21 @@ import { atlasEventTypes, type AtlasEventType } from "../../../shared/events.js"
 import {
   decodeCursor,
   encodeCursor,
+  searchRecordTypes,
+  type CursorContract,
+  type CursorSortType,
+  type SearchRecordType,
 } from "../../../shared/operating-core.js";
 import { ApiError } from "../../platform/http/api-error.js";
 import type { DbClient } from "../../platform/db/client.js";
 import { mutateIdempotentlyWithAuditAndEvent } from "../events/outbox.service.js";
 import type { OperatingCorePort } from "./operating-core.routes.js";
-import { assertStatusTransition } from "./operating-core.policy.js";
+import {
+  assertPrivilegedMergeActor,
+  assertStatusTransition,
+  canMutateProjectRelationship,
+  cursorContract,
+} from "./operating-core.policy.js";
 import {
   assertBlockerTarget,
   assertDependencyAllowed,
@@ -32,11 +41,25 @@ function notFound(): ApiError {
   return new ApiError(404, "NOT_FOUND", "Resource not found.");
 }
 
+/**
+ * Records leave the service as JSON-safe values.
+ *
+ * A first mutation reads its result straight from PostgreSQL while an idempotent
+ * replay reads the stored JSON response, so anything that does not survive a
+ * JSON round trip — `Date` in particular — would make the same request return
+ * two different shapes. Normalizing here keeps the two identical.
+ */
+function jsonSafe(value: unknown): unknown {
+  if (value instanceof Date) return value.toISOString();
+  if (Array.isArray(value)) return value.map(jsonSafe);
+  return value;
+}
+
 function camelize(row: Row): Record<string, unknown> {
   return Object.fromEntries(
     Object.entries(row).map(([key, value]) => [
       key.replace(/_([a-z])/g, (_match, character: string) => character.toUpperCase()),
-      value,
+      jsonSafe(value),
     ]),
   );
 }
@@ -45,7 +68,16 @@ function iso(value: unknown): string {
   return value instanceof Date ? value.toISOString() : String(value);
 }
 
-function paginate(rows: Row[], limit: number, sortColumn = "created_at") {
+function cursorSortValue(sortType: CursorSortType, value: unknown): string {
+  return sortType === "timestamp" ? iso(value) : String(value);
+}
+
+function paginate(
+  rows: Row[],
+  limit: number,
+  contract: CursorContract,
+  sortColumn = "created_at",
+) {
   const hasNext = rows.length > limit;
   const visible = hasNext ? rows.slice(0, limit) : rows;
   const last = visible.at(-1);
@@ -54,7 +86,12 @@ function paginate(rows: Row[], limit: number, sortColumn = "created_at") {
     page: {
       nextCursor:
         hasNext && last
-          ? encodeCursor({ sortValue: iso(last[sortColumn]), id: String(last.id) })
+          ? encodeCursor({
+              purpose: contract.purpose,
+              sortType: contract.sortType,
+              sortValue: cursorSortValue(contract.sortType, last[sortColumn]),
+              id: String(last.id),
+            })
           : null,
     },
   };
@@ -508,12 +545,13 @@ export class OperatingCoreService implements OperatingCorePort {
     if (add) {
       const result = await client.query<ProductRow>(
         `INSERT INTO work_item_dependencies
-           (id, organization_id, blocked_work_item_id, dependency_work_item_id, created_by_actor_id)
-         VALUES ($1, $2, $3, $4, $5)
+           (id, organization_id, project_id, blocked_work_item_id,
+            dependency_work_item_id, created_by_actor_id)
+         VALUES ($1, $2, $3, $4, $5, $6)
          ON CONFLICT (organization_id, blocked_work_item_id, dependency_work_item_id)
          DO NOTHING
          RETURNING *`,
-        [id, actor.organizationId, workItemId, dependencyId, actor.actorId],
+        [id, actor.organizationId, blocked.project_id, workItemId, dependencyId, actor.actorId],
       );
       if (result.rows[0]) {
         id = String(result.rows[0].id);
@@ -869,10 +907,71 @@ export class OperatingCoreService implements OperatingCorePort {
     return mutationRecord(actor, "person.updated", atlasEventTypes.personChanged, "person", personId, { person }, camelize(before), person);
   }
 
+  /**
+   * Moves a merged-away record's project relationships onto the surviving record.
+   *
+   * Rows are re-pointed in place rather than copied, which preserves each row's
+   * identity, `created_by_actor_id`, and `visibility` — a private relationship
+   * keeps belonging to the actor who created it. Where the surviving record
+   * already holds a relationship for the same project, that relationship wins
+   * and the merged-away one is archived, so a merge never overwrites a
+   * relationship the survivor already had.
+   */
+  private async transferProjectRelationships(
+    client: DbClient,
+    actor: ActorContext,
+    linkTable: "project_people" | "project_counterparties",
+    targetColumn: "person_id" | "counterparty_id",
+    sourceId: string,
+    intoId: string,
+  ): Promise<{ moved: Record<string, unknown>[]; superseded: Record<string, unknown>[] }> {
+    const sourceRows = await client.query<ProductRow>(
+      `SELECT * FROM ${linkTable}
+        WHERE organization_id = $1 AND ${targetColumn} = $2 AND archived_at IS NULL
+        ORDER BY project_id FOR UPDATE`,
+      [actor.organizationId, sourceId],
+    );
+    const survivingRows = await client.query<ProductRow>(
+      `SELECT project_id FROM ${linkTable}
+        WHERE organization_id = $1 AND ${targetColumn} = $2 AND archived_at IS NULL
+        FOR UPDATE`,
+      [actor.organizationId, intoId],
+    );
+    const occupied = new Set(survivingRows.rows.map((row) => String(row.project_id)));
+
+    const moved: Record<string, unknown>[] = [];
+    const superseded: Record<string, unknown>[] = [];
+    for (const row of sourceRows.rows) {
+      const projectId = String(row.project_id);
+      if (occupied.has(projectId)) {
+        superseded.push(camelize(row));
+        continue;
+      }
+      const result = await client.query<ProductRow>(
+        `UPDATE ${linkTable}
+            SET ${targetColumn} = $1, updated_by_actor_id = $2, updated_at = now()
+          WHERE organization_id = $3 AND ${targetColumn} = $4 AND project_id = $5
+          RETURNING *`,
+        [intoId, actor.actorId, actor.organizationId, sourceId, projectId],
+      );
+      moved.push(camelize(result.rows[0]));
+    }
+    // Anything still pointing at the merged-away record lost to the survivor.
+    await client.query(
+      `UPDATE ${linkTable} SET archived_at = now(), updated_by_actor_id = $1, updated_at = now()
+        WHERE organization_id = $2 AND ${targetColumn} = $3 AND archived_at IS NULL`,
+      [actor.actorId, actor.organizationId, sourceId],
+    );
+    return { moved, superseded };
+  }
+
   private async mergePerson(client: DbClient, actor: ActorContext, input: Input) {
     const personId = String(input.personId);
     const intoId = String(input.intoId);
     if (personId === intoId) throw conflict("A person cannot be merged into itself.");
+    // A merge rewrites relationships across every project in the organization,
+    // including private ones, so it is not available on project write access.
+    assertPrivilegedMergeActor(actor);
     const source = await this.lockOrganizationRecord(client, actor, "people", personId);
     await this.lockOrganizationRecord(client, actor, "people", intoId);
     await client.query(
@@ -881,26 +980,8 @@ export class OperatingCoreService implements OperatingCorePort {
         WHERE organization_id = $2 AND person_id = $3 AND archived_at IS NULL`,
       [intoId, actor.organizationId, personId],
     );
-    await client.query(
-      `INSERT INTO project_people
-         (organization_id, project_id, person_id, role, influence, sentiment,
-          relevance, notes, visibility, created_by_actor_id, updated_by_actor_id)
-       SELECT organization_id, project_id, $1, role, influence, sentiment,
-              relevance, notes, visibility, $2, $2
-         FROM project_people
-        WHERE organization_id = $3 AND person_id = $4 AND archived_at IS NULL
-       ON CONFLICT (organization_id, project_id, person_id)
-       DO UPDATE SET role = EXCLUDED.role, influence = EXCLUDED.influence,
-                     sentiment = EXCLUDED.sentiment, relevance = EXCLUDED.relevance,
-                     notes = EXCLUDED.notes, visibility = EXCLUDED.visibility,
-                     updated_by_actor_id = EXCLUDED.updated_by_actor_id, updated_at = now(),
-                     archived_at = NULL`,
-      [intoId, actor.actorId, actor.organizationId, personId],
-    );
-    await client.query(
-      `UPDATE project_people SET archived_at = now(), updated_by_actor_id = $1, updated_at = now()
-        WHERE organization_id = $2 AND person_id = $3 AND archived_at IS NULL`,
-      [actor.actorId, actor.organizationId, personId],
+    const relationships = await this.transferProjectRelationships(
+      client, actor, "project_people", "person_id", personId, intoId,
     );
     const result = await client.query<ProductRow>(
       `UPDATE people SET merged_into_id = $1, merged_at = now(), archived_at = now(),
@@ -909,7 +990,16 @@ export class OperatingCoreService implements OperatingCorePort {
       [intoId, actor.actorId, actor.organizationId, personId],
     );
     const person = camelize(result.rows[0]);
-    return mutationRecord(actor, "person.merged", atlasEventTypes.personChanged, "person", personId, { person, intoId }, camelize(source), person);
+    return mutationRecord(
+      actor,
+      "person.merged",
+      atlasEventTypes.personChanged,
+      "person",
+      personId,
+      { person, intoId, relationships },
+      { person: camelize(source), relationships: relationships.moved },
+      { ...person, intoId, movedRelationshipIds: relationships.moved.map((row) => row.id), supersededRelationshipIds: relationships.superseded.map((row) => row.id) },
+    );
   }
 
   private async createCounterparty(client: DbClient, actor: ActorContext, input: Input) {
@@ -939,6 +1029,7 @@ export class OperatingCoreService implements OperatingCorePort {
     const counterpartyId = String(input.counterpartyId);
     const intoId = String(input.intoId);
     if (counterpartyId === intoId) throw conflict("A counterparty cannot be merged into itself.");
+    assertPrivilegedMergeActor(actor);
     const source = await this.lockOrganizationRecord(client, actor, "counterparty_organizations", counterpartyId);
     await this.lockOrganizationRecord(client, actor, "counterparty_organizations", intoId);
     await client.query(
@@ -946,26 +1037,8 @@ export class OperatingCoreService implements OperatingCorePort {
         WHERE organization_id = $2 AND counterparty_id = $3 AND archived_at IS NULL`,
       [intoId, actor.organizationId, counterpartyId],
     );
-    await client.query(
-      `INSERT INTO project_counterparties
-         (organization_id, project_id, counterparty_id, role, influence, sentiment,
-          relevance, notes, visibility, created_by_actor_id, updated_by_actor_id)
-       SELECT organization_id, project_id, $1, role, influence, sentiment,
-              relevance, notes, visibility, $2, $2
-         FROM project_counterparties
-        WHERE organization_id = $3 AND counterparty_id = $4 AND archived_at IS NULL
-       ON CONFLICT (organization_id, project_id, counterparty_id)
-       DO UPDATE SET role = EXCLUDED.role, influence = EXCLUDED.influence,
-                     sentiment = EXCLUDED.sentiment, relevance = EXCLUDED.relevance,
-                     notes = EXCLUDED.notes, visibility = EXCLUDED.visibility,
-                     updated_by_actor_id = EXCLUDED.updated_by_actor_id, updated_at = now(),
-                     archived_at = NULL`,
-      [intoId, actor.actorId, actor.organizationId, counterpartyId],
-    );
-    await client.query(
-      `UPDATE project_counterparties SET archived_at = now(), updated_by_actor_id = $1, updated_at = now()
-        WHERE organization_id = $2 AND counterparty_id = $3 AND archived_at IS NULL`,
-      [actor.actorId, actor.organizationId, counterpartyId],
+    const relationships = await this.transferProjectRelationships(
+      client, actor, "project_counterparties", "counterparty_id", counterpartyId, intoId,
     );
     const result = await client.query<ProductRow>(
       `UPDATE counterparty_organizations
@@ -975,7 +1048,16 @@ export class OperatingCoreService implements OperatingCorePort {
       [intoId, actor.actorId, actor.organizationId, counterpartyId],
     );
     const counterparty = camelize(result.rows[0]);
-    return mutationRecord(actor, "counterparty.merged", atlasEventTypes.counterpartyChanged, "counterparty", counterpartyId, { counterparty, intoId }, camelize(source), counterparty);
+    return mutationRecord(
+      actor,
+      "counterparty.merged",
+      atlasEventTypes.counterpartyChanged,
+      "counterparty",
+      counterpartyId,
+      { counterparty, intoId, relationships },
+      { counterparty: camelize(source), relationships: relationships.moved },
+      { ...counterparty, intoId, movedRelationshipIds: relationships.moved.map((row) => row.id), supersededRelationshipIds: relationships.superseded.map((row) => row.id) },
+    );
   }
 
   private async createAffiliation(client: DbClient, actor: ActorContext, input: Input) {
@@ -1008,25 +1090,61 @@ export class OperatingCoreService implements OperatingCorePort {
     await this.lockOrganizationRecord(client, actor, targetTable, targetId, false);
     const linkTable = kind === "person" ? "project_people" : "project_counterparties";
     const targetColumn = kind === "person" ? "person_id" : "counterparty_id";
+
+    // Load and lock the existing relationship first. Project write access alone
+    // must never update, expose, or archive a private relationship belonging to
+    // another actor, so authorization is decided against the stored row rather
+    // than left to ON CONFLICT.
+    const existingResult = await client.query<ProductRow>(
+      `SELECT * FROM ${linkTable}
+        WHERE organization_id = $1 AND project_id = $2 AND ${targetColumn} = $3
+        FOR UPDATE`,
+      [actor.organizationId, projectId, targetId],
+    );
+    const existing = existingResult.rows[0] ?? null;
+    if (
+      existing &&
+      !canMutateProjectRelationship(actor, {
+        visibility: String(existing.visibility),
+        createdByActorId: existing.created_by_actor_id === null || existing.created_by_actor_id === undefined
+          ? null
+          : String(existing.created_by_actor_id),
+      })
+    ) {
+      // The read path hides this row from this actor; refusing with the same
+      // safe NOT_FOUND keeps the mutation path from disclosing its existence.
+      throw safeNotFound();
+    }
+    const before = existing ? camelize(existing) : null;
+
     let row: ProductRow;
     if (add) {
-      const result = await client.query<ProductRow>(
-        `INSERT INTO ${linkTable}
-           (organization_id, project_id, ${targetColumn}, role, influence, sentiment,
-            relevance, notes, visibility, created_by_actor_id, updated_by_actor_id)
-         VALUES ($1, $2, $3, $4, $5::relationship_influence,
-                 $6::relationship_sentiment, $7, $8, $9, $10, $10)
-         ON CONFLICT (organization_id, project_id, ${targetColumn})
-         DO UPDATE SET role = EXCLUDED.role, influence = EXCLUDED.influence,
-                       sentiment = EXCLUDED.sentiment, relevance = EXCLUDED.relevance,
-                       notes = EXCLUDED.notes, visibility = EXCLUDED.visibility,
-                       updated_by_actor_id = EXCLUDED.updated_by_actor_id,
-                       updated_at = now(), archived_at = NULL
-         RETURNING *`,
-        [actor.organizationId, projectId, targetId, valueOr(input, "role", ""), valueOr(input, "influence", "medium"), valueOr(input, "sentiment", "unknown"), valueOr(input, "relevance", ""), valueOr(input, "notes", ""), valueOr(input, "visibility", "project"), actor.actorId],
-      );
-      row = result.rows[0];
+      if (existing) {
+        const result = await client.query<ProductRow>(
+          `UPDATE ${linkTable}
+              SET role = $4, influence = $5::relationship_influence,
+                  sentiment = $6::relationship_sentiment, relevance = $7,
+                  notes = $8, visibility = $9,
+                  updated_by_actor_id = $10, updated_at = now(), archived_at = NULL
+            WHERE organization_id = $1 AND project_id = $2 AND ${targetColumn} = $3
+            RETURNING *`,
+          [actor.organizationId, projectId, targetId, valueOr(input, "role", ""), valueOr(input, "influence", "medium"), valueOr(input, "sentiment", "unknown"), valueOr(input, "relevance", ""), valueOr(input, "notes", ""), valueOr(input, "visibility", "project"), actor.actorId],
+        );
+        row = result.rows[0];
+      } else {
+        const result = await client.query<ProductRow>(
+          `INSERT INTO ${linkTable}
+             (organization_id, project_id, ${targetColumn}, role, influence, sentiment,
+              relevance, notes, visibility, created_by_actor_id, updated_by_actor_id)
+           VALUES ($1, $2, $3, $4, $5::relationship_influence,
+                   $6::relationship_sentiment, $7, $8, $9, $10, $10)
+           RETURNING *`,
+          [actor.organizationId, projectId, targetId, valueOr(input, "role", ""), valueOr(input, "influence", "medium"), valueOr(input, "sentiment", "unknown"), valueOr(input, "relevance", ""), valueOr(input, "notes", ""), valueOr(input, "visibility", "project"), actor.actorId],
+        );
+        row = result.rows[0];
+      }
     } else {
+      if (!existing || existing.archived_at !== null) throw safeNotFound();
       const result = await client.query<ProductRow>(
         `UPDATE ${linkTable} SET archived_at = now(), updated_by_actor_id = $1, updated_at = now()
           WHERE organization_id = $2 AND project_id = $3 AND ${targetColumn} = $4
@@ -1037,7 +1155,7 @@ export class OperatingCoreService implements OperatingCorePort {
       if (!row) throw safeNotFound();
     }
     const relationship = camelize(row);
-    return mutationRecord(actor, add ? `project.${kind}-linked` : `project.${kind}-unlinked`, atlasEventTypes.projectRelationshipChanged, "project_relationship", String(row.id), { relationship, removed: !add }, null, relationship);
+    return mutationRecord(actor, add ? `project.${kind}-linked` : `project.${kind}-unlinked`, atlasEventTypes.projectRelationshipChanged, "project_relationship", String(row.id), { relationship, removed: !add }, before, relationship);
   }
 
   private async createSavedView(client: DbClient, actor: ActorContext, input: Input) {
@@ -1178,8 +1296,9 @@ export class OperatingCoreService implements OperatingCorePort {
       conditions.push(`(p.name ILIKE $${values.length} ESCAPE '\\' OR p.objective ILIKE $${values.length} ESCAPE '\\')`);
     }
     if (!input.includeArchived) conditions.push("p.archived_at IS NULL");
+    const contract = cursorContract("project.list");
     if (input.cursor) {
-      const cursor = decodeCursor(String(input.cursor));
+      const cursor = decodeCursor(String(input.cursor), contract);
       values.push(cursor.sortValue, cursor.id);
       conditions.push(`(p.created_at, p.id) < ($${values.length - 1}::timestamptz, $${values.length}::uuid)`);
     }
@@ -1192,7 +1311,7 @@ export class OperatingCoreService implements OperatingCorePort {
         LIMIT $${values.length}`,
       values,
     );
-    const page = paginate(response.rows, limit);
+    const page = paginate(response.rows, limit, contract);
     return { projects: page.records, page: page.page };
   }
 
@@ -1214,7 +1333,10 @@ export class OperatingCoreService implements OperatingCorePort {
     const limit = Number(input.limit ?? 50);
     const values: unknown[] = [actor.organizationId, actor.role, actor.userId ?? null];
     const conditions = [`w.organization_id = $1`, broadProjectAccessSql];
-    if (!input.includeArchived) conditions.push("w.archived_at IS NULL");
+    // Today, portfolio and search all exclude archived projects. Board, list and
+    // calendar are projections of the same records, so they apply the identical
+    // predicate; `includeArchived` is the single explicit opt-in for both.
+    if (!input.includeArchived) conditions.push("w.archived_at IS NULL", "p.archived_at IS NULL");
     if (input.workItemId) {
       values.push(input.workItemId);
       conditions.push(`w.id = $${values.length}::uuid`);
@@ -1260,8 +1382,9 @@ export class OperatingCoreService implements OperatingCorePort {
       )`);
     }
     if (input.view === "calendar") conditions.push("w.due_at IS NOT NULL");
+    const contract = cursorContract("work.list");
     if (input.cursor) {
-      const cursor = decodeCursor(String(input.cursor));
+      const cursor = decodeCursor(String(input.cursor), contract);
       values.push(cursor.sortValue, cursor.id);
       conditions.push(`(w.created_at, w.id) < ($${values.length - 1}::timestamptz, $${values.length}::uuid)`);
     }
@@ -1286,7 +1409,7 @@ export class OperatingCoreService implements OperatingCorePort {
         LIMIT $${values.length}`,
       values,
     );
-    const page = paginate(response.rows, limit);
+    const page = paginate(response.rows, limit, contract);
     const view = String(input.view ?? "list");
     const result: Result = { items: page.records, page: page.page };
     if (projection) result.view = view;
@@ -1311,9 +1434,10 @@ export class OperatingCoreService implements OperatingCorePort {
         await this.getProject(actor, String(input.projectId));
         const limit = Number(input.limit ?? 50);
         const values: unknown[] = [actor.organizationId, input.projectId];
+        const contract = cursorContract("project.members.list");
         const cursorCondition = input.cursor
           ? (() => {
-              const cursor = decodeCursor(String(input.cursor));
+              const cursor = decodeCursor(String(input.cursor), contract);
               values.push(cursor.sortValue, cursor.id);
               return `AND (pm.created_at, pm.id) > ($${values.length - 1}::timestamptz, $${values.length}::uuid)`;
             })()
@@ -1328,7 +1452,7 @@ export class OperatingCoreService implements OperatingCorePort {
             ORDER BY pm.created_at, pm.id LIMIT $${values.length}`,
           values,
         );
-        const page = paginate(response.rows, limit);
+        const page = paginate(response.rows, limit, contract);
         return { members: page.records, page: page.page };
       }
       case "project.health.list":
@@ -1383,9 +1507,10 @@ export class OperatingCoreService implements OperatingCorePort {
         await this.getOrganizationRecord(actor, "people", String(input.personId));
         const limit = Number(input.limit ?? 50);
         const values: unknown[] = [actor.organizationId, input.personId];
+        const contract = cursorContract("affiliation.list");
         const cursorCondition = input.cursor
           ? (() => {
-              const cursor = decodeCursor(String(input.cursor));
+              const cursor = decodeCursor(String(input.cursor), contract);
               values.push(cursor.sortValue, cursor.id);
               return `AND (a.created_at, a.id) < ($${values.length - 1}::timestamptz, $${values.length}::uuid)`;
             })()
@@ -1400,7 +1525,7 @@ export class OperatingCoreService implements OperatingCorePort {
             ORDER BY a.created_at DESC, a.id DESC LIMIT $${values.length}`,
           values,
         );
-        const page = paginate(response.rows, limit);
+        const page = paginate(response.rows, limit, contract);
         return { affiliations: page.records, page: page.page };
       }
       case "project.people.list":
@@ -1430,10 +1555,14 @@ export class OperatingCoreService implements OperatingCorePort {
     const archive = ["project_health_updates"].includes(table) ? "" : "AND archived_at IS NULL";
     const sortColumn = order.startsWith("target_at") ? "target_at" : order.startsWith("occurred_at") ? "occurred_at" : order.startsWith("position") ? "position" : "created_at";
     const ascending = order.includes(" ASC");
+    const contract = cursorContract(
+      `project-resource.${table}`,
+      sortColumn === "position" ? "numeric" : "timestamp",
+    );
     const values: unknown[] = [actor.organizationId, projectId];
     let cursorCondition = "";
     if (input.cursor) {
-      const cursor = decodeCursor(String(input.cursor));
+      const cursor = decodeCursor(String(input.cursor), contract);
       values.push(cursor.sortValue, cursor.id);
       const cast = sortColumn === "position" ? "numeric" : "timestamptz";
       cursorCondition = `AND (${sortColumn}, id) ${ascending ? ">" : "<"} ($${values.length - 1}::${cast}, $${values.length}::uuid)`;
@@ -1446,7 +1575,7 @@ export class OperatingCoreService implements OperatingCorePort {
         LIMIT $${values.length}`,
       values,
     );
-    const page = paginate(response.rows, limit, sortColumn);
+    const page = paginate(response.rows, limit, contract, sortColumn);
     return { [responseKey]: page.records, page: page.page };
   }
 
@@ -1484,8 +1613,12 @@ export class OperatingCoreService implements OperatingCorePort {
       conditions.push(`(${columns.map((column) => `${column} ILIKE $${values.length} ESCAPE '\\'`).join(" OR ")})`);
     }
     const sortColumn = table === "labels" ? "name" : "created_at";
+    const contract = cursorContract(
+      `organization-resource.${table}`,
+      table === "labels" ? "text" : "timestamp",
+    );
     if (input.cursor) {
-      const cursor = decodeCursor(String(input.cursor));
+      const cursor = decodeCursor(String(input.cursor), contract);
       values.push(cursor.sortValue, cursor.id);
       conditions.push(`(${sortColumn}, id) ${table === "labels" ? ">" : "<"} ($${values.length - 1}${table === "labels" ? "" : "::timestamptz"}, $${values.length}::uuid)`);
     }
@@ -1494,7 +1627,7 @@ export class OperatingCoreService implements OperatingCorePort {
       `SELECT * FROM ${table} WHERE ${conditions.join(" AND ")} ORDER BY ${order} LIMIT $${values.length}`,
       values,
     );
-    const page = paginate(response.rows, limit, sortColumn);
+    const page = paginate(response.rows, limit, contract, sortColumn);
     return { [responseKey]: page.records, page: page.page };
   }
 
@@ -1521,10 +1654,11 @@ export class OperatingCoreService implements OperatingCorePort {
   ): Promise<Result> {
     await this.getProject(actor, String(input.projectId));
     const limit = Number(input.limit ?? 50);
+    const contract = cursorContract(`project-relationship.${linkTable}`);
     const values: unknown[] = [actor.organizationId, input.projectId, actor.actorId];
     let cursorCondition = "";
     if (input.cursor) {
-      const cursor = decodeCursor(String(input.cursor));
+      const cursor = decodeCursor(String(input.cursor), contract);
       values.push(cursor.sortValue, cursor.id);
       cursorCondition = `AND (relation.created_at, relation.id) < ($${values.length - 1}::timestamptz, $${values.length}::uuid)`;
     }
@@ -1544,7 +1678,7 @@ export class OperatingCoreService implements OperatingCorePort {
         LIMIT $${values.length}`,
       values,
     );
-    const page = paginate(response.rows, limit, "relationship_created_at");
+    const page = paginate(response.rows, limit, contract, "relationship_created_at");
     return { [responseKey]: page.records, page: page.page };
   }
 
@@ -1556,8 +1690,9 @@ export class OperatingCoreService implements OperatingCorePort {
       values.push(input.surface);
       conditions.push(`surface = $${values.length}`);
     }
+    const contract = cursorContract("saved-view.list");
     if (input.cursor) {
-      const cursor = decodeCursor(String(input.cursor));
+      const cursor = decodeCursor(String(input.cursor), contract);
       values.push(cursor.sortValue, cursor.id);
       conditions.push(`(created_at, id) < ($${values.length - 1}::timestamptz, $${values.length}::uuid)`);
     }
@@ -1567,7 +1702,7 @@ export class OperatingCoreService implements OperatingCorePort {
        ORDER BY created_at DESC, id DESC LIMIT $${values.length}`,
       values,
     );
-    const page = paginate(response.rows, limit);
+    const page = paginate(response.rows, limit, contract);
     return { savedViews: page.records, page: page.page };
   }
 
@@ -1579,8 +1714,9 @@ export class OperatingCoreService implements OperatingCorePort {
       values.push(input.health);
       conditions.push(`p.health = $${values.length}::project_health`);
     }
+    const contract = cursorContract("portfolio.summary");
     if (input.cursor) {
-      const cursor = decodeCursor(String(input.cursor));
+      const cursor = decodeCursor(String(input.cursor), contract);
       values.push(cursor.sortValue, cursor.id);
       conditions.push(`(p.created_at, p.id) < ($${values.length - 1}::timestamptz, $${values.length}::uuid)`);
     }
@@ -1602,7 +1738,7 @@ export class OperatingCoreService implements OperatingCorePort {
         LIMIT $${values.length}`,
       values,
     );
-    const page = paginate(response.rows, limit);
+    const page = paginate(response.rows, limit, contract);
     return { projects: page.records, page: page.page };
   }
 
@@ -1673,39 +1809,114 @@ export class OperatingCoreService implements OperatingCorePort {
     };
   }
 
+  /**
+   * Decisions owned by this project plus decisions that merely affect it through
+   * `decision_projects`. A Project Room that showed only `primary_project_id`
+   * decisions would omit exactly the cross-project decisions its owner most
+   * needs to see.
+   */
+  private async contextDecisions(
+    actor: ActorContext,
+    projectId: string,
+    limit: number,
+  ): Promise<Result> {
+    const contract = cursorContract("project-resource.decisions");
+    const response = await this.pool.query<Row>(
+      `SELECT d.* FROM decisions d
+        WHERE d.organization_id = $1 AND d.archived_at IS NULL
+          AND (
+            d.primary_project_id = $2
+            OR EXISTS (
+              SELECT 1 FROM decision_projects dp
+               WHERE dp.organization_id = d.organization_id
+                 AND dp.decision_id = d.id
+                 AND dp.project_id = $2
+            )
+          )
+        ORDER BY d.created_at DESC, d.id DESC
+        LIMIT $3`,
+      [actor.organizationId, projectId, limit + 1],
+    );
+    const page = paginate(response.rows, limit, contract);
+    return { decisions: page.records, page: page.page };
+  }
+
   private async projectContext(actor: ActorContext, projectId: string): Promise<Result> {
     const project = await this.getProject(actor, projectId);
+    const limit = 100;
     const [workstreams, work, decisions, risks, blockers, milestones, activities, people, counterparties, health] = await Promise.all([
-      this.listProjectResource(actor, { projectId, limit: 100 }, "workstreams", "workstreams", "position ASC, id ASC"),
-      this.listWork(actor, { projectId, limit: 100 }, false),
-      this.listProjectResource(actor, { projectId, limit: 100 }, "decisions", "decisions"),
-      this.listProjectResource(actor, { projectId, limit: 100 }, "risks", "risks"),
-      this.listProjectResource(actor, { projectId, limit: 100 }, "blockers", "blockers"),
-      this.listProjectResource(actor, { projectId, limit: 100 }, "milestones", "milestones", "target_at ASC, id ASC"),
-      this.listProjectResource(actor, { projectId, limit: 100 }, "activities", "activities", "occurred_at DESC, id DESC"),
-      this.listProjectRelationships(actor, { projectId, limit: 100 }, "project_people", "people", "person_id", "people"),
-      this.listProjectRelationships(actor, { projectId, limit: 100 }, "project_counterparties", "counterparty_organizations", "counterparty_id", "counterparties"),
-      this.listProjectResource(actor, { projectId, limit: 100 }, "project_health_updates", "healthUpdates"),
+      this.listProjectResource(actor, { projectId, limit }, "workstreams", "workstreams", "position ASC, id ASC"),
+      this.listWork(actor, { projectId, limit }, false),
+      this.contextDecisions(actor, projectId, limit),
+      this.listProjectResource(actor, { projectId, limit }, "risks", "risks"),
+      this.listProjectResource(actor, { projectId, limit }, "blockers", "blockers"),
+      this.listProjectResource(actor, { projectId, limit }, "milestones", "milestones", "target_at ASC, id ASC"),
+      this.listProjectResource(actor, { projectId, limit }, "activities", "activities", "occurred_at DESC, id DESC"),
+      this.listProjectRelationships(actor, { projectId, limit }, "project_people", "people", "person_id", "people"),
+      this.listProjectRelationships(actor, { projectId, limit }, "project_counterparties", "counterparty_organizations", "counterparty_id", "counterparties"),
+      this.listProjectResource(actor, { projectId, limit }, "project_health_updates", "healthUpdates"),
     ]);
+
+    // Each section is a bounded page, not the complete collection. Callers are
+    // told which sections were cut short and given the cursor to continue with,
+    // rather than being handed a silently truncated list.
+    const sections: Record<string, { records: unknown[]; page: { nextCursor: string | null } }> = {
+      workstreams: { records: workstreams.workstreams as unknown[], page: workstreams.page as { nextCursor: string | null } },
+      workItems: { records: work.items as unknown[], page: work.page as { nextCursor: string | null } },
+      decisions: { records: decisions.decisions as unknown[], page: decisions.page as { nextCursor: string | null } },
+      risks: { records: risks.risks as unknown[], page: risks.page as { nextCursor: string | null } },
+      blockers: { records: blockers.blockers as unknown[], page: blockers.page as { nextCursor: string | null } },
+      milestones: { records: milestones.milestones as unknown[], page: milestones.page as { nextCursor: string | null } },
+      activities: { records: activities.activities as unknown[], page: activities.page as { nextCursor: string | null } },
+      people: { records: people.people as unknown[], page: people.page as { nextCursor: string | null } },
+      counterparties: { records: counterparties.counterparties as unknown[], page: counterparties.page as { nextCursor: string | null } },
+      healthUpdates: { records: health.healthUpdates as unknown[], page: health.page as { nextCursor: string | null } },
+    };
+
     return {
       project,
-      workstreams: workstreams.workstreams,
-      workItems: work.items,
-      decisions: decisions.decisions,
-      risks: risks.risks,
-      blockers: blockers.blockers,
-      milestones: milestones.milestones,
-      activities: activities.activities,
-      people: people.people,
-      counterparties: counterparties.counterparties,
-      healthUpdates: health.healthUpdates,
+      sectionLimit: limit,
+      sections: Object.fromEntries(
+        Object.entries(sections).map(([name, section]) => [
+          name,
+          {
+            count: section.records.length,
+            truncated: section.page.nextCursor !== null,
+            nextCursor: section.page.nextCursor,
+          },
+        ]),
+      ),
+      ...Object.fromEntries(
+        Object.entries(sections).map(([name, section]) => [name, section.records]),
+      ),
     };
   }
 
   private async search(actor: ActorContext, input: Input): Promise<Result> {
     const limit = Number(input.limit ?? 50);
     const query = `%${String(input.q).replaceAll("%", "\\%").replaceAll("_", "\\_")}%`;
-    const allowedTypes = input.types ? new Set(String(input.types).split(",")) : null;
+    const contract = cursorContract("search.global");
+    const values: unknown[] = [actor.organizationId, actor.role, actor.userId ?? null, query];
+
+    // The type filter must run in SQL before ORDER BY and LIMIT. Filtering the
+    // returned page in memory would silently drop matches whenever the first
+    // `limit` rows happened to be of another type.
+    const requestedTypes = this.parseSearchTypes(input.types);
+    let typeCondition = "";
+    if (requestedTypes) {
+      values.push(requestedTypes);
+      typeCondition = `type = ANY($${values.length}::text[])`;
+    }
+
+    let cursorCondition = "";
+    if (input.cursor) {
+      const cursor = decodeCursor(String(input.cursor), contract);
+      values.push(cursor.sortValue, cursor.id);
+      cursorCondition = `(updated_at, id) < ($${values.length - 1}::timestamptz, $${values.length}::uuid)`;
+    }
+    const filters = [typeCondition, cursorCondition].filter(Boolean);
+    values.push(limit + 1);
+
     const response = await this.pool.query<Row>(
       `WITH authorized_projects AS (
          SELECT p.id FROM project_rooms p
@@ -1728,14 +1939,30 @@ export class OperatingCoreService implements OperatingCorePort {
              AND c.merged_at IS NULL AND (c.name ILIKE $4 ESCAPE '\\' OR c.kind ILIKE $4 ESCAPE '\\')
        )
        SELECT * FROM native_records
-        ${input.cursor ? "WHERE (updated_at, id) < ($5::timestamptz, $6::uuid)" : ""}
-        ORDER BY updated_at DESC, id DESC LIMIT $${input.cursor ? 7 : 5}`,
-      input.cursor
-        ? [actor.organizationId, actor.role, actor.userId ?? null, query, decodeCursor(String(input.cursor)).sortValue, decodeCursor(String(input.cursor)).id, limit + 1]
-        : [actor.organizationId, actor.role, actor.userId ?? null, query, limit + 1],
+        ${filters.length > 0 ? `WHERE ${filters.join(" AND ")}` : ""}
+        ORDER BY updated_at DESC, id DESC LIMIT $${values.length}`,
+      values,
     );
-    const filtered = allowedTypes ? response.rows.filter((row) => allowedTypes.has(String(row.type))) : response.rows;
-    const page = paginate(filtered, limit, "updated_at");
+    const page = paginate(response.rows, limit, contract, "updated_at");
     return { results: page.records, page: page.page };
+  }
+
+  private parseSearchTypes(types: unknown): SearchRecordType[] | null {
+    if (types === undefined || types === null || types === "") return null;
+    const requested = (Array.isArray(types) ? types : String(types).split(","))
+      .map((type) => String(type).trim())
+      .filter((type) => type.length > 0);
+    if (requested.length === 0) return null;
+    const unknown = requested.filter(
+      (type) => !(searchRecordTypes as readonly string[]).includes(type),
+    );
+    if (unknown.length > 0) {
+      throw new ApiError(
+        400,
+        "INVALID_INPUT",
+        `Unsupported search type. Supported types: ${searchRecordTypes.join(", ")}.`,
+      );
+    }
+    return [...new Set(requested)] as SearchRecordType[];
   }
 }

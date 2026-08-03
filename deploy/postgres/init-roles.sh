@@ -182,6 +182,84 @@ BEGIN
     GRANT UPDATE (display_name, updated_at, disabled_at) ON actors TO atlas_web;
     GRANT UPDATE (response_body, completed_at) ON api_idempotency_keys TO atlas_web;
 
+    -- The blanket REVOKE above also strips Operating Core privileges, so a
+    -- database that has reached migration 0007 must have them restored here.
+    -- Without this, rotating credentials would leave the web role unable to
+    -- read or write any product table.
+    IF to_regclass('public.project_rooms') IS NOT NULL THEN
+      GRANT SELECT ON
+        project_rooms, project_memberships, project_health_updates, workstreams,
+        work_items, work_item_dependencies, labels, work_item_labels, decisions,
+        decision_projects, risks, blockers, milestones, activities, people,
+        counterparty_organizations, person_organization_affiliations, project_people,
+        project_counterparties, saved_views
+      TO atlas_web;
+      GRANT INSERT ON
+        project_rooms, project_memberships, project_health_updates, workstreams,
+        work_items, work_item_dependencies, labels, work_item_labels, decisions,
+        decision_projects, risks, blockers, milestones, activities, people,
+        counterparty_organizations, person_organization_affiliations, project_people,
+        project_counterparties, saved_views
+      TO atlas_web;
+      GRANT UPDATE (
+        name, objective, template_type, status, health, priority, strategic_area,
+        owner_user_id, current_focus, blocker_summary, next_decision, next_action,
+        updated_by_actor_id, updated_at, archived_at, archived_by_actor_id
+      ) ON project_rooms TO atlas_web;
+      GRANT UPDATE (role, updated_at) ON project_memberships TO atlas_web;
+      GRANT UPDATE (
+        name, description, owner_user_id, status, position, updated_by_actor_id,
+        updated_at, archived_at, archived_by_actor_id
+      ) ON workstreams TO atlas_web;
+      GRANT UPDATE (
+        workstream_id, parent_id, type, title, description, owner_user_id, status,
+        priority, due_at, position, completed_at, completed_by_actor_id,
+        updated_by_actor_id, updated_at, archived_at, archived_by_actor_id
+      ) ON work_items TO atlas_web;
+      GRANT UPDATE (
+        question, state, outcome, rationale, owner_user_id, decision_at,
+        updated_by_actor_id, updated_at, archived_at, merged_into_id
+      ) ON decisions TO atlas_web;
+      GRANT UPDATE (
+        workstream_id, title, description, likelihood, impact, owner_user_id,
+        mitigation, state, updated_by_actor_id, updated_at, archived_at
+      ) ON risks TO atlas_web;
+      GRANT UPDATE (
+        condition, target_type, target_id, owner_user_id, resolved_at,
+        updated_by_actor_id, updated_at, archived_at
+      ) ON blockers TO atlas_web;
+      GRANT UPDATE (
+        workstream_id, outcome, owner_user_id, target_at, state, completed_at,
+        calendar_event_id, updated_by_actor_id, updated_at, archived_at
+      ) ON milestones TO atlas_web;
+      GRANT UPDATE (
+        display_name, given_name, family_name, email, phone, title, notes,
+        provenance, updated_by_actor_id, updated_at, archived_at, merged_into_id,
+        merged_at
+      ) ON people TO atlas_web;
+      GRANT UPDATE (
+        name, kind, website, notes, provenance, updated_by_actor_id, updated_at,
+        archived_at, merged_into_id, merged_at
+      ) ON counterparty_organizations TO atlas_web;
+      GRANT UPDATE (person_id, counterparty_id, archived_at)
+        ON person_organization_affiliations TO atlas_web;
+      GRANT UPDATE (
+        person_id, role, influence, sentiment, relevance, notes, visibility,
+        updated_by_actor_id, updated_at, archived_at
+      ) ON project_people TO atlas_web;
+      GRANT UPDATE (
+        counterparty_id, role, influence, sentiment, relevance, notes, visibility,
+        updated_by_actor_id, updated_at, archived_at
+      ) ON project_counterparties TO atlas_web;
+      GRANT UPDATE (
+        name, surface, filters, is_default, updated_by_actor_id, updated_at, archived_at
+      ) ON saved_views TO atlas_web;
+      GRANT DELETE ON
+        project_memberships, work_item_dependencies, work_item_labels,
+        decision_projects
+      TO atlas_web;
+    END IF;
+
     REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA public FROM atlas_worker;
     GRANT SELECT ON outbox_events TO atlas_worker;
     GRANT UPDATE (

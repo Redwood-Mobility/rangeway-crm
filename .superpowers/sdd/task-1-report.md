@@ -66,6 +66,101 @@ This machine had no reachable PostgreSQL at `localhost:5432`; these four tests e
 - OpenAPI, typecheck, build and non-equipped tests: passing.
 - Equipped PostgreSQL execution: pending a reachable PostgreSQL fixture; tests are ready and self-identifying.
 
+## Review fix wave (2026-08-03)
+
+Closes the 3 Critical and 8 Important findings in
+`.superpowers/sdd/task-1-review-findings.md`.
+
+**A working local PostgreSQL 17 replaced the deferred equipped gate.** Every
+PostgreSQL-backed test in this repository had previously been skipped, never
+executed. Running them immediately exposed defects that static analysis and the
+independent review both missed:
+
+- Critical 3 was real and worse than described: with no `dueAt` and no
+  `ownerUserId`, the calendar projection and Today assertions passed against
+  empty arrays. The primary Task 1 acceptance test proved nothing.
+- A first mutation returned PostgreSQL `Date` objects while its idempotent
+  replay returned ISO strings from the stored JSON response, so the same request
+  produced two different shapes. Not previously reported.
+- `deploy/postgres/init-roles.sh` revokes all privileges and re-granted only the
+  platform tables. Rotating database credentials on a deployed Atlas would have
+  stripped `atlas_web` of every Operating Core privilege. Not previously
+  reported; surfaced by extending the permission contract.
+- The end-to-end smoke test could never have passed as written: the session
+  cookie is issued `Secure`, so a supertest cookie jar over plain HTTP never
+  returns it. `secure: true` is correct for the HTTPS-only deployment, so the
+  test now replays the cookie explicitly.
+
+### Critical
+
+1. Person and counterparty merges now require an organization owner or
+   administrator (`assertPrivilegedMergeActor`). Project relationships are
+   re-pointed in place by `transferProjectRelationships` rather than copied, so
+   each row keeps its identity, `created_by_actor_id` and `visibility` — a
+   private relationship still belongs to the actor who created it. Where the
+   surviving record already holds a relationship for a project, that
+   relationship wins and the merged-away one is archived, so a merge never
+   overwrites the survivor's data. Moved and superseded relationship IDs are
+   recorded in the audit and outbox evidence.
+2. `changeProjectRelationship` loads and locks the existing row first and
+   authorizes against it through `canMutateProjectRelationship`. A project
+   editor can no longer update, expose, or archive another actor's private
+   relationship; the refusal is the same safe `NOT_FOUND` the read path already
+   produced, so existence is not disclosed. Accurate before/after values are now
+   passed to `mutationRecord` (the add path previously hardcoded `before: null`).
+3. The projection fixture supplies `dueAt` and `ownerUserId`, and the assertions
+   check both fields across board, list and calendar.
+
+### Important
+
+1. `project.context` returns a `sections` map giving each collection's count,
+   truncation flag and continuation cursor instead of silently cutting at 100,
+   and `contextDecisions` includes decisions linked through `decision_projects`.
+2. `requirement` is removed from `blockerTargetTypes` and deferred to Task 3,
+   which must reintroduce it with referential validation.
+3. Cursors carry `purpose` and `sortType`. `decodeCursor` requires both to match
+   the listing's contract and validates the sort value against its type, so an
+   invalid timestamp or numeric returns `INVALID_INPUT` instead of a 500.
+   `isWellFormedCursor` keeps structural rejection at the route, before any
+   handler runs.
+4. Search types are a strict enum filtered in SQL before `ORDER BY` and `LIMIT`.
+   Filtering the returned page in memory had silently dropped matches whenever
+   the first page happened to hold other types.
+5. The `/search` `types` parameter is documented in OpenAPI. Exact request and
+   response schemas for the generic mutation bodies remain outstanding and are
+   deferred to Task 2, where the client consumes each endpoint.
+6. `src/shared/database-permission-contract.ts` covers all 20 Operating Core
+   relations with their exact update columns and models per-relation DELETE
+   grants. `init-roles.sh` restores the complete contract during rotation.
+7. Migration `0009_operating_core_integrity_and_permissions.sql` adds
+   project-inclusive unique keys and composite foreign keys for workstream,
+   parent, dependency, risk-workstream and milestone-workstream relationships,
+   and persists `project_id` on `work_item_dependencies`. Migrations `0001`
+   through `0008` are byte-identical.
+8. Board, list and calendar exclude archived projects, matching Today, portfolio
+   and search. `includeArchived` is the single explicit opt-in.
+
+### Verification (2026-08-03, live PostgreSQL 17.10)
+
+- `npm test`: 28 files passed; 373 tests passed; 13 skipped; 0 failed.
+- Skips are 8 Docker Compose cases and 5 deployment-coordinator cases needing a
+  Linux `flock` or a systemd transient cgroup. Docker is not installed on this
+  macOS host and systemd does not exist on it. No PostgreSQL test is skipped.
+- Previous baseline for comparison: 341 passed, 5 failed, 37 skipped.
+- `npm run typecheck`, `npm run build`, Redocly OpenAPI lint,
+  `npm audit --audit-level=high` (0 vulnerabilities), `git diff --check`: passed.
+- Migrations `0001`-`0008` unmodified; only `0009` added.
+- New behavioral regression tests prove private-relationship authorization,
+  merge authorization with preserved creator ownership, and cross-project
+  rejection at the database boundary with the service layer bypassed.
+
+### Environment note
+
+`better-sqlite3` was rebuilt for Node 24; its binding had been compiled for
+Node 22, which made the preserved V1 SQLite application fail to load and
+`tests/server/production-legacy.test.ts` fail. This was a host issue, not a code
+defect.
+
 ## Concerns and boundaries
 
 - Blocker target vocabulary includes `requirement`, but this Task 1 service intentionally rejects requirement targets until Task 8 owns Location Pursuit requirement persistence. Accepting unvalidated requirement UUIDs now would create dangling blockers.

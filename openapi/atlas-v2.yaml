@@ -788,6 +788,17 @@ paths:
           in: query
           required: true
           schema: { type: string, minLength: 2, maxLength: 200 }
+        - name: types
+          in: query
+          required: false
+          description: >-
+            Comma-separated record types to search. Filtering is applied before
+            pagination, so a narrowed search returns a full page of matches.
+            Unsupported values are rejected with INVALID_INPUT.
+          schema:
+            type: string
+            pattern: "^(project|work_item|person|counterparty)(,(project|work_item|person|counterparty))*$"
+          example: work_item,person
         - $ref: "#/components/parameters/Cursor"
         - $ref: "#/components/parameters/Limit"
       responses:

@@ -131,8 +131,7 @@ describe("Atlas V2 platform foundation smoke", () => {
         logger: { error: () => undefined },
       });
 
-      const humanClient = request.agent(app);
-      const login = await humanClient
+      const login = await request(app)
         .post("/api/v2/auth/local/login")
         .send({ email: ownerEmail, password: ownerPassword });
       expect(login.status).toBe(200);
@@ -142,6 +141,18 @@ describe("Atlas V2 platform foundation smoke", () => {
         organizationId: rangewayOrganizationId,
         role: "owner",
       });
+
+      // The session cookie is issued `Secure`, which is correct for the
+      // HTTPS-only deployment but means a cookie-jar client speaking plain HTTP
+      // will never send it back. Replay it explicitly instead.
+      const sessionCookie = (login.headers["set-cookie"] as unknown as string[])
+        .map((cookie) => cookie.split(";")[0])
+        .join("; ");
+      expect(sessionCookie).toMatch(/^rw_session=/);
+      const humanClient = {
+        get: (path: string) => request(app).get(path).set("Cookie", sessionCookie),
+        patch: (path: string) => request(app).patch(path).set("Cookie", sessionCookie),
+      };
 
       const humanMe = await humanClient.get("/api/v2/me");
       expect(humanMe.status).toBe(200);
@@ -274,7 +285,13 @@ describe("Atlas V2 platform foundation smoke", () => {
           },
         },
       });
-      await expect(worker.runOnce()).resolves.toBe(2);
+      // The worker drains the whole outbox, which also holds the identity events
+      // emitted while provisioning the users and service actors above — not only
+      // the two organization events asserted here.
+      const pending = await pool.query<{ count: string }>(
+        "SELECT count(*)::text AS count FROM outbox_events WHERE published_at IS NULL AND terminal_at IS NULL",
+      );
+      await expect(worker.runOnce()).resolves.toBe(Number(pending.rows[0].count));
       expect(handled.sort()).toEqual(
         outbox.rows.map((event) => `${event.id}:${event.id}`).sort(),
       );

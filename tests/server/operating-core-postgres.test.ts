@@ -99,6 +99,10 @@ describe("Operating Core PostgreSQL acceptance", () => {
         nextAction: "Confirm contacts",
       }, key("project"));
       const projectId = String((created.project as { id: string }).id);
+      // Calendar requires a due date and Today requires an owner. Without both
+      // this fixture the projection assertions below pass against empty results
+      // and prove nothing.
+      const dueAt = "2026-08-14T17:00:00.000Z";
       const work = await core.mutate(actor, "work.create", {
         projectId,
         type: "action",
@@ -107,6 +111,8 @@ describe("Operating Core PostgreSQL acceptance", () => {
         status: "next",
         priority: "high",
         position: 100,
+        ownerUserId: actor.userId,
+        dueAt,
         labelIds: [],
       }, key("work"));
       const workItemId = String((work.workItem as { id: string }).id);
@@ -118,8 +124,13 @@ describe("Operating Core PostgreSQL acceptance", () => {
 
       for (const view of ["board", "list", "calendar"]) {
         const projection = await core.query(actor, "work.view", { view, projectId, limit: 50 });
-        expect(projection.items).toEqual([
-          expect.objectContaining({ id: workItemId, status: "in_progress" }),
+        expect(projection.items, `${view} projection`).toEqual([
+          expect.objectContaining({
+            id: workItemId,
+            status: "in_progress",
+            ownerUserId: actor.userId,
+            dueAt,
+          }),
         ]);
       }
       const today = await core.query(actor, "today.get", {});
@@ -248,6 +259,195 @@ describe("Operating Core PostgreSQL acceptance", () => {
            (SELECT count(*)::text FROM api_idempotency_keys WHERE operation = 'project.create.v1') AS keys`,
       );
       expect(after.rows).toEqual(before.rows);
+    });
+  });
+
+  it("keeps a private project relationship mutable only by its creator or a privileged role", async (context) => {
+    await withPostgreSql(context, async (pool) => {
+      const creator = await createHuman(pool);
+      const editor = await createHuman(pool);
+      const administrator = await createHuman(pool, "admin");
+      const core = new OperatingCoreService(pool);
+
+      const created = await core.mutate(creator, "project.create", {
+        name: "Shared project",
+        ownerUserId: creator.userId,
+      }, key("project"));
+      const projectId = String((created.project as { id: string }).id);
+      await core.mutate(creator, "project.members.add", {
+        projectId,
+        userId: editor.userId,
+        role: "editor",
+      }, key("member"));
+
+      const person = await core.mutate(creator, "person.create", {
+        displayName: "Landowner contact",
+      }, key("person"));
+      const personId = String((person.person as { id: string }).id);
+      await core.mutate(creator, "project.people.add", {
+        projectId,
+        personId,
+        notes: "Private assessment",
+        visibility: "private",
+      }, key("link"));
+
+      // The editor has project write access but must not see, overwrite,
+      // expose, or archive another actor's private relationship.
+      const editorView = await core.query(editor, "project.people.list", { projectId, limit: 50 });
+      expect(editorView.people).toEqual([]);
+      await expect(core.mutate(editor, "project.people.add", {
+        projectId,
+        personId,
+        notes: "Overwritten",
+        visibility: "project",
+      }, key("hijack"))).rejects.toMatchObject({ status: 404, code: "NOT_FOUND" });
+      await expect(core.mutate(editor, "project.people.remove", {
+        projectId,
+        personId,
+      }, key("unlink"))).rejects.toMatchObject({ status: 404, code: "NOT_FOUND" });
+
+      const stored = await pool.query<{ visibility: string; notes: string; archived_at: string | null }>(
+        "SELECT visibility, notes, archived_at FROM project_people WHERE project_id = $1",
+        [projectId],
+      );
+      expect(stored.rows).toEqual([
+        { visibility: "private", notes: "Private assessment", archived_at: null },
+      ]);
+
+      // The creator still owns it, and a privileged role may also act on it.
+      await core.mutate(creator, "project.people.add", {
+        projectId,
+        personId,
+        notes: "Updated by creator",
+        visibility: "private",
+      }, key("creator-update"));
+      await core.mutate(administrator, "project.people.add", {
+        projectId,
+        personId,
+        notes: "Reviewed by administrator",
+        visibility: "private",
+      }, key("admin-update"));
+      const final = await pool.query<{ notes: string; created_by_actor_id: string }>(
+        "SELECT notes, created_by_actor_id FROM project_people WHERE project_id = $1",
+        [projectId],
+      );
+      expect(final.rows).toEqual([
+        { notes: "Reviewed by administrator", created_by_actor_id: creator.actorId },
+      ]);
+    });
+  });
+
+  it("restricts merges to privileged actors and preserves relationship ownership", async (context) => {
+    await withPostgreSql(context, async (pool) => {
+      const member = await createHuman(pool);
+      const owner = await createHuman(pool, "owner");
+      const core = new OperatingCoreService(pool);
+
+      const created = await core.mutate(owner, "project.create", {
+        name: "Merge project",
+        ownerUserId: owner.userId,
+      }, key("project"));
+      const projectId = String((created.project as { id: string }).id);
+      const survivingProject = await core.mutate(owner, "project.create", {
+        name: "Second project",
+        ownerUserId: owner.userId,
+      }, key("project"));
+      const secondProjectId = String((survivingProject.project as { id: string }).id);
+      await core.mutate(owner, "project.members.add", {
+        projectId: secondProjectId,
+        userId: member.userId,
+        role: "editor",
+      }, key("member"));
+
+      const duplicate = await core.mutate(owner, "person.create", { displayName: "Dup" }, key("person"));
+      const survivor = await core.mutate(owner, "person.create", { displayName: "Survivor" }, key("person"));
+      const duplicateId = String((duplicate.person as { id: string }).id);
+      const survivorId = String((survivor.person as { id: string }).id);
+
+      // The duplicate holds a private relationship created by the member, plus a
+      // relationship on a project where the survivor is already linked.
+      await core.mutate(member, "project.people.add", {
+        projectId: secondProjectId,
+        personId: duplicateId,
+        notes: "Member's private note",
+        visibility: "private",
+      }, key("private-link"));
+      await core.mutate(owner, "project.people.add", {
+        projectId,
+        personId: duplicateId,
+        notes: "Duplicate link",
+      }, key("dup-link"));
+      await core.mutate(owner, "project.people.add", {
+        projectId,
+        personId: survivorId,
+        notes: "Survivor keeps this",
+      }, key("survivor-link"));
+
+      await expect(core.mutate(member, "person.merge", {
+        personId: duplicateId,
+        intoId: survivorId,
+      }, key("denied-merge"))).rejects.toMatchObject({ status: 403, code: "FORBIDDEN" });
+
+      await core.mutate(owner, "person.merge", {
+        personId: duplicateId,
+        intoId: survivorId,
+      }, key("merge"));
+
+      const moved = await pool.query<{ notes: string; visibility: string; created_by_actor_id: string }>(
+        `SELECT notes, visibility, created_by_actor_id FROM project_people
+          WHERE person_id = $1 AND project_id = $2 AND archived_at IS NULL`,
+        [survivorId, secondProjectId],
+      );
+      // The private relationship moved to the survivor but still belongs to the
+      // member who created it.
+      expect(moved.rows).toEqual([
+        { notes: "Member's private note", visibility: "private", created_by_actor_id: member.actorId },
+      ]);
+
+      const contested = await pool.query<{ notes: string }>(
+        `SELECT notes FROM project_people
+          WHERE person_id = $1 AND project_id = $2 AND archived_at IS NULL`,
+        [survivorId, projectId],
+      );
+      // Where both records had a relationship, the survivor's is not overwritten.
+      expect(contested.rows).toEqual([{ notes: "Survivor keeps this" }]);
+    });
+  });
+
+  it("refuses cross-project work relationships at the database boundary", async (context) => {
+    await withPostgreSql(context, async (pool) => {
+      const actor = await createHuman(pool, "owner");
+      const core = new OperatingCoreService(pool);
+      const projects: string[] = [];
+      for (const name of ["Project one", "Project two"]) {
+        const created = await core.mutate(actor, "project.create", {
+          name,
+          ownerUserId: actor.userId,
+        }, key("project"));
+        projects.push(String((created.project as { id: string }).id));
+      }
+      const workstream = await core.mutate(actor, "workstream.create", {
+        projectId: projects[1],
+        name: "Other project workstream",
+        position: 1,
+      }, key("workstream"));
+      const workstreamId = String((workstream.workstream as { id: string }).id);
+      const work = await core.mutate(actor, "work.create", {
+        projectId: projects[0],
+        type: "action",
+        title: "Belongs to project one",
+        status: "inbox",
+        priority: "medium",
+        position: 1,
+        labelIds: [],
+      }, key("work"));
+      const workItemId = String((work.workItem as { id: string }).id);
+
+      // Migration 0009 must reject this even when the service layer is bypassed.
+      await expect(pool.query(
+        "UPDATE work_items SET workstream_id = $1 WHERE id = $2",
+        [workstreamId, workItemId],
+      )).rejects.toMatchObject({ constraint: "work_items_workstream_project_fk" });
     });
   });
 });

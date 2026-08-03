@@ -4,7 +4,7 @@ import type { ActorContext } from "../../../shared/identity.js";
 import {
   blockerTargetTypes,
   decisionStates,
-  decodeCursor,
+  isWellFormedCursor,
   milestoneStates,
   priorityValues,
   projectHealthValues,
@@ -15,6 +15,7 @@ import {
   riskImpacts,
   riskLikelihoods,
   riskStates,
+  searchRecordTypes,
   workItemStatuses,
   workItemTypes,
 } from "../../../shared/operating-core.js";
@@ -43,14 +44,14 @@ const idempotencyKeySchema = z
   .min(8)
   .max(128)
   .regex(/^[A-Za-z0-9._:-]+$/);
-const cursorSchema = z.string().refine((value) => {
-  try {
-    decodeCursor(value);
-    return true;
-  } catch {
-    return false;
-  }
-});
+// Structural validation happens here so a malformed cursor never reaches a
+// handler. Binding the cursor to its specific listing and sort type is the
+// service's `decodeCursor`. Both layers reject with 400 INVALID_INPUT.
+const cursorSchema = z
+  .string()
+  .min(1)
+  .max(512)
+  .refine(isWellFormedCursor, "Invalid pagination cursor.");
 const paginationSchema = z.object({
   cursor: cursorSchema.optional(),
   limit: z.coerce.number().int().min(1).max(100).default(50),
@@ -347,7 +348,13 @@ export function createOperatingCoreRouter(core: OperatingCorePort): Router {
   router.post("/saved-views/:savedViewId/archive", mutateRoute(core, "saved-view.archive", archiveSchema, { paramSchema: idParam("savedViewId") }));
   router.get("/search", queryRoute(core, "search.global", paginationSchema.extend({
     q: z.string().trim().min(2).max(200),
-    types: z.string().trim().max(200).optional(),
+    types: z
+      .string()
+      .trim()
+      .min(1)
+      .transform((value) => value.split(",").map((type) => type.trim()))
+      .pipe(z.array(z.enum(searchRecordTypes)).min(1).max(searchRecordTypes.length))
+      .optional(),
   })));
 
   return router;
