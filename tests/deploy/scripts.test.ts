@@ -326,6 +326,18 @@ function createBackupFixture(): BackupFixture {
 if [[ "$*" == "rev-parse --is-inside-work-tree" ]]; then exit 0; fi
 if [[ "$*" == "rev-parse --verify HEAD" ]]; then printf '%s\\n' '${releaseCommit}'; exit 0; fi
 exit 0`);
+  fakeTool(binDirectory, "date", `
+case "$*" in
+  "-u +%Y-%m-%dT%H:%M:%SZ") printf '%s\\n' "2026-08-02T20:00:00Z" ;;
+  "-u +%Y%m%dT%H%M%SZ") printf '%s\\n' "20260802T200000Z" ;;
+  *) exit 61 ;;
+esac`);
+  fakeTool(binDirectory, "mktemp", `
+last_argument=""
+for argument in "$@"; do last_argument="$argument"; done
+pending_directory="$(/usr/bin/ruby -e 'puts ARGV.fetch(0).sub(/XXXXXX$/, "COLLIDE")' "$last_argument")"
+mkdir -p -- "$pending_directory"
+printf '%s\\n' "$pending_directory"`);
   fakeTool(binDirectory, "sha256sum", `
 [[ "\${FAKE_FAIL_STAGE:-}" == "checksum" ]] && exit 51
 /usr/bin/shasum -a 256 "$@"`);
@@ -334,6 +346,18 @@ printf '%s\\n' "$*" >> "\${FAKE_LOG_DIR}/docker.log"
 last_argument=""
 for argument in "$@"; do last_argument="\${argument}"; done
 if [[ "$*" == "compose ps -q db" ]]; then printf '%s\\n' db-container; exit 0; fi
+if [[ "$*" == *"compose ps --all --format"* ]]; then
+  [[ "\${FAKE_SNAPSHOT_FAIL:-0}" == "1" ]] && exit 55
+  if [[ -n "\${FAKE_COMPOSE_SNAPSHOT:-}" ]]; then
+    printf '%b' "$FAKE_COMPOSE_SNAPSHOT"
+  else
+    web_state="\${FAKE_WEB_STATE:-running}"
+    worker_state="\${FAKE_WORKER_STATE:-running}"
+    [[ "$web_state" == "absent" ]] || printf 'web|%s\\n' "$web_state"
+    [[ "$worker_state" == "absent" ]] || printf 'worker|%s\\n' "$worker_state"
+  fi
+  exit 0
+fi
 if [[ "$*" == *"compose ps"* && ( "\${last_argument}" == "web" || "\${last_argument}" == "worker" ) ]]; then
   requested_status=""
   previous_argument=""
@@ -342,6 +366,9 @@ if [[ "$*" == *"compose ps"* && ( "\${last_argument}" == "web" || "\${last_argum
     previous_argument="\${argument}"
   done
   [[ "\${FAKE_PROBE_FAIL:-}" == "\${last_argument}:\${requested_status}" ]] && exit 55
+  if [[ "\${FAKE_TRANSITION_RACE:-0}" == "1" && "$last_argument" == "web" ]]; then
+    exit 0
+  fi
   case "\${last_argument}" in
     web) service_state="\${FAKE_WEB_STATE:-running}" ;;
     worker) service_state="\${FAKE_WORKER_STATE:-running}" ;;
@@ -420,22 +447,70 @@ describe("backup.sh behavior", () => {
     expect(log).not.toMatch(/compose (?:stop|start) (?:db|caddy)/);
   });
 
+  it("uses one snapshot so a restarting-to-running transition cannot disappear between probes", () => {
+    const fixture = createBackupFixture();
+    const result = backup(fixture, {
+      FAKE_TRANSITION_RACE: "1",
+      FAKE_COMPOSE_SNAPSHOT: "web|restarting\nworker|exited\n",
+      FAKE_WORKER_STATE: "exited",
+    });
+
+    expect(result.status, result.stderr).toBe(0);
+    const log = readFileSync(path.join(fixture.logDirectory, "docker.log"), "utf8");
+    expect(log.match(/compose ps --all --format/g)).toHaveLength(1);
+    expect(log).not.toContain("compose ps --status");
+    expect(log).toContain("compose stop web");
+    expect(log).toContain("compose start web");
+    expect(log).not.toContain("compose stop worker");
+    expect(log).not.toContain("compose start worker");
+  });
+
   it("aborts on a service-state probe failure before stopping or backing up", () => {
     const fixture = createBackupFixture();
-    const result = backup(fixture, { FAKE_PROBE_FAIL: "worker:restarting" });
+    const result = backup(fixture, { FAKE_SNAPSHOT_FAIL: "1" });
 
     expect(result.status).not.toBe(0);
     expect(result.stdout).not.toContain("ATLAS_BACKUP_PATH=");
     const log = readFileSync(path.join(fixture.logDirectory, "docker.log"), "utf8");
-    expect(log).toContain("compose ps --status restarting -q worker");
+    expect(log.match(/compose ps --all --format/g)).toHaveLength(1);
     expect(log).not.toMatch(/compose stop|pg_dump|compose start/);
     expect(existsSync(fixture.backupRoot) ? readdirSync(fixture.backupRoot) : []).toEqual([]);
+  });
+
+  it.each([
+    ["duplicate", "web|running\nweb|restarting\nworker|exited\n"],
+    ["unknown", "web|running\ncaddy|running\n"],
+    ["malformed", "web running\nworker|exited\n"],
+  ])("rejects %s service-state snapshot output before backup", (_label, snapshot) => {
+    const fixture = createBackupFixture();
+    const result = backup(fixture, { FAKE_COMPOSE_SNAPSHOT: snapshot });
+
+    expect(result.status).not.toBe(0);
+    expect(result.stdout).not.toContain("ATLAS_BACKUP_PATH=");
+    const log = readFileSync(path.join(fixture.logDirectory, "docker.log"), "utf8");
+    expect(log.match(/compose ps --all --format/g)).toHaveLength(1);
+    expect(log).not.toMatch(/compose stop|pg_dump|compose start/);
+    expect(existsSync(fixture.backupRoot) ? readdirSync(fixture.backupRoot) : []).toEqual([]);
+  });
+
+  it("cleans the pending directory when the final backup name already exists", () => {
+    const fixture = createBackupFixture();
+    mkdirSync(fixture.backupRoot, { recursive: true });
+    const collisionName = "20260802T200000Z-COLLIDE";
+    mkdirSync(path.join(fixture.backupRoot, collisionName));
+    const result = backup(fixture);
+
+    expect(result.status).not.toBe(0);
+    expect(result.stdout).not.toContain("ATLAS_BACKUP_PATH=");
+    expect(readdirSync(fixture.backupRoot)).toEqual([collisionName]);
+    const log = readFileSync(path.join(fixture.logDirectory, "docker.log"), "utf8");
+    expect(log).not.toMatch(/compose stop|pg_dump|compose start/);
   });
 
   it("treats restarting as active, restores only that service after failure, and removes partial output", () => {
     const fixture = createBackupFixture();
     const result = backup(fixture, {
-      FAKE_WEB_STATE: "stopped",
+      FAKE_WEB_STATE: "exited",
       FAKE_WORKER_STATE: "restarting",
       FAKE_FAIL_STAGE: "pg_dump",
     });
@@ -467,7 +542,7 @@ describe("backup.sh behavior", () => {
 
   it("restarts exactly the app services that were running before backup", () => {
     const fixture = createBackupFixture();
-    const result = backup(fixture, { FAKE_WORKER_STATE: "stopped" });
+    const result = backup(fixture, { FAKE_WORKER_STATE: "exited" });
 
     expect(result.status, result.stderr).toBe(0);
     const log = readFileSync(path.join(fixture.logDirectory, "docker.log"), "utf8");

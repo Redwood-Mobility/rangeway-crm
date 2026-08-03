@@ -97,38 +97,67 @@ DATABASE_IMAGE="$(docker inspect --format '{{.Config.Image}}' "${DB_CONTAINER}")
 TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 
-probe_service_active() {
-  local service="$1"
-  local running_containers
-  local restarting_containers
-
-  if ! running_containers="$(docker compose ps --status running -q "${service}")"; then
-    fail "could not determine whether ${service} is running."
-  fi
-  if ! restarting_containers="$(docker compose ps --status restarting -q "${service}")"; then
-    fail "could not determine whether ${service} is restarting."
-  fi
-
-  if [[ -n "${running_containers}" || -n "${restarting_containers}" ]]; then
-    printf '1\n'
-  else
-    printf '0\n'
-  fi
-}
+SERVICE_SNAPSHOT=""
+if ! SERVICE_SNAPSHOT="$(
+  docker compose ps --all --format '{{.Service}}|{{.State}}' web worker
+)"; then
+  fail "could not capture the web/worker service-state snapshot."
+fi
 
 # Policy: running and restarting services are active writers. Stop and later
-# start exactly that prior-active subset; leave every other state untouched.
-WEB_WAS_ACTIVE="$(probe_service_active web)"
-WORKER_WAS_ACTIVE="$(probe_service_active worker)"
+# start exactly that prior-active subset; leave every other known state untouched.
+WEB_WAS_ACTIVE=0
+WORKER_WAS_ACTIVE=0
+WEB_RECORDS=0
+WORKER_RECORDS=0
+if [[ -n "${SERVICE_SNAPSHOT}" ]]; then
+  while IFS= read -r service_record; do
+    case "${service_record}" in
+      *"|"*"|"*|*[[:space:]]*)
+        fail "service-state snapshot contained a malformed record."
+        ;;
+      *"|"*) ;;
+      *)
+        fail "service-state snapshot contained a malformed record."
+        ;;
+    esac
 
-mkdir -p -- "${BACKUP_ROOT}"
-BACKUP_ROOT="$(cd -- "${BACKUP_ROOT}" && pwd -P)"
-PENDING_DIR="$(mktemp -d "${BACKUP_ROOT}/.atlas-backup-${STAMP}.XXXXXX")"
-BACKUP_SUFFIX="${PENDING_DIR##*.}"
-FINAL_DIR="${BACKUP_ROOT}/${STAMP}-${BACKUP_SUFFIX}"
-[[ ! -e "${FINAL_DIR}" ]] || fail "backup destination already exists: ${FINAL_DIR}"
+    service_name="${service_record%%|*}"
+    service_state="${service_record#*|}"
+    case "${service_name}" in
+      web)
+        WEB_RECORDS=$((WEB_RECORDS + 1))
+        [[ "${WEB_RECORDS}" -eq 1 ]] \
+          || fail "service-state snapshot contained duplicate web records."
+        ;;
+      worker)
+        WORKER_RECORDS=$((WORKER_RECORDS + 1))
+        [[ "${WORKER_RECORDS}" -eq 1 ]] \
+          || fail "service-state snapshot contained duplicate worker records."
+        ;;
+      *)
+        fail "service-state snapshot contained an unknown service."
+        ;;
+    esac
 
-RESTORE_SERVICES=1
+    case "${service_state}" in
+      running|restarting)
+        if [[ "${service_name}" == "web" ]]; then
+          WEB_WAS_ACTIVE=1
+        else
+          WORKER_WAS_ACTIVE=1
+        fi
+        ;;
+      paused|removing|dead|created|exited) ;;
+      *)
+        fail "service-state snapshot contained an unknown state."
+        ;;
+    esac
+  done <<< "${SERVICE_SNAPSHOT}"
+fi
+
+PENDING_DIR=""
+RESTORE_SERVICES=0
 
 restart_app_services() {
   local restart_status=0
@@ -169,7 +198,17 @@ restart_on_exit() {
   [[ "${restart_status}" -ne 0 ]] && exit "${restart_status}"
   exit "${cleanup_status}"
 }
+
+mkdir -p -- "${BACKUP_ROOT}"
+BACKUP_ROOT="$(cd -- "${BACKUP_ROOT}" && pwd -P)"
+PENDING_DIR="$(mktemp -d "${BACKUP_ROOT}/.atlas-backup-${STAMP}.XXXXXX")"
 trap restart_on_exit EXIT INT TERM
+
+BACKUP_SUFFIX="${PENDING_DIR##*.}"
+FINAL_DIR="${BACKUP_ROOT}/${STAMP}-${BACKUP_SUFFIX}"
+[[ ! -e "${FINAL_DIR}" ]] || fail "backup destination already exists: ${FINAL_DIR}"
+
+RESTORE_SERVICES=1
 
 if [[ "${WEB_WAS_ACTIVE}" -eq 1 ]]; then
   docker compose stop web >&2
