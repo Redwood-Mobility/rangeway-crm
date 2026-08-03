@@ -1,6 +1,7 @@
 import process from "node:process";
 import { pathToFileURL } from "node:url";
 import type { Pool, QueryConfig, QueryResult } from "pg";
+import { workerPermissionContractSql } from "../shared/database-permission-contract.js";
 import { createPool } from "../server/platform/db/client.js";
 import { parseWorkerConfig } from "./config.js";
 
@@ -15,13 +16,7 @@ export async function checkWorkerReadiness(
     query: QueryConfig & { query_timeout: number },
   ) => Promise<QueryResult<ReadinessRow>>;
   const result = await boundedQuery({
-    text: `SELECT
-      current_user = 'atlas_worker' AS role_ok,
-      current_database() = 'atlas' AS database_ok,
-      has_table_privilege(current_user, 'public.outbox_events', 'SELECT')
-        AND has_column_privilege(current_user, 'public.outbox_events', 'attempt_count', 'UPDATE')
-        AND NOT has_column_privilege(current_user, 'public.outbox_events', 'payload', 'UPDATE')
-        AS permissions_ok`,
+    text: workerPermissionContractSql,
     query_timeout: 2_000,
   });
   const readiness = result.rows[0];

@@ -68,6 +68,83 @@ function productionApp(databasePath: string, uploadDir: string) {
 }
 
 describe("production legacy isolation", () => {
+  it.each([
+    ["/api/v1/legacy", '{"canary":"parser-secret",'],
+    ["/api/unknown", '{"canary":"parser-secret",'],
+  ])("maps malformed JSON globally before production route-family handling for %s", async (route, body) => {
+    const root = temporaryDirectory();
+    const errors: Array<{ message: string; context: Record<string, unknown> }> = [];
+    const app = createApp({
+      config: {
+        ...config,
+        nodeEnv: "production",
+        isProduction: true,
+        authMode: "google",
+        databasePath: path.join(root, "legacy.sqlite"),
+        uploadDir: path.join(root, "uploads"),
+        googleClientId: "google-client",
+        googleClientSecret: "google-secret",
+        googleRedirectUri: "https://atlas.rangeway.app/api/auth/google/callback",
+      },
+      v2Identity: identity,
+      logger: { error: (message, context) => errors.push({ message, context }) },
+    });
+
+    const response = await request(app)
+      .post(route)
+      .set("Content-Type", "application/json")
+      .send(body);
+
+    expect(response.status).toBe(400);
+    expect(response.headers["x-request-id"]).toMatch(/^[0-9a-f-]{36}$/);
+    expect(response.body).toEqual({
+      error: {
+        code: "INVALID_INPUT",
+        message: "Malformed JSON body.",
+        requestId: response.headers["x-request-id"],
+      },
+    });
+    expect(JSON.stringify({ response: response.body, errors })).not.toContain("parser-secret");
+  });
+
+  it.each(["/api/v1/legacy", "/api/unknown"])(
+    "maps oversized JSON globally before production route-family handling for %s",
+    async (route) => {
+      const root = temporaryDirectory();
+      const errors: Array<{ message: string; context: Record<string, unknown> }> = [];
+      const app = createApp({
+        config: {
+          ...config,
+          nodeEnv: "production",
+          isProduction: true,
+          authMode: "google",
+          databasePath: path.join(root, "legacy.sqlite"),
+          uploadDir: path.join(root, "uploads"),
+          googleClientId: "google-client",
+          googleClientSecret: "google-secret",
+          googleRedirectUri: "https://atlas.rangeway.app/api/auth/google/callback",
+        },
+        v2Identity: identity,
+        logger: { error: (message, context) => errors.push({ message, context }) },
+      });
+
+      const response = await request(app)
+        .post(route)
+        .set("Content-Type", "application/json")
+        .send(JSON.stringify({ canary: "parser-secret", padding: "x".repeat(1_100_000) }));
+
+      expect(response.status).toBe(413);
+      expect(response.body).toEqual({
+        error: {
+          code: "PAYLOAD_TOO_LARGE",
+          message: "Request body is too large.",
+          requestId: response.headers["x-request-id"],
+        },
+      });
+      expect(JSON.stringify({ response: response.body, errors })).not.toContain("parser-secret");
+    },
+  );
+
   it("returns a safe 404 before any legacy contact, project, task, document, or upload mutation", async () => {
     const root = temporaryDirectory();
     const databasePath = path.join(root, "data", "legacy.sqlite");

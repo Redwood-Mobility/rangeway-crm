@@ -45,6 +45,33 @@ describe("GET /api/v2/ready", () => {
       text: expect.stringMatching(/current_user.*atlas_web[\s\S]*current_database.*atlas/s),
       query_timeout: 2000,
     }));
+    const readinessSql = String(query.mock.calls[0]?.[0]?.text);
+    for (const relation of [
+      "organizations",
+      "users",
+      "actors",
+      "organization_memberships",
+      "audit_events",
+      "outbox_events",
+      "api_idempotency_keys",
+      "schema_migrations",
+    ]) {
+      expect(readinessSql).toContain(relation);
+    }
+    for (const requiredUpdateColumn of [
+      "name",
+      "google_subject",
+      "email",
+      "display_name",
+      "disabled_at",
+      "response_body",
+      "completed_at",
+    ]) {
+      expect(readinessSql).toContain(requiredUpdateColumn);
+    }
+    expect(readinessSql).toContain("has_any_column_privilege");
+    expect(readinessSql).toMatch(/audit_events[\s\S]*(?:UPDATE|DELETE|TRUNCATE)/);
+    expect(readinessSql).toMatch(/outbox_events[\s\S]*payload[\s\S]*UPDATE/);
   });
 
   it("fails closed without exposing database details when readiness fails", async () => {

@@ -8,6 +8,7 @@ import multer from "multer";
 import { nanoid } from "nanoid";
 import type { Pool, QueryConfig, QueryResult } from "pg";
 import { ZodError } from "zod";
+import { webPermissionContractSql } from "../shared/database-permission-contract.js";
 import { config as defaultConfig } from "./config.js";
 import {
   clearSessionCookie,
@@ -30,6 +31,7 @@ import {
 import { createPool } from "./platform/db/client.js";
 import {
   createApiErrorHandler,
+  isTrustedJsonParserError,
   type ErrorLogger,
 } from "./platform/http/error-handler.js";
 import {
@@ -169,13 +171,7 @@ app.get("/api/v2/ready", async (_req, res, next) => {
       query: QueryConfig & { query_timeout: number },
     ) => Promise<QueryResult<ReadinessRow>>;
     const result = await boundedQuery({
-      text: `SELECT
-        current_user = 'atlas_web' AS role_ok,
-        current_database() = 'atlas' AS database_ok,
-        has_table_privilege(current_user, 'public.organizations', 'SELECT')
-          AND has_table_privilege(current_user, 'public.audit_events', 'INSERT')
-          AND NOT has_table_privilege(current_user, 'public.schema_migrations', 'SELECT')
-          AS permissions_ok`,
+      text: webPermissionContractSql,
       query_timeout: 2_000,
     });
     const readiness = result.rows[0];
@@ -1114,7 +1110,10 @@ app.delete("/api/tasks/:id", (req, res) => {
 });
 
 app.use((error: unknown, req: express.Request, res: express.Response, next: express.NextFunction) => {
-  if (req.originalUrl.startsWith("/api/v2")) {
+  if (
+    req.originalUrl.startsWith("/api/v2") ||
+    (req.path.startsWith("/api/") && isTrustedJsonParserError(error))
+  ) {
     v2ErrorHandler(error, req, res, next);
     return;
   }

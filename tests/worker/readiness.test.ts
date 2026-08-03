@@ -14,10 +14,38 @@ describe("worker readiness", () => {
       service: "atlas-worker",
       contractVersion: "atlas-v2-foundation-v1",
     });
-    expect(query).toHaveBeenCalledWith(expect.objectContaining({
-      text: expect.stringMatching(/current_user.*atlas_worker[\s\S]*outbox_events/s),
-      query_timeout: 2000,
-    }));
+    expect(query).toHaveBeenCalledWith(expect.objectContaining({ query_timeout: 2000 }));
+    const readinessSql = String(query.mock.calls[0]?.[0]?.text);
+    expect(readinessSql).toContain("current_user = 'atlas_worker'");
+    expect(readinessSql).toContain("outbox_events");
+    for (const requiredUpdateColumn of [
+      "attempt_count",
+      "available_at",
+      "processing_started_at",
+      "processing_token",
+      "published_at",
+      "terminal_at",
+      "last_error",
+      "updated_at",
+    ]) {
+      expect(readinessSql).toContain(requiredUpdateColumn);
+    }
+    for (const forbiddenColumn of [
+      "organization_id",
+      "actor_id",
+      "request_id",
+      "event_type",
+      "aggregate_type",
+      "aggregate_id",
+      "schema_version",
+      "payload",
+      "created_at",
+    ]) {
+      expect(readinessSql).toContain(forbiddenColumn);
+    }
+    expect(readinessSql).toContain("has_any_column_privilege");
+    expect(readinessSql).toContain("audit_events");
+    expect(readinessSql).toContain("schema_migrations");
   });
 
   it("fails closed when the role or permissions do not match", async () => {

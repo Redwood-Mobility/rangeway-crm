@@ -14,6 +14,17 @@ const defaultLogger: ErrorLogger = {
   },
 };
 
+export function isTrustedJsonParserError(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "type" in error &&
+    "status" in error &&
+    ((error.type === "entity.parse.failed" && error.status === 400) ||
+      (error.type === "entity.too.large" && error.status === 413))
+  );
+}
+
 export function createApiErrorHandler(
   logger: ErrorLogger = defaultLogger,
 ): ErrorRequestHandler {
@@ -35,12 +46,8 @@ export function createApiErrorHandler(
     }
 
     if (
-      typeof error === "object" &&
-      error !== null &&
-      "type" in error &&
-      error.type === "entity.parse.failed" &&
-      "status" in error &&
-      error.status === 400
+      isTrustedJsonParserError(error) &&
+      (error as { type: string }).type === "entity.parse.failed"
     ) {
       const body: ApiErrorBody = {
         error: {
@@ -53,14 +60,7 @@ export function createApiErrorHandler(
       return;
     }
 
-    if (
-      typeof error === "object" &&
-      error !== null &&
-      "type" in error &&
-      error.type === "entity.too.large" &&
-      "status" in error &&
-      error.status === 413
-    ) {
+    if (isTrustedJsonParserError(error)) {
       const body: ApiErrorBody = {
         error: {
           code: "PAYLOAD_TOO_LARGE",

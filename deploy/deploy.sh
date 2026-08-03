@@ -5,7 +5,7 @@ REPOSITORY_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 cd "${REPOSITORY_ROOT}"
 
 REMOTE_HOST="${ATLAS_HOST:-}"
-REMOTE_USER="${ATLAS_USER:-atlas}"
+REMOTE_USER="${ATLAS_USER:-root}"
 REMOTE_DIR="${ATLAS_DIR:-/opt/atlas-v2}"
 REMOTE_BACKUP_ROOT="${ATLAS_BACKUP_ROOT:-/var/backups/atlas-v2}"
 ENV_FILE_INPUT="${ATLAS_ENV_FILE:-}"
@@ -13,7 +13,10 @@ SSH_KEY="${ATLAS_SSH_KEY:-}"
 COORDINATOR_PATH="${ATLAS_COORDINATOR_PATH:-/usr/local/sbin/atlas-v2-deployment-coordinator}"
 GUARDIAN_UNIT_PATH="${ATLAS_GUARDIAN_UNIT_PATH:-/etc/systemd/system/atlas-v2-deployment-guardian.service}"
 COORDINATOR_STATE_FILE="${ATLAS_COORDINATOR_STATE_FILE:-/var/lib/atlas-v2-deployment/active.state}"
-COORDINATOR_STAGE="${ATLAS_COORDINATOR_STAGE:-/opt/atlas-v2/.atlas-coordinator-staging}"
+COORDINATOR_STAGE="${ATLAS_COORDINATOR_STAGE:-/var/lib/atlas-v2-deployment/staging}"
+COORDINATOR_INSTALL_LOCK="${ATLAS_COORDINATOR_INSTALL_LOCK:-/run/lock/atlas-v2-deployment-install.lock}"
+BACKUP_TOOL_PATH="${ATLAS_BACKUP_TOOL_PATH:-/usr/local/libexec/atlas-v2/backup.sh}"
+RESTORE_TOOL_PATH="${ATLAS_RESTORE_TOOL_PATH:-/usr/local/libexec/atlas-v2/restore-test.sh}"
 LEASE_SECONDS="${ATLAS_DEPLOYMENT_LEASE_SECONDS:-900}"
 SSH_OPTS=(-o BatchMode=yes -o StrictHostKeyChecking=accept-new)
 RSYNC_RSH="ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new"
@@ -43,20 +46,29 @@ valid_path "${COORDINATOR_PATH}" || fail "ATLAS_COORDINATOR_PATH must be a canon
 valid_path "${GUARDIAN_UNIT_PATH}" || fail "ATLAS_GUARDIAN_UNIT_PATH must be a canonical absolute path."
 valid_path "${COORDINATOR_STATE_FILE}" || fail "ATLAS_COORDINATOR_STATE_FILE must be a canonical absolute path."
 valid_path "${COORDINATOR_STAGE}" || fail "ATLAS_COORDINATOR_STAGE must be a canonical absolute path."
+valid_path "${COORDINATOR_INSTALL_LOCK}" || fail "ATLAS_COORDINATOR_INSTALL_LOCK must be a canonical absolute path."
+valid_path "${BACKUP_TOOL_PATH}" || fail "ATLAS_BACKUP_TOOL_PATH must be a canonical absolute path."
+valid_path "${RESTORE_TOOL_PATH}" || fail "ATLAS_RESTORE_TOOL_PATH must be a canonical absolute path."
 path_is_equal_or_descendant "${REMOTE_BACKUP_ROOT}" "${REMOTE_DIR}" \
   && fail "ATLAS_BACKUP_ROOT must be outside the synchronized ATLAS_DIR tree."
 [[ "${LEASE_SECONDS}" =~ ^[0-9]+$ && "${LEASE_SECONDS}" -ge 2 && "${LEASE_SECONDS}" -le 900 ]] \
   || fail "ATLAS_DEPLOYMENT_LEASE_SECONDS must be between 2 and 900 seconds."
 if [[ "${ATLAS_COORDINATOR_TEST_MODE:-0}" != "1" ]]; then
-  [[ "${REMOTE_USER}" == "atlas" ]] || fail "ATLAS_USER must be the dedicated atlas deploy operator."
+  [[ "${REMOTE_USER}" == "root" ]] || fail "ATLAS_USER must be root for the supported root-admin deployment model."
   [[ "${REMOTE_DIR}" == "/opt/atlas-v2" ]] || fail "ATLAS_DIR must be /opt/atlas-v2 for the supported operator model."
   [[ "${REMOTE_BACKUP_ROOT}" == "/var/backups/atlas-v2" ]] || fail "ATLAS_BACKUP_ROOT must be /var/backups/atlas-v2 for the supported operator model."
   [[ "${COORDINATOR_PATH}" == "/usr/local/sbin/atlas-v2-deployment-coordinator" ]] \
     || fail "ATLAS_COORDINATOR_PATH must use the bootstrap-installed coordinator."
   [[ "${GUARDIAN_UNIT_PATH}" == "/etc/systemd/system/atlas-v2-deployment-guardian.service" ]] \
     || fail "ATLAS_GUARDIAN_UNIT_PATH must use the bootstrap-installed unit."
-  [[ "${COORDINATOR_STAGE}" == "/opt/atlas-v2/.atlas-coordinator-staging" ]] \
-    || fail "ATLAS_COORDINATOR_STAGE must use the bootstrap-owned staging directory."
+  [[ "${COORDINATOR_STAGE}" == "/var/lib/atlas-v2-deployment/staging" ]] \
+    || fail "ATLAS_COORDINATOR_STAGE must use the root-owned staging directory."
+  [[ "${COORDINATOR_INSTALL_LOCK}" == "/run/lock/atlas-v2-deployment-install.lock" ]] \
+    || fail "ATLAS_COORDINATOR_INSTALL_LOCK must use the root-owned acquisition lock."
+  [[ "${BACKUP_TOOL_PATH}" == "/usr/local/libexec/atlas-v2/backup.sh" ]] \
+    || fail "ATLAS_BACKUP_TOOL_PATH must use the immutable root-owned tool path."
+  [[ "${RESTORE_TOOL_PATH}" == "/usr/local/libexec/atlas-v2/restore-test.sh" ]] \
+    || fail "ATLAS_RESTORE_TOOL_PATH must use the immutable root-owned tool path."
 fi
 
 [[ -n "${ENV_FILE_INPUT}" ]] || fail "set ATLAS_ENV_FILE to the production environment file."
@@ -130,7 +142,7 @@ if [[ -n "${SSH_KEY}" ]]; then
   printf -v RSYNC_RSH '%s -i %q' "${RSYNC_RSH}" "${SSH_KEY}"
 fi
 
-for command_name in git npm npx rsync ssh curl node; do
+for command_name in git npm npx rsync ssh curl node mktemp install; do
   command -v "${command_name}" >/dev/null 2>&1 || fail "required local command is unavailable: ${command_name}"
 done
 
@@ -149,130 +161,220 @@ npx --yes @redocly/cli lint openapi/atlas-v2.yaml
 REMOTE_TARGET="${REMOTE_USER}@${REMOTE_HOST}"
 DEPLOYMENT_TOKEN="$(node --input-type=module -e 'console.log(crypto.randomUUID())')"
 [[ "${DEPLOYMENT_TOKEN}" =~ ^[0-9a-f-]{36}$ ]] || fail "could not create a deployment token."
+REMOTE_CANDIDATE_STAGE="${COORDINATOR_STAGE}/${DEPLOYMENT_TOKEN}"
+
+ssh "${SSH_OPTS[@]}" "${REMOTE_TARGET}" bash -s -- "${ATLAS_COORDINATOR_TEST_MODE:-0}" <<'REMOTE_ROOT_PREFLIGHT'
+set -euo pipefail
+test_mode="$1"
+if [[ "${test_mode}" != "1" ]]; then
+  [[ "$(id -u)" -eq 0 ]] || { echo "Atlas deployment requires a root SSH administrator." >&2; exit 1; }
+fi
+REMOTE_ROOT_PREFLIGHT
 
 COORDINATOR_SOURCE="${REPOSITORY_ROOT}/deploy/deployment-coordinator.sh"
 GUARDIAN_UNIT_SOURCE="${REPOSITORY_ROOT}/deploy/systemd/atlas-v2-deployment-guardian.service"
+BACKUP_SOURCE="${REPOSITORY_ROOT}/deploy/backup.sh"
+RESTORE_SOURCE="${REPOSITORY_ROOT}/deploy/restore-test.sh"
 [[ -f "${COORDINATOR_SOURCE}" && ! -L "${COORDINATOR_SOURCE}" ]] \
   || fail "reviewed deployment coordinator source is unavailable."
 [[ -f "${GUARDIAN_UNIT_SOURCE}" && ! -L "${GUARDIAN_UNIT_SOURCE}" ]] \
   || fail "reviewed deployment guardian unit source is unavailable."
+[[ -f "${BACKUP_SOURCE}" && ! -L "${BACKUP_SOURCE}" ]] \
+  || fail "reviewed backup source is unavailable."
+[[ -f "${RESTORE_SOURCE}" && ! -L "${RESTORE_SOURCE}" ]] \
+  || fail "reviewed restore-test source is unavailable."
 COORDINATOR_SHA256="$(node --input-type=module -e \
   'import fs from "node:fs"; import crypto from "node:crypto"; process.stdout.write(crypto.createHash("sha256").update(fs.readFileSync(process.argv[1])).digest("hex"))' \
   "${COORDINATOR_SOURCE}")"
 GUARDIAN_UNIT_SHA256="$(node --input-type=module -e \
   'import fs from "node:fs"; import crypto from "node:crypto"; process.stdout.write(crypto.createHash("sha256").update(fs.readFileSync(process.argv[1])).digest("hex"))' \
   "${GUARDIAN_UNIT_SOURCE}")"
-[[ "${COORDINATOR_SHA256}" =~ ^[0-9a-f]{64}$ && "${GUARDIAN_UNIT_SHA256}" =~ ^[0-9a-f]{64}$ ]] \
+BACKUP_SHA256="$(node --input-type=module -e \
+  'import fs from "node:fs"; import crypto from "node:crypto"; process.stdout.write(crypto.createHash("sha256").update(fs.readFileSync(process.argv[1])).digest("hex"))' \
+  "${BACKUP_SOURCE}")"
+RESTORE_SHA256="$(node --input-type=module -e \
+  'import fs from "node:fs"; import crypto from "node:crypto"; process.stdout.write(crypto.createHash("sha256").update(fs.readFileSync(process.argv[1])).digest("hex"))' \
+  "${RESTORE_SOURCE}")"
+[[ "${COORDINATOR_SHA256}" =~ ^[0-9a-f]{64}$ && "${GUARDIAN_UNIT_SHA256}" =~ ^[0-9a-f]{64}$ \
+  && "${BACKUP_SHA256}" =~ ^[0-9a-f]{64}$ && "${RESTORE_SHA256}" =~ ^[0-9a-f]{64}$ ]] \
   || fail "could not hash reviewed coordinator assets."
 
-install_verified_coordinator() {
+LOCAL_CANDIDATE_STAGE="$(mktemp -d "${TMPDIR:-/tmp}/atlas-v2-candidate.XXXXXX")"
+git archive --format=tar --output="${LOCAL_CANDIDATE_STAGE}/atlas-release.tar" "${LOCAL_COMMIT}"
+install -m 0600 "${ENV_FILE}" "${LOCAL_CANDIDATE_STAGE}/atlas.env"
+RELEASE_ARCHIVE_SHA256="$(node --input-type=module -e \
+  'import fs from "node:fs"; import crypto from "node:crypto"; process.stdout.write(crypto.createHash("sha256").update(fs.readFileSync(process.argv[1])).digest("hex"))' \
+  "${LOCAL_CANDIDATE_STAGE}/atlas-release.tar")"
+ENVIRONMENT_SHA256="$(node --input-type=module -e \
+  'import fs from "node:fs"; import crypto from "node:crypto"; process.stdout.write(crypto.createHash("sha256").update(fs.readFileSync(process.argv[1])).digest("hex"))' \
+  "${LOCAL_CANDIDATE_STAGE}/atlas.env")"
+[[ "${RELEASE_ARCHIVE_SHA256}" =~ ^[0-9a-f]{64}$ && "${ENVIRONMENT_SHA256}" =~ ^[0-9a-f]{64}$ ]] \
+  || fail "could not hash immutable release inputs."
+
+install_verified_coordinator_and_begin() {
   ssh "${SSH_OPTS[@]}" "${REMOTE_TARGET}" bash -s -- \
-    "${COORDINATOR_STAGE}" "${ATLAS_COORDINATOR_TEST_MODE:-0}" <<'REMOTE_STAGE'
+    "${COORDINATOR_STAGE}" "${REMOTE_CANDIDATE_STAGE}" "${ATLAS_COORDINATOR_TEST_MODE:-0}" \
+    <<'REMOTE_STAGE' || fail "remote immutable staging directory preparation failed."
 set -euo pipefail
-stage="$1"
-test_mode="$2"
+stage_root="$1"
+stage="$2"
+test_mode="$3"
 if [[ "${test_mode}" == "1" ]]; then
-  install -d -m 0700 -- "${stage}"
+  install -d -m 0700 -- "${stage_root}" "${stage}"
 else
-  [[ "${stage}" == "/opt/atlas-v2/.atlas-coordinator-staging" ]] || exit 1
-  [[ -d "${stage}" && ! -L "${stage}" ]] || exit 1
-  [[ "$(stat -c '%U:%G:%a' "${stage}")" == "atlas:atlas:700" ]] || exit 1
+  [[ "$(id -u)" -eq 0 ]] || exit 1
+  [[ "${stage_root}" == "/var/lib/atlas-v2-deployment/staging" ]] || exit 1
+  [[ "${stage}" == "${stage_root}/"* ]] || exit 1
+  [[ -d "${stage_root}" && ! -L "${stage_root}" ]] || exit 1
+  [[ "$(stat -c '%U:%G:%a' "${stage_root}")" == "root:root:700" ]] || exit 1
+  install -o root -g root -m 0700 -d -- "${stage}"
 fi
 REMOTE_STAGE
 
   rsync -az --chmod=F600 -e "${RSYNC_RSH}" \
-    "${COORDINATOR_SOURCE}" "${GUARDIAN_UNIT_SOURCE}" \
-    "${REMOTE_TARGET}:${COORDINATOR_STAGE}/"
+    "${COORDINATOR_SOURCE}" "${GUARDIAN_UNIT_SOURCE}" "${BACKUP_SOURCE}" "${RESTORE_SOURCE}" \
+    "${LOCAL_CANDIDATE_STAGE}/atlas-release.tar" "${LOCAL_CANDIDATE_STAGE}/atlas.env" \
+    "${REMOTE_TARGET}:${REMOTE_CANDIDATE_STAGE}/" \
+    || fail "immutable deployment bundle staging failed."
 
   ssh "${SSH_OPTS[@]}" "${REMOTE_TARGET}" bash -s -- \
-    "${COORDINATOR_STAGE}" "${COORDINATOR_PATH}" "${GUARDIAN_UNIT_PATH}" \
-    "${COORDINATOR_STATE_FILE}" "${COORDINATOR_SHA256}" "${GUARDIAN_UNIT_SHA256}" \
-    "${ATLAS_COORDINATOR_TEST_MODE:-0}" <<'REMOTE_INSTALL'
+    "${REMOTE_CANDIDATE_STAGE}" "${COORDINATOR_PATH}" "${GUARDIAN_UNIT_PATH}" \
+    "${BACKUP_TOOL_PATH}" "${RESTORE_TOOL_PATH}" "${COORDINATOR_STATE_FILE}" \
+    "${COORDINATOR_INSTALL_LOCK}" "${COORDINATOR_SHA256}" "${GUARDIAN_UNIT_SHA256}" \
+    "${BACKUP_SHA256}" "${RESTORE_SHA256}" "${RELEASE_ARCHIVE_SHA256}" \
+    "${ENVIRONMENT_SHA256}" "${DEPLOYMENT_TOKEN}" "${REMOTE_DIR}" \
+    "${REMOTE_BACKUP_ROOT}" "${LEASE_SECONDS}" "${LOCAL_COMMIT}" \
+    "${ATLAS_COORDINATOR_TEST_MODE:-0}" \
+    <<'REMOTE_INSTALL' || fail "immutable deployment bundle install or ownership acquisition failed."
 set -euo pipefail
 stage="$1"
 coordinator="$2"
 unit="$3"
-state_file="$4"
-expected_coordinator_hash="$5"
-expected_unit_hash="$6"
-test_mode="$7"
+backup_tool="$4"
+restore_tool="$5"
+state_file="$6"
+install_lock="$7"
+expected_coordinator_hash="$8"
+expected_unit_hash="$9"
+expected_backup_hash="${10}"
+expected_restore_hash="${11}"
+expected_archive_hash="${12}"
+expected_environment_hash="${13}"
+deployment_token="${14}"
+remote_dir="${15}"
+backup_root="${16}"
+lease_seconds="${17}"
+bundle_version="${18}"
+test_mode="${19}"
 staged_coordinator="${stage}/deployment-coordinator.sh"
 staged_unit="${stage}/atlas-v2-deployment-guardian.service"
+staged_backup="${stage}/backup.sh"
+staged_restore="${stage}/restore-test.sh"
+staged_archive="${stage}/atlas-release.tar"
+staged_environment="${stage}/atlas.env"
 coordinator_next="${coordinator}.next"
 unit_next="${unit}.next"
-
-privileged() {
-  if [[ "${test_mode}" == "1" || "${EUID}" -eq 0 ]]; then
-    "$@"
-  else
-    sudo -n "$@"
-  fi
-}
+backup_next="${backup_tool}.next"
+restore_next="${restore_tool}.next"
 
 hash_file() {
   sha256sum -- "$1" | awk '{print $1}'
 }
 
-[[ -f "${staged_coordinator}" && ! -L "${staged_coordinator}" ]] || exit 1
-[[ -f "${staged_unit}" && ! -L "${staged_unit}" ]] || exit 1
-[[ "$(hash_file "${staged_coordinator}")" == "${expected_coordinator_hash}" ]] \
-  || { echo "Staged Atlas coordinator hash mismatch." >&2; exit 1; }
-[[ "$(hash_file "${staged_unit}")" == "${expected_unit_hash}" ]] \
-  || { echo "Staged Atlas guardian unit hash mismatch." >&2; exit 1; }
+if [[ "${test_mode}" != "1" ]]; then
+  [[ "$(id -u)" -eq 0 ]] || { echo "Atlas deployment requires root." >&2; exit 1; }
+fi
+install -d -m 0755 -- "$(dirname -- "${install_lock}")"
+exec 6>"${install_lock}"
+flock -x 6
+
+while IFS='|' read -r staged expected_hash; do
+  [[ -f "${staged}" && ! -L "${staged}" ]] || exit 1
+  [[ "$(hash_file "${staged}")" == "${expected_hash}" ]] \
+    || { echo "Staged Atlas bundle hash mismatch." >&2; exit 1; }
+done <<EOF
+${staged_coordinator}|${expected_coordinator_hash}
+${staged_unit}|${expected_unit_hash}
+${staged_backup}|${expected_backup_hash}
+${staged_restore}|${expected_restore_hash}
+${staged_archive}|${expected_archive_hash}
+${staged_environment}|${expected_environment_hash}
+EOF
 
 installed_matches=0
-if [[ -f "${coordinator}" && ! -L "${coordinator}" && -f "${unit}" && ! -L "${unit}" ]] \
+if [[ -f "${coordinator}" && ! -L "${coordinator}" && -f "${unit}" && ! -L "${unit}" \
+  && -f "${backup_tool}" && ! -L "${backup_tool}" && -f "${restore_tool}" && ! -L "${restore_tool}" ]] \
   && [[ "$(hash_file "${coordinator}")" == "${expected_coordinator_hash}" ]] \
-  && [[ "$(hash_file "${unit}")" == "${expected_unit_hash}" ]]; then
+  && [[ "$(hash_file "${unit}")" == "${expected_unit_hash}" ]] \
+  && [[ "$(hash_file "${backup_tool}")" == "${expected_backup_hash}" ]] \
+  && [[ "$(hash_file "${restore_tool}")" == "${expected_restore_hash}" ]]; then
   if [[ "${test_mode}" == "1" ]] \
     || [[ "$(stat -c '%U:%G:%a' "${coordinator}")" == "root:root:755" \
-      && "$(stat -c '%U:%G:%a' "${unit}")" == "root:root:644" ]]; then
+      && "$(stat -c '%U:%G:%a' "${unit}")" == "root:root:644" \
+      && "$(stat -c '%U:%G:%a' "${backup_tool}")" == "root:root:755" \
+      && "$(stat -c '%U:%G:%a' "${restore_tool}")" == "root:root:755" ]]; then
     installed_matches=1
   fi
 fi
 
 if [[ "${installed_matches}" -ne 1 ]]; then
-  if privileged systemctl is-active --quiet atlas-v2-deployment-guardian.service; then
+  if systemctl is-active --quiet atlas-v2-deployment-guardian.service; then
     echo "Refusing to replace Atlas coordinator bytes while its guardian is active." >&2
     exit 1
   fi
-  if [[ "${test_mode}" == "1" && -e "${state_file}" ]]; then
-    echo "Refusing to replace Atlas coordinator bytes while active.state requires resolution." >&2
-    exit 1
-  fi
-  if [[ "${test_mode}" != "1" ]] \
-    && privileged stat -c %F "${state_file}" >/dev/null 2>&1; then
+  if [[ -e "${state_file}" ]]; then
     echo "Refusing to replace Atlas coordinator bytes while active.state requires resolution." >&2
     exit 1
   fi
   if [[ "${test_mode}" == "1" ]]; then
     install -m 0755 "${staged_coordinator}" "${coordinator_next}"
     install -m 0644 "${staged_unit}" "${unit_next}"
+    install -m 0755 "${staged_backup}" "${backup_next}"
+    install -m 0755 "${staged_restore}" "${restore_next}"
   else
-    privileged install -o root -g root -m 0755 "${staged_coordinator}" "${coordinator_next}"
-    privileged install -o root -g root -m 0644 "${staged_unit}" "${unit_next}"
+    install -o root -g root -m 0755 -d "$(dirname -- "${backup_tool}")"
+    install -o root -g root -m 0755 "${staged_coordinator}" "${coordinator_next}"
+    install -o root -g root -m 0644 "${staged_unit}" "${unit_next}"
+    install -o root -g root -m 0755 "${staged_backup}" "${backup_next}"
+    install -o root -g root -m 0755 "${staged_restore}" "${restore_next}"
   fi
   [[ "$(hash_file "${coordinator_next}")" == "${expected_coordinator_hash}" ]]
   [[ "$(hash_file "${unit_next}")" == "${expected_unit_hash}" ]]
-  privileged mv -f -- "${coordinator_next}" "${coordinator}"
-  privileged mv -f -- "${unit_next}" "${unit}"
+  [[ "$(hash_file "${backup_next}")" == "${expected_backup_hash}" ]]
+  [[ "$(hash_file "${restore_next}")" == "${expected_restore_hash}" ]]
+  mv -f -- "${coordinator_next}" "${coordinator}"
+  mv -f -- "${unit_next}" "${unit}"
+  mv -f -- "${backup_next}" "${backup_tool}"
+  mv -f -- "${restore_next}" "${restore_tool}"
 fi
 
 [[ "$(hash_file "${coordinator}")" == "${expected_coordinator_hash}" ]]
 [[ "$(hash_file "${unit}")" == "${expected_unit_hash}" ]]
+[[ "$(hash_file "${backup_tool}")" == "${expected_backup_hash}" ]]
+[[ "$(hash_file "${restore_tool}")" == "${expected_restore_hash}" ]]
 if [[ "${test_mode}" != "1" ]]; then
   [[ "$(stat -c '%U:%G:%a' "${coordinator}")" == "root:root:755" ]]
   [[ "$(stat -c '%U:%G:%a' "${unit}")" == "root:root:644" ]]
+  [[ "$(stat -c '%U:%G:%a' "${backup_tool}")" == "root:root:755" ]]
+  [[ "$(stat -c '%U:%G:%a' "${restore_tool}")" == "root:root:755" ]]
 fi
-privileged systemctl daemon-reload
-loaded_unit="$(privileged systemctl cat --no-pager --full atlas-v2-deployment-guardian.service)"
+systemctl daemon-reload
+loaded_unit="$(systemctl cat --no-pager --full atlas-v2-deployment-guardian.service)"
 loaded_hash="$(printf '%s\n' "${loaded_unit}" | sed '1{/^# \/etc\/systemd\/system\/atlas-v2-deployment-guardian\.service$/d;}' | sha256sum | awk '{print $1}')"
 [[ "${loaded_hash}" == "${expected_unit_hash}" ]] \
   || { echo "Loaded Atlas guardian unit differs from reviewed bytes." >&2; exit 1; }
+if systemctl is-active --quiet atlas-v2-deployment-guardian.service; then
+  echo "Refusing Atlas begin while the deployment guardian is already active." >&2
+  exit 1
+fi
+[[ ! -e "${state_file}" ]] || { echo "Refusing Atlas begin while active.state exists." >&2; exit 1; }
+ATLAS_COORDINATOR_INSTALL_LOCK_HELD=1 exec "${coordinator}" begin \
+  "${deployment_token}" "${remote_dir}" "${backup_root}" "${lease_seconds}" \
+  "${bundle_version}" "${expected_coordinator_hash}" "${expected_unit_hash}" \
+  "${expected_backup_hash}" "${expected_restore_hash}" "${stage}" \
+  "${expected_archive_hash}" "${expected_environment_hash}"
 REMOTE_INSTALL
 }
-
-install_verified_coordinator
 
 run_coordinator() {
   ssh "${SSH_OPTS[@]}" "${REMOTE_TARGET}" bash -s -- \
@@ -281,17 +383,21 @@ set -euo pipefail
 coordinator="$1"
 shift
 [[ -x "${coordinator}" ]] || { echo "Atlas V2 deployment coordinator is not installed." >&2; exit 1; }
-if [[ "${EUID}" -eq 0 || "${ATLAS_COORDINATOR_TEST_MODE:-0}" == "1" ]]; then
+if [[ "${ATLAS_COORDINATOR_TEST_MODE:-0}" == "1" ]]; then
   exec "${coordinator}" "$@"
 fi
-exec sudo -n "${coordinator}" "$@"
+if [[ "${EUID}" -eq 0 ]]; then
+  [[ "$(id -u)" -eq 0 ]] || { echo "Atlas coordinator commands require root." >&2; exit 1; }
+  exec "${coordinator}" "$@"
+fi
+echo "Atlas coordinator commands require root." >&2
+exit 1
 REMOTE_COORDINATOR
 }
 
 # The coordinator takes the host-wide durable claim before backup, quiescence,
 # source synchronization, role rotation, or migration can mutate the release.
-BEGIN_OUTPUT="$(run_coordinator begin "${DEPLOYMENT_TOKEN}" "${REMOTE_DIR}" \
-  "${REMOTE_BACKUP_ROOT}" "${LEASE_SECONDS}")"
+BEGIN_OUTPUT="$(install_verified_coordinator_and_begin)"
 
 PREVIOUS_COMMIT="none"
 EXACT_BACKUP="none"
@@ -345,6 +451,9 @@ on_deploy_exit() {
       fi
     } >&2
   fi
+  case "${LOCAL_CANDIDATE_STAGE:-}" in
+    "${TMPDIR:-/tmp}"/atlas-v2-candidate.*) /bin/rm -rf -- "${LOCAL_CANDIDATE_STAGE}" ;;
+  esac
   exit "${failure_status}"
 }
 trap on_deploy_exit EXIT
@@ -370,41 +479,15 @@ if [[ "${EXACT_BACKUP}" != "none" ]]; then
   echo "Fresh pre-deploy backup passed its non-destructive restore test: ${EXACT_BACKUP}" >&2
 fi
 run_coordinator transition "${DEPLOYMENT_TOKEN}" prepared quiesced
-
-RSYNC_TREE_ARGS=(
-  -az --delete-delay
-  -e "${RSYNC_RSH}"
-  --exclude ".git/"
-  --exclude ".env"
-  --exclude ".env.*"
-  --exclude ".atlas-release"
-  --exclude ".atlas-coordinator-staging/"
-  --exclude "node_modules/"
-  --exclude "dist/"
-  --exclude "backups/"
-  --exclude "artifacts/"
-  --exclude "atlas-db/"
-  --exclude "atlas-artifacts/"
-  --exclude "data/"
-  --exclude "uploads/"
-)
-if [[ -n "${ENV_SOURCE_EXCLUDE}" ]]; then
-  RSYNC_TREE_ARGS+=(--exclude "${ENV_SOURCE_EXCLUDE}")
-fi
-run_coordinator assert "${DEPLOYMENT_TOKEN}" quiesced
-rsync "${RSYNC_TREE_ARGS[@]}" ./ "${REMOTE_TARGET}:${REMOTE_DIR}/"
-run_coordinator renew "${DEPLOYMENT_TOKEN}" quiesced
-
-run_coordinator assert "${DEPLOYMENT_TOKEN}" quiesced
-rsync -az --chmod=F600 -e "${RSYNC_RSH}" \
-  "${ENV_FILE}" "${REMOTE_TARGET}:${REMOTE_DIR}/.env"
-run_coordinator renew "${DEPLOYMENT_TOKEN}" quiesced
+run_coordinator transition "${DEPLOYMENT_TOKEN}" quiesced syncing
+run_coordinator guard "${DEPLOYMENT_TOKEN}" syncing sync-release
+run_coordinator transition "${DEPLOYMENT_TOKEN}" syncing synced
 run_coordinator candidate "${DEPLOYMENT_TOKEN}" "${LOCAL_COMMIT}"
-run_coordinator guard "${DEPLOYMENT_TOKEN}" quiesced build-db
+run_coordinator guard "${DEPLOYMENT_TOKEN}" synced build-db
 
 # Credentials and schema can become incompatible with the prior release after
 # this exact durable transition. Every later failure remains fail closed.
-run_coordinator transition "${DEPLOYMENT_TOKEN}" quiesced boundary
+run_coordinator transition "${DEPLOYMENT_TOKEN}" synced boundary
 BOUNDARY_CROSSED=1
 
 run_coordinator guard "${DEPLOYMENT_TOKEN}" boundary rotate-roles
@@ -453,6 +536,7 @@ HEALTH_JSON="${PUBLIC_HEALTH_RESPONSE}" node --input-type=module -e '
 run_coordinator assert "${DEPLOYMENT_TOKEN}" boundary
 run_coordinator complete "${DEPLOYMENT_TOKEN}" "${LOCAL_COMMIT}"
 DEPLOYMENT_COMPLETE=1
+/bin/rm -rf -- "${LOCAL_CANDIDATE_STAGE}"
 trap - EXIT INT TERM
 
 echo "Atlas V2 release ${LOCAL_COMMIT} passed target-bound and public HTTPS health verification."

@@ -216,26 +216,29 @@ describe("deterministic deployment source contract", () => {
     expect(caddyfile).toContain('Cache-Control "no-store"');
   });
 
-  it("backs up before replacement and verifies migration, startup, and live V2 health", () => {
+  it("stages immutable inputs, backs up before atomic promotion, and verifies the live V2 release", () => {
+    const stagePosition = deployScript.indexOf("rsync -az --chmod=F600");
     const backupPosition = deployScript.indexOf('guard "${DEPLOYMENT_TOKEN}" prepared backup');
     const restorePosition = deployScript.indexOf('guard "${DEPLOYMENT_TOKEN}" prepared restore-backup');
-    const syncPosition = deployScript.indexOf('rsync "${RSYNC_TREE_ARGS[@]}"');
+    const syncPosition = deployScript.indexOf('guard "${DEPLOYMENT_TOKEN}" syncing sync-release');
+    expect(stagePosition).toBeGreaterThan(0);
     expect(backupPosition).toBeGreaterThan(0);
+    expect(backupPosition).toBeGreaterThan(stagePosition);
     expect(restorePosition).toBeGreaterThan(backupPosition);
     expect(syncPosition).toBeGreaterThan(restorePosition);
-    expect(syncPosition).toBeGreaterThan(backupPosition);
     expect(deployScript).toContain("npm test");
     expect(deployScript).toContain("npm run typecheck");
     expect(deployScript).toContain("npm run build");
     expect(deployScript).toContain("@redocly/cli lint openapi/atlas-v2.yaml");
-    expect(deploymentCoordinator).toContain("deploy/backup.sh");
-    expect(deploymentCoordinator).toContain("deploy/restore-test.sh");
+    expect(deploymentCoordinator).toContain("BACKUP_TOOL_PATH");
+    expect(deploymentCoordinator).toContain("RESTORE_TOOL_PATH");
+    expect(deploymentCoordinator).not.toMatch(/\.\/deploy\/(?:backup|restore-test)\.sh/);
     expect(deploymentCoordinator).toContain("docker compose up -d db");
     expect(deploymentCoordinator).toContain("docker compose exec -T db /docker-entrypoint-initdb.d/001-atlas-roles.sh");
-    expect(deploymentCoordinator).toContain("docker compose --profile operations run --rm migrator");
+    expect(deploymentCoordinator).toContain("docker compose --profile operations run --rm --label");
     expect(deploymentCoordinator).toContain("docker compose up -d web worker caddy");
     expect(deploymentCoordinator.indexOf("docker compose build web worker")).toBeLessThan(
-      deploymentCoordinator.indexOf("docker compose run --rm --no-deps web"),
+      deploymentCoordinator.indexOf("import('./dist/server/config.js')"),
     );
     expect(deployScript).toContain("https://atlas.rangeway.app/api/v2/ready");
     expect(deployScript).toContain("contractVersion");
@@ -248,8 +251,10 @@ describe("deterministic deployment source contract", () => {
 
   it("uses one durable, boot-reconciled coordinator around the compatibility boundary", () => {
     expect(deployScript).toContain("atlas-v2-deployment-coordinator");
-    expect(deployScript).toMatch(/run_coordinator begin .*DEPLOYMENT_TOKEN/);
-    expect(deployScript).toContain('run_coordinator transition "${DEPLOYMENT_TOKEN}" quiesced boundary');
+    expect(deployScript).toMatch(/ATLAS_COORDINATOR_INSTALL_LOCK_HELD=1 exec[^\n]*coordinator[^\n]*begin/);
+    expect(deployScript).toContain('run_coordinator transition "${DEPLOYMENT_TOKEN}" quiesced syncing');
+    expect(deployScript).toContain('run_coordinator transition "${DEPLOYMENT_TOKEN}" syncing synced');
+    expect(deployScript).toContain('run_coordinator transition "${DEPLOYMENT_TOKEN}" synced boundary');
     expect(deployScript).toContain('run_coordinator complete "${DEPLOYMENT_TOKEN}" "${LOCAL_COMMIT}"');
     expect(deployScript).not.toMatch(/setsid|\.lease\.sh|\.atlas-preflight-handoffs/);
     expect(deploymentCoordinator).toContain("flock -n 9");
@@ -259,10 +264,11 @@ describe("deterministic deployment source contract", () => {
     expect(deploymentCoordinator).toContain('label=com.docker.compose.service=${service}');
     expect(deploymentCoordinator).toContain('label=com.docker.compose.project=${COMPOSE_PROJECT}');
     expect(deploymentCoordinator).toContain('COMPOSE_PROJECT="atlas-v2"');
-    expect(deploymentCoordinator).not.toMatch(/docker (?:rm|container rm)|docker compose down/);
+    expect(deploymentCoordinator).toContain('label=atlas.deployment-token=${requested_token}');
+    expect(deploymentCoordinator).not.toMatch(/docker compose down/);
     expect(deploymentGuardianUnit).toContain("WantedBy=multi-user.target");
     expect(deploymentGuardianUnit).toContain("Restart=on-failure");
-    expect(deployScript.indexOf("quiesced boundary")).toBeLessThan(
+    expect(deployScript.indexOf("synced boundary")).toBeLessThan(
       deployScript.indexOf('guard "${DEPLOYMENT_TOKEN}" boundary rotate-roles'),
     );
   });

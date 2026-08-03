@@ -220,7 +220,36 @@ if [[ "${WORKER_WAS_ACTIVE}" -eq 1 ]]; then
   docker compose stop worker >&2
 fi
 
-docker compose exec -T db \
+fence_exact_service() {
+  local service="$1"
+  local snapshot container project_label service_label extra remaining
+  local -a containers=()
+  snapshot="$(docker ps \
+    --filter "label=com.docker.compose.project=${COMPOSE_PROJECT_NAME}" \
+    --filter "label=com.docker.compose.service=${service}" \
+    --format '{{.ID}}|{{.Label "com.docker.compose.project"}}|{{.Label "com.docker.compose.service"}}')"
+  while IFS='|' read -r container project_label service_label extra; do
+    [[ -n "${container}" ]] || continue
+    [[ "${container}" =~ ^[A-Za-z0-9_.-]+$ && -z "${extra:-}" ]] \
+      || fail "exact-label ${service} fence returned malformed output."
+    [[ "${project_label}" == "${COMPOSE_PROJECT_NAME}" && "${service_label}" == "${service}" ]] \
+      || fail "exact-label ${service} fence returned mismatched labels."
+    containers+=("${container}")
+  done <<< "${snapshot}"
+  if [[ "${#containers[@]}" -gt 0 ]]; then
+    docker stop -- "${containers[@]}" >&2
+  fi
+  remaining="$(docker ps -q \
+    --filter "label=com.docker.compose.project=${COMPOSE_PROJECT_NAME}" \
+    --filter "label=com.docker.compose.service=${service}")"
+  [[ -z "${remaining}" ]] || fail "exact-label ${service} writer remains active before pg_dump."
+}
+
+for fenced_service in web worker migrator; do
+  fence_exact_service "${fenced_service}"
+done
+
+docker compose exec -T -e "PGAPPNAME=atlas-deploy-${ATLAS_DEPLOYMENT_TOKEN:-standalone-backup}" db \
   pg_dump --format=custom --username=atlas --dbname=atlas \
   > "${PENDING_DIR}/atlas-postgres.dump"
 

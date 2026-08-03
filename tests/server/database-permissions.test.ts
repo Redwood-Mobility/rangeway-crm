@@ -7,6 +7,11 @@ import { runMigrations } from "../../src/server/platform/db/migrate.js";
 import { IdentityService } from "../../src/server/modules/identity/identity.service.js";
 import { provisionProductionOwnerWithPool } from "../../src/server/platform/db/provision-production-owner.js";
 import {
+  buildPermissionContractSql,
+  webUpdateColumns,
+  workerUpdateColumns,
+} from "../../src/shared/database-permission-contract.js";
+import {
   createTemporaryDatabase,
   PostgreSqlUnavailableError,
 } from "../helpers/database.js";
@@ -50,6 +55,106 @@ async function withTemporaryPostgreSql(
 }
 
 describe("least-privilege PostgreSQL roles", () => {
+  it("adds an exact runtime grant migration without changing prior migrations", async () => {
+    const migration = await source("db/migrations/0005_exact_runtime_permissions.sql").catch(() => "");
+
+    expect(migration).toContain("REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA public FROM atlas_web");
+    expect(migration).toMatch(/GRANT SELECT ON\s+organizations,\s+users,\s+actors,\s+organization_memberships,\s+api_idempotency_keys\s+TO atlas_web/);
+    expect(migration).toMatch(/GRANT INSERT ON\s+users,\s+actors,\s+organization_memberships,\s+audit_events,\s+outbox_events,\s+api_idempotency_keys\s+TO atlas_web/);
+    expect(migration).toMatch(/GRANT UPDATE \(name, updated_at\) ON organizations TO atlas_web/);
+    expect(migration).toMatch(/GRANT UPDATE \(email, display_name, google_subject, updated_at\) ON users TO atlas_web/);
+    expect(migration).toMatch(/GRANT UPDATE \(display_name, updated_at, disabled_at\) ON actors TO atlas_web/);
+    expect(migration).toMatch(/GRANT UPDATE \(response_body, completed_at\) ON api_idempotency_keys TO atlas_web/);
+    expect(migration).toMatch(/GRANT SELECT ON outbox_events TO atlas_worker/);
+    expect(migration).toMatch(/GRANT UPDATE\s*\([\s\S]*attempt_count[\s\S]*updated_at[\s\S]*\)\s*ON outbox_events TO atlas_worker/);
+  });
+
+  it("fails the shared readiness contract for drift in every required grant and critical forbidden surface", async (context) => {
+    await withTemporaryPostgreSql(context, async (pool) => {
+      const readiness = async (role: "atlas_web" | "atlas_worker") => {
+        const client = await pool.connect();
+        try {
+          await client.query(`SET ROLE ${role}`);
+          const result = await client.query<{ permissions_ok: boolean }>(
+            buildPermissionContractSql(role),
+          );
+          return result.rows[0]?.permissions_ok === true;
+        } finally {
+          await client.query("RESET ROLE").catch(() => undefined);
+          client.release();
+        }
+      };
+      const driftRequiredTableGrant = async (
+        role: "atlas_web" | "atlas_worker",
+        privilege: "SELECT" | "INSERT",
+        relation: string,
+      ) => {
+        await pool.query(`REVOKE ${privilege} ON ${relation} FROM ${role}`);
+        await expect(readiness(role), `${role} ${privilege} ${relation}`).resolves.toBe(false);
+        await pool.query(`GRANT ${privilege} ON ${relation} TO ${role}`);
+      };
+      const driftRequiredColumnGrant = async (
+        role: "atlas_web" | "atlas_worker",
+        relation: string,
+        column: string,
+      ) => {
+        await pool.query(`REVOKE UPDATE (${column}) ON ${relation} FROM ${role}`);
+        await expect(readiness(role), `${role} UPDATE ${relation}.${column}`).resolves.toBe(false);
+        await pool.query(`GRANT UPDATE (${column}) ON ${relation} TO ${role}`);
+      };
+
+      for (const relation of [
+        "organizations",
+        "users",
+        "actors",
+        "organization_memberships",
+        "api_idempotency_keys",
+      ]) {
+        await driftRequiredTableGrant("atlas_web", "SELECT", relation);
+      }
+      for (const relation of [
+        "users",
+        "actors",
+        "organization_memberships",
+        "audit_events",
+        "outbox_events",
+        "api_idempotency_keys",
+      ]) {
+        await driftRequiredTableGrant("atlas_web", "INSERT", relation);
+      }
+      for (const [relation, columns] of Object.entries(webUpdateColumns)) {
+        for (const column of columns) {
+          await driftRequiredColumnGrant("atlas_web", relation, column);
+        }
+      }
+      await driftRequiredTableGrant("atlas_worker", "SELECT", "outbox_events");
+      for (const column of workerUpdateColumns.outbox_events) {
+        await driftRequiredColumnGrant("atlas_worker", "outbox_events", column);
+      }
+
+      for (const statement of [
+        "GRANT SELECT ON schema_migrations TO atlas_web",
+        "GRANT UPDATE (action) ON audit_events TO atlas_web",
+        "GRANT UPDATE (payload) ON outbox_events TO atlas_web",
+      ]) {
+        await pool.query(statement);
+        await expect(readiness("atlas_web"), statement).resolves.toBe(false);
+        await pool.query(statement.replace("GRANT", "REVOKE").replace(" TO ", " FROM "));
+      }
+      for (const statement of [
+        "GRANT SELECT ON audit_events TO atlas_worker",
+        "GRANT UPDATE (payload) ON outbox_events TO atlas_worker",
+        "GRANT UPDATE (organization_id) ON outbox_events TO atlas_worker",
+      ]) {
+        await pool.query(statement);
+        await expect(readiness("atlas_worker"), statement).resolves.toBe(false);
+        await pool.query(statement.replace("GRANT", "REVOKE").replace(" TO ", " FROM "));
+      }
+      await expect(readiness("atlas_web")).resolves.toBe(true);
+      await expect(readiness("atlas_worker")).resolves.toBe(true);
+    });
+  });
+
   it("narrows worker outbox updates to worker-managed columns in an additive migration", async () => {
     const migration = await source("db/migrations/0004_worker_outbox_permissions.sql");
     expect(migration).toContain("REVOKE UPDATE ON outbox_events FROM atlas_worker");
