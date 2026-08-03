@@ -172,6 +172,32 @@ paths:
           $ref: "#/components/responses/ApiError"
         4XX:
           $ref: "#/components/responses/ApiError"
+  /ready:
+    get:
+      operationId: getReadiness
+      summary: Get API readiness
+      description: >-
+        Proves the web process can reach PostgreSQL through the expected
+        least-privilege role and permission contract. The response identifies
+        the exact release commit without exposing database details.
+      tags: [System]
+      security: []
+      parameters:
+        - $ref: "#/components/parameters/RequestId"
+      responses:
+        "200":
+          description: The exact Atlas release and database contract are ready.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReadinessResponse"
+        "503":
+          $ref: "#/components/responses/ApiError"
+        4XX:
+          $ref: "#/components/responses/ApiError"
   /me:
     get:
       operationId: getCurrentActor
@@ -236,6 +262,8 @@ paths:
                   actor:
                     $ref: "#/components/schemas/ActorContext"
         "400":
+          $ref: "#/components/responses/ApiError"
+        "413":
           $ref: "#/components/responses/ApiError"
         "401":
           $ref: "#/components/responses/ApiError"
@@ -316,6 +344,8 @@ paths:
                 $ref: "#/components/schemas/OrganizationResponse"
         "400":
           $ref: "#/components/responses/ApiError"
+        "413":
+          $ref: "#/components/responses/ApiError"
         "401":
           $ref: "#/components/responses/ApiError"
         "403":
@@ -393,6 +423,26 @@ components:
         apiVersion:
           type: string
           const: v2
+    ReadinessResponse:
+      type: object
+      additionalProperties: false
+      required: [status, service, apiVersion, contractVersion, release]
+      properties:
+        status:
+          type: string
+          const: ready
+        service:
+          type: string
+          const: atlas-web
+        apiVersion:
+          type: string
+          const: v2
+        contractVersion:
+          type: string
+          const: atlas-v2-foundation-v1
+        release:
+          type: string
+          pattern: "^[0-9a-f]{40}$"
     LocalLoginRequest:
       type: object
       additionalProperties: false
@@ -482,6 +532,8 @@ components:
                 - NOT_FOUND
                 - CONFLICT
                 - RATE_LIMITED
+                - PAYLOAD_TOO_LARGE
+                - SERVICE_UNAVAILABLE
                 - INTERNAL_ERROR
             message:
               type: string

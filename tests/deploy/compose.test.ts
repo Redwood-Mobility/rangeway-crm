@@ -85,7 +85,8 @@ describe.skipIf(!hasDockerCompose)("resolved Docker Compose topology", () => {
     expect(compose.services.web.depends_on).toMatchObject({ db: { condition: "service_healthy" } });
     expect(compose.services.worker.depends_on).toMatchObject({ db: { condition: "service_healthy" } });
     expect(compose.services.migrator.depends_on).toMatchObject({ db: { condition: "service_healthy" } });
-    expect(commandIncludes((compose.services.web.healthcheck as { test?: unknown }).test, "/api/v2/health")).toBe(true);
+    expect(commandIncludes((compose.services.web.healthcheck as { test?: unknown }).test, "/api/v2/ready")).toBe(true);
+    expect(commandIncludes((compose.services.worker.healthcheck as { test?: unknown }).test, "readiness.js")).toBe(true);
   });
 
   it("declares only V2 data and Caddy state volumes", () => {
@@ -136,7 +137,8 @@ describe("deterministic deployment source contract", () => {
     expect(composeSource.match(/atlas-artifacts:\/app\/artifacts/g)).toHaveLength(2);
     expect(composeSource.match(/condition: service_healthy/g)?.length).toBeGreaterThanOrEqual(3);
     expect(composeSource).toContain("pg_isready");
-    expect(composeSource).toContain("/api/v2/health");
+    expect(composeSource).toContain("/api/v2/ready");
+    expect(composeSource).toContain("dist/worker/readiness.js");
   });
 
   it("never names or declares either preserved V1 application volume", () => {
@@ -210,11 +212,13 @@ describe("deterministic deployment source contract", () => {
     expect(caddyfile).toContain("reverse_proxy web:8080");
     expect(caddyfile).toContain("Strict-Transport-Security");
     expect(caddyfile).toContain("X-Content-Type-Options");
+    expect(caddyfile).toContain("/api/v2/health /api/v2/ready");
+    expect(caddyfile).toContain('Cache-Control "no-store"');
   });
 
   it("backs up before replacement and verifies migration, startup, and live V2 health", () => {
-    const backupPosition = deployScript.indexOf("deploy/backup.sh");
-    const restorePosition = deployScript.indexOf("deploy/restore-test.sh");
+    const backupPosition = deployScript.indexOf('guard "${DEPLOYMENT_TOKEN}" prepared backup');
+    const restorePosition = deployScript.indexOf('guard "${DEPLOYMENT_TOKEN}" prepared restore-backup');
     const syncPosition = deployScript.indexOf('rsync "${RSYNC_TREE_ARGS[@]}"');
     expect(backupPosition).toBeGreaterThan(0);
     expect(restorePosition).toBeGreaterThan(backupPosition);
@@ -224,12 +228,20 @@ describe("deterministic deployment source contract", () => {
     expect(deployScript).toContain("npm run typecheck");
     expect(deployScript).toContain("npm run build");
     expect(deployScript).toContain("@redocly/cli lint openapi/atlas-v2.yaml");
-    expect(deployScript).toContain("docker compose up -d db");
-    expect(deployScript).toContain("docker compose exec -T db /docker-entrypoint-initdb.d/001-atlas-roles.sh");
-    expect(deployScript).toContain("docker compose --profile operations run --rm migrator");
-    expect(deployScript).toContain("docker compose up -d web worker caddy");
-    expect(deployScript).toContain("https://atlas.rangeway.app/api/v2/health");
-    expect(deployScript).toContain("apiVersion");
+    expect(deploymentCoordinator).toContain("deploy/backup.sh");
+    expect(deploymentCoordinator).toContain("deploy/restore-test.sh");
+    expect(deploymentCoordinator).toContain("docker compose up -d db");
+    expect(deploymentCoordinator).toContain("docker compose exec -T db /docker-entrypoint-initdb.d/001-atlas-roles.sh");
+    expect(deploymentCoordinator).toContain("docker compose --profile operations run --rm migrator");
+    expect(deploymentCoordinator).toContain("docker compose up -d web worker caddy");
+    expect(deploymentCoordinator.indexOf("docker compose build web worker")).toBeLessThan(
+      deploymentCoordinator.indexOf("docker compose run --rm --no-deps web"),
+    );
+    expect(deployScript).toContain("https://atlas.rangeway.app/api/v2/ready");
+    expect(deployScript).toContain("contractVersion");
+    expect(deployScript).toContain("LOCAL_COMMIT");
+    expect(deployScript).toMatch(/worker.*healthy|healthy.*worker/s);
+    expect(deployScript).toContain("verify-contract");
     expect(deployScript).toContain("PREVIOUS_COMMIT");
     expect(deployScript).not.toMatch(/git reset|git checkout|docker volume rm|docker compose down -v/);
   });
@@ -243,10 +255,15 @@ describe("deterministic deployment source contract", () => {
     expect(deploymentCoordinator).toContain("flock -n 9");
     expect(deploymentCoordinator).toContain('status="failed_closed"');
     expect(deploymentCoordinator).toContain("restore_exact_writers");
+    expect(deploymentCoordinator).toContain("for service in web worker migrator");
+    expect(deploymentCoordinator).toContain('label=com.docker.compose.service=${service}');
+    expect(deploymentCoordinator).toContain('label=com.docker.compose.project=${COMPOSE_PROJECT}');
+    expect(deploymentCoordinator).toContain('COMPOSE_PROJECT="atlas-v2"');
+    expect(deploymentCoordinator).not.toMatch(/docker (?:rm|container rm)|docker compose down/);
     expect(deploymentGuardianUnit).toContain("WantedBy=multi-user.target");
     expect(deploymentGuardianUnit).toContain("Restart=on-failure");
     expect(deployScript.indexOf("quiesced boundary")).toBeLessThan(
-      deployScript.indexOf("001-atlas-roles.sh"),
+      deployScript.indexOf('guard "${DEPLOYMENT_TOKEN}" boundary rotate-roles'),
     );
   });
 

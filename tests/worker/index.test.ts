@@ -124,6 +124,8 @@ describe("outbox worker entrypoint lifecycle", () => {
     "postgresql://atlas_worker:safe-password-0123456789@db:5432/postgres",
     "postgresql://atlas_worker:too-short@db:5432/atlas",
     "postgresql://atlas_worker:p%40ssword@db:5432/atlas",
+    "postgresql://atlas_worker:safe-password-0123456789@db/atlas",
+    "postgresql://atlas_worker:safe-password-0123456789@db:6432/atlas",
   ])("rejects an unsafe production worker database URL without exposing it", (databaseUrl) => {
     expect(() =>
       parseWorkerConfig({ NODE_ENV: "production", DATABASE_URL: databaseUrl }),

@@ -7,6 +7,7 @@ UNIT_NAME="atlas-v2-deployment-guardian.service"
 STATE_ROOT="/var/lib/atlas-v2-deployment"
 CONFIG_FILE="/etc/atlas-v2-deployment-guardian.conf"
 GLOBAL_LOCK="/run/lock/atlas-v2-deployment.lock"
+COMPOSE_PROJECT="atlas-v2"
 
 if [[ "${ATLAS_COORDINATOR_TEST_MODE:-0}" == "1" ]]; then
   STATE_ROOT="${ATLAS_COORDINATOR_STATE_ROOT:-${STATE_ROOT}}"
@@ -48,6 +49,79 @@ valid_path() {
 
 path_is_equal_or_descendant() {
   [[ "$1" == "$2" || "$1" == "$2/"* ]]
+}
+
+durable_publish() {
+  local destination="$1"
+  local mode="$2"
+  python3 -c '
+import os
+import secrets
+import sys
+
+destination, mode_text, fault = sys.argv[1:4]
+directory = os.path.dirname(destination)
+basename = os.path.basename(destination)
+temporary = os.path.join(directory, f".{basename}.tmp.{os.getpid()}.{secrets.token_hex(8)}")
+flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+if hasattr(os, "O_NOFOLLOW"):
+    flags |= os.O_NOFOLLOW
+file_descriptor = None
+try:
+    file_descriptor = os.open(temporary, flags, int(mode_text, 8))
+    data = sys.stdin.buffer.read()
+    view = memoryview(data)
+    while view:
+        written = os.write(file_descriptor, view)
+        view = view[written:]
+    os.fchmod(file_descriptor, int(mode_text, 8))
+    os.fsync(file_descriptor)
+    if fault == "after-file-fsync":
+        os._exit(86)
+    os.close(file_descriptor)
+    file_descriptor = None
+    os.replace(temporary, destination)
+    if fault == "after-rename":
+        os._exit(87)
+    directory_descriptor = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(directory_descriptor)
+    finally:
+        os.close(directory_descriptor)
+except BaseException:
+    if file_descriptor is not None:
+        os.close(file_descriptor)
+    try:
+        os.unlink(temporary)
+    except FileNotFoundError:
+        pass
+    raise
+' "${destination}" "${mode}" "${ATLAS_COORDINATOR_FAULT:-}"
+}
+
+durable_move() {
+  local source="$1"
+  local destination="$2"
+  python3 -c '
+import os
+import sys
+
+source, destination = sys.argv[1:3]
+if os.path.exists(destination):
+    raise FileExistsError(destination)
+source_descriptor = os.open(source, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+try:
+    os.fsync(source_descriptor)
+finally:
+    os.close(source_descriptor)
+os.replace(source, destination)
+for directory in dict.fromkeys((os.path.dirname(source), os.path.dirname(destination))):
+    directory_descriptor = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(directory_descriptor)
+    finally:
+        os.close(directory_descriptor)
+' "${source}" "${destination}"
 }
 
 prepare_state_root() {
@@ -119,7 +193,6 @@ read_state() {
 
 write_state() {
   local destination="${1:-${ACTIVE_STATE}}"
-  local temporary="${destination}.tmp.$$"
   umask 077
   {
     printf 'token=%s\n' "${token}"
@@ -134,18 +207,13 @@ write_state() {
     printf 'deadline_epoch=%s\n' "${deadline_epoch}"
     printf 'guardian_ack_token=%s\n' "${guardian_ack_token}"
     printf 'release_commit=%s\n' "${release_commit}"
-  } > "${temporary}"
-  chmod 0600 "${temporary}"
-  mv -f -- "${temporary}" "${destination}"
+  } | durable_publish "${destination}" 0600
 }
 
 write_config() {
-  local temporary="${CONFIG_FILE}.tmp.$$"
   umask 077
   mkdir -p -- "$(dirname -- "${CONFIG_FILE}")"
-  printf 'REMOTE_DIR=%s\n' "${remote_dir}" > "${temporary}"
-  chmod 0600 "${temporary}"
-  mv -f -- "${temporary}" "${CONFIG_FILE}"
+  printf 'REMOTE_DIR=%s\n' "${remote_dir}" | durable_publish "${CONFIG_FILE}" 0600
 }
 
 configured_remote_dir() {
@@ -160,12 +228,31 @@ configured_remote_dir() {
 
 stop_all_writers() {
   local target="$1"
+  local service snapshot line container project_label service_label extra
+  local -a containers=()
   valid_path "${target}" || return 1
-  (cd -- "${target}" && docker compose stop web worker)
+  for service in web worker migrator; do
+    snapshot="$(docker ps \
+      --filter "label=com.docker.compose.project=${COMPOSE_PROJECT}" \
+      --filter "label=com.docker.compose.service=${service}" \
+      --format '{{.ID}}|{{.Label "com.docker.compose.project"}}|{{.Label "com.docker.compose.service"}}')"
+    while IFS= read -r line; do
+      [[ -n "${line}" ]] || continue
+      IFS='|' read -r container project_label service_label extra <<< "${line}"
+      [[ "${container}" =~ ^[A-Za-z0-9_.-]+$ ]] || return 1
+      [[ "${project_label}" == "${COMPOSE_PROJECT}" && "${service_label}" == "${service}" ]] || return 1
+      [[ -z "${extra:-}" && "${line}" == *"|"*"|"* ]] || return 1
+      containers+=("${container}")
+    done <<< "${snapshot}"
+  done
+  if [[ "${#containers[@]}" -gt 0 ]]; then
+    docker stop -- "${containers[@]}" >/dev/null
+  fi
 }
 
 restore_exact_writers() {
   local failed=0
+  stop_all_writers "${remote_dir}" || failed=1
   if [[ "${worker_container}" != "none" ]]; then
     docker start "${worker_container}" >/dev/null || failed=1
   fi
@@ -176,14 +263,15 @@ restore_exact_writers() {
 }
 
 snapshot_writers() {
-  local snapshot line service state container
+  local snapshot line service state container extra
   web_container="none"
   worker_container="none"
   snapshot="$(cd -- "${remote_dir}" && docker compose ps --all --format '{{.Service}}|{{.State}}|{{.ID}}')"
   while IFS= read -r line; do
     [[ -n "${line}" ]] || continue
-    IFS='|' read -r service state container <<< "${line}"
-    [[ -n "${service}" && -n "${state}" && -n "${container}" && "${line}" != *"|"*"|"*"|"* ]] \
+    IFS='|' read -r service state container extra <<< "${line}"
+    [[ -n "${service}" && -n "${state}" && -n "${container}" && -z "${extra:-}" \
+      && "${line}" == *"|"*"|"* ]] \
       || die "writer snapshot was malformed."
     [[ "${container}" =~ ^[A-Za-z0-9_.-]+$ ]] || die "writer snapshot contained an invalid container ID."
     case "${state}" in
@@ -211,7 +299,7 @@ read_release_commit() {
 
 archive_stale_state() {
   local suffix="$1"
-  mv -- "${ACTIVE_STATE}" "${HISTORY_ROOT}/${token}.${suffix}.state"
+  durable_move "${ACTIVE_STATE}" "${HISTORY_ROOT}/${token}.${suffix}.state"
 }
 
 begin_deployment() {
@@ -306,6 +394,7 @@ mutate_state() {
   current_now="$(now_epoch)"
   case "${operation}" in
     transition)
+      [[ "${deadline_epoch}" -gt "${current_now}" ]] || die "deployment ownership lease expired."
       [[ "${status}" == "${expected}" ]] || die "expected deployment state ${expected}, found ${status}."
       case "${expected}:${replacement}" in
         prepared:quiesced|quiesced:boundary) ;;
@@ -315,15 +404,27 @@ mutate_state() {
       deadline_epoch="$((current_now + lease_seconds))"
       ;;
     renew)
+      [[ "${deadline_epoch}" -gt "${current_now}" ]] || die "deployment ownership lease expired."
+      [[ -z "${expected}" || "${status}" == "${expected}" ]] \
+        || die "expected deployment state ${expected}, found ${status}."
       case "${status}" in prepared|quiesced|boundary) ;; *) die "deployment lease cannot be renewed in ${status}." ;; esac
       deadline_epoch="$((current_now + lease_seconds))"
       ;;
     annotate)
+      [[ "${deadline_epoch}" -gt "${current_now}" ]] || die "deployment ownership lease expired."
       valid_commit "${expected}" || die "previous release commit is invalid."
       valid_path "${replacement}" || die "exact backup path is invalid."
       path_is_equal_or_descendant "${replacement}" "${backup_root}" || die "exact backup is outside the backup root."
       previous_commit="${expected}"
       exact_backup="${replacement}"
+      deadline_epoch="$((current_now + lease_seconds))"
+      ;;
+    candidate)
+      [[ "${deadline_epoch}" -gt "${current_now}" ]] || die "deployment ownership lease expired."
+      [[ "${status}" == "quiesced" ]] || die "release candidate can only be recorded while quiesced."
+      valid_commit "${expected}" || die "release candidate commit is invalid."
+      [[ "${expected}" != "none" ]] || die "release candidate commit is required."
+      release_commit="${expected}"
       deadline_epoch="$((current_now + lease_seconds))"
       ;;
     fail)
@@ -334,6 +435,225 @@ mutate_state() {
   esac
   write_state
   flock -u 8
+}
+
+assert_deployment() {
+  local requested_token="$1"
+  local expected_status="$2"
+  local current_now
+  prepare_state_root
+  exec 8>"${STATE_LOCK}"
+  flock -x 8
+  read_state || die "active deployment state is missing or malformed."
+  [[ "${token}" == "${requested_token}" ]] || die "deployment ownership token does not match."
+  [[ "${status}" == "${expected_status}" ]] \
+    || die "expected deployment state ${expected_status}, found ${status}."
+  current_now="$(now_epoch)"
+  [[ "${deadline_epoch}" -gt "${current_now}" ]] || die "deployment ownership lease expired."
+  flock -u 8
+}
+
+run_guarded_action_command() {
+  local action="$1"
+  case "${action}" in
+    backup)
+      local backup_output backup_path backup_file
+      backup_path="none"
+      if docker volume inspect atlas-db >/dev/null 2>&1; then
+        [[ -x deploy/backup.sh ]] || die "existing Atlas V2 database found, but backup.sh is unavailable."
+        grep -Fxq 'ATLAS_BACKUP_FORMAT="atlas-v2-postgres-artifacts-v1"' deploy/backup.sh \
+          || die "existing database backup tool has an unsupported format."
+        backup_output="$(BACKUP_ROOT="${backup_root}" COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT}" \
+          ATLAS_GIT_COMMIT="${previous_commit}" ATLAS_KEEP_QUIESCED=1 ./deploy/backup.sh)"
+        [[ "$(printf '%s\n' "${backup_output}" | wc -l | tr -d '[:space:]')" == "1" ]] \
+          || die "backup script did not emit exactly one machine-readable path."
+        case "${backup_output}" in
+          ATLAS_BACKUP_PATH=*) backup_path="${backup_output#ATLAS_BACKUP_PATH=}" ;;
+          *) die "backup script did not emit ATLAS_BACKUP_PATH." ;;
+        esac
+        backup_path="$(realpath -m -- "${backup_path}")"
+        path_is_equal_or_descendant "${backup_path}" "${backup_root}" \
+          || die "backup escaped its configured root."
+        for backup_file in atlas-postgres.dump atlas-artifacts.tgz metadata.txt manifest.sha256; do
+          [[ -s "${backup_path}/${backup_file}" ]] || die "exact backup is incomplete: ${backup_file}."
+        done
+        (cd -- "${backup_path}" && sha256sum --check manifest.sha256) >&2
+      else
+        stop_all_writers "${remote_dir}"
+      fi
+      printf 'EXACT_BACKUP=%s\n' "${backup_path}"
+      ;;
+    restore-backup)
+      [[ "${exact_backup}" != "none" ]] || die "exact backup is required for restore testing."
+      [[ -x deploy/restore-test.sh ]] || die "non-destructive restore test is unavailable."
+      ./deploy/restore-test.sh "${exact_backup}"
+      ;;
+    build-db)
+      docker compose config >/dev/null
+      docker compose build web worker
+      docker compose run --rm --no-deps web node --input-type=module -e \
+        "import('./dist/server/config.js')"
+      docker compose run --rm --no-deps worker node --input-type=module -e \
+        "import('./dist/worker/config.js').then(({parseWorkerConfig}) => parseWorkerConfig(process.env))"
+      docker compose run --rm --no-deps migrator node --input-type=module -e \
+        "import('./dist/server/platform/db/migrate.js').then(({readMigrationDatabaseUrl}) => readMigrationDatabaseUrl(process.env))"
+      docker compose up -d db
+      local db_container db_health
+      db_container="$(docker compose ps -q db)"
+      [[ -n "${db_container}" ]] || die "Atlas V2 database container did not start."
+      for _attempt in $(seq 1 60); do
+        db_health="$(docker inspect --format '{{.State.Health.Status}}' "${db_container}")"
+        [[ "${db_health}" == "healthy" ]] && break
+        [[ "${db_health}" != "unhealthy" ]] || {
+          docker compose logs db >&2
+          return 1
+        }
+        /bin/sleep 2
+      done
+      [[ "$(docker inspect --format '{{.State.Health.Status}}' "${db_container}")" == "healthy" ]] || {
+        echo "Atlas V2 database did not become healthy." >&2
+        docker compose logs db >&2
+        return 1
+      }
+      ;;
+    rotate-roles)
+      docker compose exec -T db /docker-entrypoint-initdb.d/001-atlas-roles.sh
+      ;;
+    migrate)
+      docker compose --profile operations run --rm migrator
+      ;;
+    start-writers)
+      docker compose up -d web worker caddy
+      docker compose up -d --wait --wait-timeout 180
+      docker compose ps
+      ;;
+    verify-contract)
+      docker compose exec -T db psql --username=atlas --dbname=atlas \
+        --variable=ON_ERROR_STOP=1 --tuples-only --no-align <<'SQL'
+DO $contract$
+BEGIN
+  IF EXISTS (
+    SELECT 1
+      FROM pg_class c
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+      JOIN pg_roles r ON r.oid = c.relowner
+     WHERE n.nspname = 'public'
+       AND c.relname = ANY (ARRAY[
+         'schema_migrations', 'organizations', 'users', 'actors',
+         'organization_memberships', 'audit_events', 'outbox_events',
+         'api_idempotency_keys'
+       ])
+       AND r.rolname <> 'atlas_migrator'
+  ) THEN
+    RAISE EXCEPTION 'Atlas migration-managed relation ownership contract failed';
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1
+      FROM pg_proc p
+      JOIN pg_namespace n ON n.oid = p.pronamespace
+      JOIN pg_roles r ON r.oid = p.proowner
+     WHERE n.nspname = 'public'
+       AND p.proname = 'atlas_reject_audit_mutation'
+       AND r.rolname = 'atlas_migrator'
+  ) THEN
+    RAISE EXCEPTION 'Atlas audit guard ownership contract failed';
+  END IF;
+  IF NOT (
+    has_table_privilege('atlas_web', 'public.organizations', 'SELECT')
+    AND has_table_privilege('atlas_web', 'public.audit_events', 'INSERT')
+    AND NOT has_table_privilege('atlas_web', 'public.schema_migrations', 'SELECT')
+    AND has_table_privilege('atlas_worker', 'public.outbox_events', 'SELECT')
+    AND has_column_privilege('atlas_worker', 'public.outbox_events', 'attempt_count', 'UPDATE')
+    AND NOT has_column_privilege('atlas_worker', 'public.outbox_events', 'payload', 'UPDATE')
+  ) THEN
+    RAISE EXCEPTION 'Atlas application role permission contract failed';
+  END IF;
+END
+$contract$;
+SELECT 'atlas-v2-foundation-v1';
+SQL
+      ;;
+    *) die "guarded deployment action is invalid." ;;
+  esac
+}
+
+guard_deployment_action() {
+  local requested_token="$1"
+  local expected_status="$2"
+  local action="$3"
+  local required_status current_now child_pid heartbeat_pid action_status heartbeat_interval
+  case "${action}" in
+    backup|restore-backup) required_status="prepared" ;;
+    build-db) required_status="quiesced" ;;
+    rotate-roles|migrate|start-writers|verify-contract) required_status="boundary" ;;
+    *) die "guarded deployment action is invalid." ;;
+  esac
+  [[ "${expected_status}" == "${required_status}" ]] \
+    || die "guarded deployment action has an invalid phase."
+
+  prepare_state_root
+  exec 8>"${STATE_LOCK}"
+  flock -x 8
+  read_state || die "active deployment state is missing or malformed."
+  [[ "${token}" == "${requested_token}" ]] || die "deployment ownership token does not match."
+  [[ "${status}" == "${expected_status}" ]] \
+    || die "expected deployment state ${expected_status}, found ${status}."
+  current_now="$(now_epoch)"
+  [[ "${deadline_epoch}" -gt "${current_now}" ]] || die "deployment ownership lease expired."
+  deadline_epoch="$((current_now + lease_seconds))"
+  write_state
+
+  (
+    cd -- "${remote_dir}"
+    if [[ "${release_commit}" != "none" ]]; then
+      export ATLAS_IMAGE_TAG="${release_commit}"
+      export ATLAS_RELEASE_SHA="${release_commit}"
+    fi
+    run_guarded_action_command "${action}"
+  ) &
+  child_pid="$!"
+  flock -u 8
+
+  # One-second heartbeats keep the kill/wait path bounded even for the maximum
+  # 15-minute lease and leave ample margin for the minimum two-second lease.
+  if [[ "${ATLAS_COORDINATOR_TEST_MODE:-0}" == "1" ]]; then
+    heartbeat_interval=0.05
+  else
+    heartbeat_interval=1
+  fi
+  (
+    while /bin/sleep "${heartbeat_interval}"; do
+      kill -0 "${child_pid}" 2>/dev/null || exit 0
+      exec 7>"${STATE_LOCK}"
+      flock -x 7
+      if ! read_state \
+        || [[ "${token}" != "${requested_token}" ]] \
+        || [[ "${status}" != "${expected_status}" ]]; then
+        flock -u 7
+        kill -TERM "${child_pid}" 2>/dev/null || true
+        exit 1
+      fi
+      current_now="$(now_epoch)"
+      if [[ "${deadline_epoch}" -le "${current_now}" ]]; then
+        flock -u 7
+        kill -TERM "${child_pid}" 2>/dev/null || true
+        exit 1
+      fi
+      deadline_epoch="$((current_now + lease_seconds))"
+      write_state
+      flock -u 7
+    done
+  ) &
+  heartbeat_pid="$!"
+
+  set +e
+  wait "${child_pid}"
+  action_status="$?"
+  kill -TERM "${heartbeat_pid}" 2>/dev/null || true
+  wait "${heartbeat_pid}" 2>/dev/null || true
+  set -e
+  assert_deployment "${requested_token}" "${expected_status}"
+  return "${action_status}"
 }
 
 reconcile_once() {
@@ -425,7 +745,7 @@ guardian_loop() {
 complete_deployment() {
   local requested_token="$1"
   local requested_commit="$2"
-  local release_temporary
+  local current_now
   valid_commit "${requested_commit}" || die "release commit is invalid."
   [[ "${requested_commit}" != "none" ]] || die "release commit is required."
   prepare_state_root
@@ -434,23 +754,23 @@ complete_deployment() {
   read_state || die "active deployment state is missing or malformed."
   [[ "${token}" == "${requested_token}" ]] || die "deployment ownership token does not match."
   [[ "${status}" == "boundary" ]] || die "only a boundary deployment can be completed."
+  [[ "${release_commit}" == "${requested_commit}" ]] || die "release commit does not match the guarded candidate."
+  current_now="$(now_epoch)"
+  [[ "${deadline_epoch}" -gt "${current_now}" ]] || die "deployment ownership lease expired."
 
-  release_temporary="${remote_dir}/.atlas-release.next"
   umask 077
-  printf '%s\n' "${requested_commit}" > "${release_temporary}"
-  chmod 0600 "${release_temporary}"
-  mv -f -- "${release_temporary}" "${remote_dir}/.atlas-release"
+  printf '%s\n' "${requested_commit}" | durable_publish "${remote_dir}/.atlas-release" 0600
 
   release_commit="${requested_commit}"
   status="complete"
   write_state
-  mv -- "${ACTIVE_STATE}" "${HISTORY_ROOT}/${token}.complete.state"
+  durable_move "${ACTIVE_STATE}" "${HISTORY_ROOT}/${token}.complete.state"
   flock -u 8
   systemctl disable --now "${UNIT_NAME}" >/dev/null
 }
 
 usage() {
-  echo "usage: $0 begin|transition|renew|annotate|fail|complete|guardian|guardian-once ..." >&2
+  echo "usage: $0 begin|transition|renew|assert|annotate|candidate|guard|fail|complete|guardian|guardian-once ..." >&2
   exit 64
 }
 
@@ -458,8 +778,11 @@ command="${1:-}"
 case "${command}" in
   begin) [[ "$#" -eq 5 ]] || usage; begin_deployment "$2" "$3" "$4" "$5" ;;
   transition) [[ "$#" -eq 4 ]] || usage; mutate_state "$2" transition "$3" "$4" ;;
-  renew) [[ "$#" -eq 2 ]] || usage; mutate_state "$2" renew ;;
+  renew) [[ "$#" -eq 3 ]] || usage; mutate_state "$2" renew "$3" ;;
+  assert) [[ "$#" -eq 3 ]] || usage; assert_deployment "$2" "$3" ;;
   annotate) [[ "$#" -eq 4 ]] || usage; mutate_state "$2" annotate "$3" "$4" ;;
+  candidate) [[ "$#" -eq 3 ]] || usage; mutate_state "$2" candidate "$3" ;;
+  guard) [[ "$#" -eq 4 ]] || usage; guard_deployment_action "$2" "$3" "$4" ;;
   fail)
     [[ "$#" -eq 2 ]] || usage
     mutate_state "$2" fail

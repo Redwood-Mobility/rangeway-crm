@@ -1,4 +1,5 @@
 import { readFile } from "node:fs/promises";
+import { spawnSync } from "node:child_process";
 import type { Pool } from "pg";
 import { describe, expect, it, type TestContext } from "vitest";
 import { createPool } from "../../src/server/platform/db/client.js";
@@ -81,6 +82,10 @@ describe("least-privilege PostgreSQL roles", () => {
       expect(`${compose}\n${bootstrap}`).toContain(role);
     }
     expect(bootstrap).toContain("ALTER TABLE %I.%I OWNER TO atlas_migrator");
+    expect(bootstrap).toContain("ALTER FUNCTION public.atlas_reject_audit_mutation() OWNER TO atlas_migrator");
+    expect(bootstrap).toContain("CREATE EXTENSION IF NOT EXISTS citext");
+    expect(bootstrap).toContain("CREATE EXTENSION IF NOT EXISTS pgcrypto");
+    expect(bootstrap).toMatch(/citext[\s\S]*pgcrypto[\s\S]*bootstrap-owned|bootstrap-owned[\s\S]*citext[\s\S]*pgcrypto/i);
     for (const variable of [
       "POSTGRES_BOOTSTRAP_PASSWORD",
       "ATLAS_MIGRATOR_PASSWORD",
@@ -90,6 +95,104 @@ describe("least-privilege PostgreSQL roles", () => {
       expect(environment).toContain(`${variable}=REPLACE_WITH_`);
     }
     expect(compose).not.toMatch(/REPLACE_WITH_|correct-horse|rangeway-dev/);
+  });
+
+  it("upgrades a bootstrap-owned 0001-0004 layout through the real role initializer", async (context) => {
+    if (spawnSync("psql", ["--version"], { encoding: "utf8" }).status !== 0) {
+      context.skip("psql is unavailable; equipped ownership-upgrade test skipped.");
+      return;
+    }
+    let temporaryDatabase;
+    try {
+      temporaryDatabase = await createTemporaryDatabase();
+    } catch (error) {
+      if (error instanceof PostgreSqlUnavailableError) {
+        context.skip(error.message);
+        return;
+      }
+      throw error;
+    }
+
+    const databaseUrl = new URL(temporaryDatabase.databaseUrl);
+    if (decodeURIComponent(databaseUrl.username) !== "atlas") {
+      await temporaryDatabase.cleanup();
+      context.skip("Equipped ownership-upgrade test requires the bootstrap atlas role.");
+      return;
+    }
+    const pool = createPool(temporaryDatabase.databaseUrl);
+    try {
+      await runMigrations(pool);
+      const initialized = spawnSync("bash", ["deploy/postgres/init-roles.sh"], {
+        cwd: new URL("../..", import.meta.url),
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          PGHOST: databaseUrl.hostname,
+          PGPORT: databaseUrl.port || "5432",
+          PGPASSWORD: decodeURIComponent(databaseUrl.password),
+          POSTGRES_USER: "atlas",
+          POSTGRES_DB: databaseUrl.pathname.slice(1),
+          POSTGRES_BOOTSTRAP_PASSWORD: "bootstrap-upgrade-password-01",
+          ATLAS_MIGRATOR_PASSWORD: "migrator-upgrade-password-02",
+          ATLAS_WEB_PASSWORD: "web-upgrade-password-000003",
+          ATLAS_WORKER_PASSWORD: "worker-upgrade-password-0004",
+        },
+      });
+      expect(initialized.status, `${initialized.stdout}\n${initialized.stderr}`).toBe(0);
+
+      const ownership = await pool.query<{ object_name: string; owner: string }>(`
+        SELECT c.relname AS object_name, r.rolname AS owner
+          FROM pg_class c
+          JOIN pg_namespace n ON n.oid = c.relnamespace
+          JOIN pg_roles r ON r.oid = c.relowner
+         WHERE n.nspname = 'public'
+           AND c.relname IN ('organizations', 'schema_migrations', 'audit_events')
+        UNION ALL
+        SELECT p.proname, r.rolname
+          FROM pg_proc p
+          JOIN pg_namespace n ON n.oid = p.pronamespace
+          JOIN pg_roles r ON r.oid = p.proowner
+         WHERE n.nspname = 'public' AND p.proname = 'atlas_reject_audit_mutation'
+        ORDER BY object_name
+      `);
+      expect(ownership.rows).toEqual([
+        { object_name: "atlas_reject_audit_mutation", owner: "atlas_migrator" },
+        { object_name: "audit_events", owner: "atlas_migrator" },
+        { object_name: "organizations", owner: "atlas_migrator" },
+        { object_name: "schema_migrations", owner: "atlas_migrator" },
+      ]);
+      const extensions = await pool.query<{ extname: string; owner: string }>(`
+        SELECT e.extname, r.rolname AS owner
+          FROM pg_extension e
+          JOIN pg_roles r ON r.oid = e.extowner
+         WHERE e.extname IN ('citext', 'pgcrypto')
+         ORDER BY e.extname
+      `);
+      expect(extensions.rows).toEqual([
+        { extname: "citext", owner: "atlas" },
+        { extname: "pgcrypto", owner: "atlas" },
+      ]);
+
+      const client = await pool.connect();
+      try {
+        await client.query("SET ROLE atlas_migrator");
+        await client.query("CREATE TABLE future_migration_probe (id integer PRIMARY KEY)");
+        await client.query("CREATE FUNCTION future_migration_probe_fn() RETURNS integer LANGUAGE sql AS 'SELECT 1'");
+        const futureOwner = await client.query<{ owner: string }>(`
+          SELECT r.rolname AS owner
+            FROM pg_class c
+            JOIN pg_roles r ON r.oid = c.relowner
+           WHERE c.relname = 'future_migration_probe'
+        `);
+        expect(futureOwner.rows).toEqual([{ owner: "atlas_migrator" }]);
+      } finally {
+        await client.query("RESET ROLE").catch(() => undefined);
+        client.release();
+      }
+    } finally {
+      await pool.end();
+      await temporaryDatabase.cleanup();
+    }
   });
 
   it("enforces audit append-only and denies application roles schema history access", async (context) => {

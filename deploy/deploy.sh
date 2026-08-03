@@ -5,12 +5,15 @@ REPOSITORY_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 cd "${REPOSITORY_ROOT}"
 
 REMOTE_HOST="${ATLAS_HOST:-}"
-REMOTE_USER="${ATLAS_USER:-root}"
+REMOTE_USER="${ATLAS_USER:-atlas}"
 REMOTE_DIR="${ATLAS_DIR:-/opt/atlas-v2}"
 REMOTE_BACKUP_ROOT="${ATLAS_BACKUP_ROOT:-/var/backups/atlas-v2}"
 ENV_FILE_INPUT="${ATLAS_ENV_FILE:-}"
 SSH_KEY="${ATLAS_SSH_KEY:-}"
 COORDINATOR_PATH="${ATLAS_COORDINATOR_PATH:-/usr/local/sbin/atlas-v2-deployment-coordinator}"
+GUARDIAN_UNIT_PATH="${ATLAS_GUARDIAN_UNIT_PATH:-/etc/systemd/system/atlas-v2-deployment-guardian.service}"
+COORDINATOR_STATE_FILE="${ATLAS_COORDINATOR_STATE_FILE:-/var/lib/atlas-v2-deployment/active.state}"
+COORDINATOR_STAGE="${ATLAS_COORDINATOR_STAGE:-/opt/atlas-v2/.atlas-coordinator-staging}"
 LEASE_SECONDS="${ATLAS_DEPLOYMENT_LEASE_SECONDS:-900}"
 SSH_OPTS=(-o BatchMode=yes -o StrictHostKeyChecking=accept-new)
 RSYNC_RSH="ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new"
@@ -37,10 +40,24 @@ path_is_equal_or_descendant() {
 valid_path "${REMOTE_DIR}" || fail "ATLAS_DIR must be a canonical absolute path with supported characters."
 valid_path "${REMOTE_BACKUP_ROOT}" || fail "ATLAS_BACKUP_ROOT must be a canonical absolute path with supported characters."
 valid_path "${COORDINATOR_PATH}" || fail "ATLAS_COORDINATOR_PATH must be a canonical absolute path."
+valid_path "${GUARDIAN_UNIT_PATH}" || fail "ATLAS_GUARDIAN_UNIT_PATH must be a canonical absolute path."
+valid_path "${COORDINATOR_STATE_FILE}" || fail "ATLAS_COORDINATOR_STATE_FILE must be a canonical absolute path."
+valid_path "${COORDINATOR_STAGE}" || fail "ATLAS_COORDINATOR_STAGE must be a canonical absolute path."
 path_is_equal_or_descendant "${REMOTE_BACKUP_ROOT}" "${REMOTE_DIR}" \
   && fail "ATLAS_BACKUP_ROOT must be outside the synchronized ATLAS_DIR tree."
 [[ "${LEASE_SECONDS}" =~ ^[0-9]+$ && "${LEASE_SECONDS}" -ge 2 && "${LEASE_SECONDS}" -le 900 ]] \
   || fail "ATLAS_DEPLOYMENT_LEASE_SECONDS must be between 2 and 900 seconds."
+if [[ "${ATLAS_COORDINATOR_TEST_MODE:-0}" != "1" ]]; then
+  [[ "${REMOTE_USER}" == "atlas" ]] || fail "ATLAS_USER must be the dedicated atlas deploy operator."
+  [[ "${REMOTE_DIR}" == "/opt/atlas-v2" ]] || fail "ATLAS_DIR must be /opt/atlas-v2 for the supported operator model."
+  [[ "${REMOTE_BACKUP_ROOT}" == "/var/backups/atlas-v2" ]] || fail "ATLAS_BACKUP_ROOT must be /var/backups/atlas-v2 for the supported operator model."
+  [[ "${COORDINATOR_PATH}" == "/usr/local/sbin/atlas-v2-deployment-coordinator" ]] \
+    || fail "ATLAS_COORDINATOR_PATH must use the bootstrap-installed coordinator."
+  [[ "${GUARDIAN_UNIT_PATH}" == "/etc/systemd/system/atlas-v2-deployment-guardian.service" ]] \
+    || fail "ATLAS_GUARDIAN_UNIT_PATH must use the bootstrap-installed unit."
+  [[ "${COORDINATOR_STAGE}" == "/opt/atlas-v2/.atlas-coordinator-staging" ]] \
+    || fail "ATLAS_COORDINATOR_STAGE must use the bootstrap-owned staging directory."
+fi
 
 [[ -n "${ENV_FILE_INPUT}" ]] || fail "set ATLAS_ENV_FILE to the production environment file."
 [[ -f "${ENV_FILE_INPUT}" ]] || fail "production environment file is not a regular file: ${ENV_FILE_INPUT}"
@@ -133,6 +150,130 @@ REMOTE_TARGET="${REMOTE_USER}@${REMOTE_HOST}"
 DEPLOYMENT_TOKEN="$(node --input-type=module -e 'console.log(crypto.randomUUID())')"
 [[ "${DEPLOYMENT_TOKEN}" =~ ^[0-9a-f-]{36}$ ]] || fail "could not create a deployment token."
 
+COORDINATOR_SOURCE="${REPOSITORY_ROOT}/deploy/deployment-coordinator.sh"
+GUARDIAN_UNIT_SOURCE="${REPOSITORY_ROOT}/deploy/systemd/atlas-v2-deployment-guardian.service"
+[[ -f "${COORDINATOR_SOURCE}" && ! -L "${COORDINATOR_SOURCE}" ]] \
+  || fail "reviewed deployment coordinator source is unavailable."
+[[ -f "${GUARDIAN_UNIT_SOURCE}" && ! -L "${GUARDIAN_UNIT_SOURCE}" ]] \
+  || fail "reviewed deployment guardian unit source is unavailable."
+COORDINATOR_SHA256="$(node --input-type=module -e \
+  'import fs from "node:fs"; import crypto from "node:crypto"; process.stdout.write(crypto.createHash("sha256").update(fs.readFileSync(process.argv[1])).digest("hex"))' \
+  "${COORDINATOR_SOURCE}")"
+GUARDIAN_UNIT_SHA256="$(node --input-type=module -e \
+  'import fs from "node:fs"; import crypto from "node:crypto"; process.stdout.write(crypto.createHash("sha256").update(fs.readFileSync(process.argv[1])).digest("hex"))' \
+  "${GUARDIAN_UNIT_SOURCE}")"
+[[ "${COORDINATOR_SHA256}" =~ ^[0-9a-f]{64}$ && "${GUARDIAN_UNIT_SHA256}" =~ ^[0-9a-f]{64}$ ]] \
+  || fail "could not hash reviewed coordinator assets."
+
+install_verified_coordinator() {
+  ssh "${SSH_OPTS[@]}" "${REMOTE_TARGET}" bash -s -- \
+    "${COORDINATOR_STAGE}" "${ATLAS_COORDINATOR_TEST_MODE:-0}" <<'REMOTE_STAGE'
+set -euo pipefail
+stage="$1"
+test_mode="$2"
+if [[ "${test_mode}" == "1" ]]; then
+  install -d -m 0700 -- "${stage}"
+else
+  [[ "${stage}" == "/opt/atlas-v2/.atlas-coordinator-staging" ]] || exit 1
+  [[ -d "${stage}" && ! -L "${stage}" ]] || exit 1
+  [[ "$(stat -c '%U:%G:%a' "${stage}")" == "atlas:atlas:700" ]] || exit 1
+fi
+REMOTE_STAGE
+
+  rsync -az --chmod=F600 -e "${RSYNC_RSH}" \
+    "${COORDINATOR_SOURCE}" "${GUARDIAN_UNIT_SOURCE}" \
+    "${REMOTE_TARGET}:${COORDINATOR_STAGE}/"
+
+  ssh "${SSH_OPTS[@]}" "${REMOTE_TARGET}" bash -s -- \
+    "${COORDINATOR_STAGE}" "${COORDINATOR_PATH}" "${GUARDIAN_UNIT_PATH}" \
+    "${COORDINATOR_STATE_FILE}" "${COORDINATOR_SHA256}" "${GUARDIAN_UNIT_SHA256}" \
+    "${ATLAS_COORDINATOR_TEST_MODE:-0}" <<'REMOTE_INSTALL'
+set -euo pipefail
+stage="$1"
+coordinator="$2"
+unit="$3"
+state_file="$4"
+expected_coordinator_hash="$5"
+expected_unit_hash="$6"
+test_mode="$7"
+staged_coordinator="${stage}/deployment-coordinator.sh"
+staged_unit="${stage}/atlas-v2-deployment-guardian.service"
+coordinator_next="${coordinator}.next"
+unit_next="${unit}.next"
+
+privileged() {
+  if [[ "${test_mode}" == "1" || "${EUID}" -eq 0 ]]; then
+    "$@"
+  else
+    sudo -n "$@"
+  fi
+}
+
+hash_file() {
+  sha256sum -- "$1" | awk '{print $1}'
+}
+
+[[ -f "${staged_coordinator}" && ! -L "${staged_coordinator}" ]] || exit 1
+[[ -f "${staged_unit}" && ! -L "${staged_unit}" ]] || exit 1
+[[ "$(hash_file "${staged_coordinator}")" == "${expected_coordinator_hash}" ]] \
+  || { echo "Staged Atlas coordinator hash mismatch." >&2; exit 1; }
+[[ "$(hash_file "${staged_unit}")" == "${expected_unit_hash}" ]] \
+  || { echo "Staged Atlas guardian unit hash mismatch." >&2; exit 1; }
+
+installed_matches=0
+if [[ -f "${coordinator}" && ! -L "${coordinator}" && -f "${unit}" && ! -L "${unit}" ]] \
+  && [[ "$(hash_file "${coordinator}")" == "${expected_coordinator_hash}" ]] \
+  && [[ "$(hash_file "${unit}")" == "${expected_unit_hash}" ]]; then
+  if [[ "${test_mode}" == "1" ]] \
+    || [[ "$(stat -c '%U:%G:%a' "${coordinator}")" == "root:root:755" \
+      && "$(stat -c '%U:%G:%a' "${unit}")" == "root:root:644" ]]; then
+    installed_matches=1
+  fi
+fi
+
+if [[ "${installed_matches}" -ne 1 ]]; then
+  if privileged systemctl is-active --quiet atlas-v2-deployment-guardian.service; then
+    echo "Refusing to replace Atlas coordinator bytes while its guardian is active." >&2
+    exit 1
+  fi
+  if [[ "${test_mode}" == "1" && -e "${state_file}" ]]; then
+    echo "Refusing to replace Atlas coordinator bytes while active.state requires resolution." >&2
+    exit 1
+  fi
+  if [[ "${test_mode}" != "1" ]] \
+    && privileged stat -c %F "${state_file}" >/dev/null 2>&1; then
+    echo "Refusing to replace Atlas coordinator bytes while active.state requires resolution." >&2
+    exit 1
+  fi
+  if [[ "${test_mode}" == "1" ]]; then
+    install -m 0755 "${staged_coordinator}" "${coordinator_next}"
+    install -m 0644 "${staged_unit}" "${unit_next}"
+  else
+    privileged install -o root -g root -m 0755 "${staged_coordinator}" "${coordinator_next}"
+    privileged install -o root -g root -m 0644 "${staged_unit}" "${unit_next}"
+  fi
+  [[ "$(hash_file "${coordinator_next}")" == "${expected_coordinator_hash}" ]]
+  [[ "$(hash_file "${unit_next}")" == "${expected_unit_hash}" ]]
+  privileged mv -f -- "${coordinator_next}" "${coordinator}"
+  privileged mv -f -- "${unit_next}" "${unit}"
+fi
+
+[[ "$(hash_file "${coordinator}")" == "${expected_coordinator_hash}" ]]
+[[ "$(hash_file "${unit}")" == "${expected_unit_hash}" ]]
+if [[ "${test_mode}" != "1" ]]; then
+  [[ "$(stat -c '%U:%G:%a' "${coordinator}")" == "root:root:755" ]]
+  [[ "$(stat -c '%U:%G:%a' "${unit}")" == "root:root:644" ]]
+fi
+privileged systemctl daemon-reload
+loaded_unit="$(privileged systemctl cat --no-pager --full atlas-v2-deployment-guardian.service)"
+loaded_hash="$(printf '%s\n' "${loaded_unit}" | sed '1{/^# \/etc\/systemd\/system\/atlas-v2-deployment-guardian\.service$/d;}' | sha256sum | awk '{print $1}')"
+[[ "${loaded_hash}" == "${expected_unit_hash}" ]] \
+  || { echo "Loaded Atlas guardian unit differs from reviewed bytes." >&2; exit 1; }
+REMOTE_INSTALL
+}
+
+install_verified_coordinator
+
 run_coordinator() {
   ssh "${SSH_OPTS[@]}" "${REMOTE_TARGET}" bash -s -- \
     "${COORDINATOR_PATH}" "$@" <<'REMOTE_COORDINATOR'
@@ -210,42 +351,8 @@ trap on_deploy_exit EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-run_remote_backup() {
-  ssh "${SSH_OPTS[@]}" "${REMOTE_TARGET}" bash -s -- \
-    "${REMOTE_DIR}" "${REMOTE_BACKUP_ROOT}" "${PREVIOUS_COMMIT}" <<'REMOTE_BACKUP'
-set -euo pipefail
-remote_dir="$1"
-backup_root="$2"
-previous_commit="$3"
-exact_backup="none"
-cd -- "${remote_dir}"
-
-if docker volume inspect atlas-db >/dev/null 2>&1; then
-  [[ -x deploy/backup.sh ]] || { echo "Existing Atlas V2 database found, but backup.sh is unavailable." >&2; exit 1; }
-  grep -Fxq 'ATLAS_BACKUP_FORMAT="atlas-v2-postgres-artifacts-v1"' deploy/backup.sh \
-    || { echo "Existing database backup tool has an unsupported format." >&2; exit 1; }
-  backup_output="$(BACKUP_ROOT="${backup_root}" COMPOSE_PROJECT_NAME=atlas-v2 \
-    ATLAS_GIT_COMMIT="${previous_commit}" ATLAS_KEEP_QUIESCED=1 ./deploy/backup.sh)"
-  [[ "$(printf '%s\n' "${backup_output}" | wc -l | tr -d '[:space:]')" == "1" ]] \
-    || { echo "Backup script did not emit exactly one machine-readable path." >&2; exit 1; }
-  case "${backup_output}" in
-    ATLAS_BACKUP_PATH=*) exact_backup="${backup_output#ATLAS_BACKUP_PATH=}" ;;
-    *) echo "Backup script did not emit ATLAS_BACKUP_PATH." >&2; exit 1 ;;
-  esac
-  exact_backup="$(realpath -m -- "${exact_backup}")"
-  backup_root="$(realpath -m -- "${backup_root}")"
-  case "${exact_backup}" in "${backup_root}"/*) ;; *) echo "Backup escaped its configured root." >&2; exit 1 ;; esac
-  for backup_file in atlas-postgres.dump atlas-artifacts.tgz metadata.txt manifest.sha256; do
-    [[ -s "${exact_backup}/${backup_file}" ]] || { echo "Exact backup is incomplete: ${backup_file}." >&2; exit 1; }
-  done
-  (cd -- "${exact_backup}" && sha256sum --check manifest.sha256) >&2
-else
-  docker compose stop web worker
-fi
-printf 'EXACT_BACKUP=%s\n' "${exact_backup}"
-REMOTE_BACKUP
-}
-BACKUP_OUTPUT="$(run_remote_backup)"
+run_coordinator assert "${DEPLOYMENT_TOKEN}" prepared
+BACKUP_OUTPUT="$(run_coordinator guard "${DEPLOYMENT_TOKEN}" prepared backup)"
 [[ "$(printf '%s\n' "${BACKUP_OUTPUT}" | wc -l | tr -d '[:space:]')" == "1" ]] \
   || fail "remote backup returned an invalid response."
 case "${BACKUP_OUTPUT}" in
@@ -257,14 +364,7 @@ if [[ "${EXACT_BACKUP}" != "none" ]]; then
   path_is_equal_or_descendant "${EXACT_BACKUP}" "${REMOTE_BACKUP_ROOT}" \
     || fail "remote backup path escaped the configured backup root."
   run_coordinator annotate "${DEPLOYMENT_TOKEN}" "${PREVIOUS_COMMIT}" "${EXACT_BACKUP}"
-  if ! ssh "${SSH_OPTS[@]}" "${REMOTE_TARGET}" bash -s -- \
-    "${REMOTE_DIR}" "${EXACT_BACKUP}" <<'REMOTE_RESTORE_TEST'
-set -euo pipefail
-cd -- "$1"
-[[ -x deploy/restore-test.sh ]] || { echo "Non-destructive restore test is unavailable." >&2; exit 1; }
-./deploy/restore-test.sh "$2"
-REMOTE_RESTORE_TEST
-  then
+  if ! run_coordinator guard "${DEPLOYMENT_TOKEN}" prepared restore-backup; then
     fail "fresh pre-deploy backup failed its non-destructive restore test."
   fi
   echo "Fresh pre-deploy backup passed its non-destructive restore test: ${EXACT_BACKUP}" >&2
@@ -278,6 +378,7 @@ RSYNC_TREE_ARGS=(
   --exclude ".env"
   --exclude ".env.*"
   --exclude ".atlas-release"
+  --exclude ".atlas-coordinator-staging/"
   --exclude "node_modules/"
   --exclude "dist/"
   --exclude "backups/"
@@ -290,47 +391,27 @@ RSYNC_TREE_ARGS=(
 if [[ -n "${ENV_SOURCE_EXCLUDE}" ]]; then
   RSYNC_TREE_ARGS+=(--exclude "${ENV_SOURCE_EXCLUDE}")
 fi
+run_coordinator assert "${DEPLOYMENT_TOKEN}" quiesced
 rsync "${RSYNC_TREE_ARGS[@]}" ./ "${REMOTE_TARGET}:${REMOTE_DIR}/"
-run_coordinator renew "${DEPLOYMENT_TOKEN}"
+run_coordinator renew "${DEPLOYMENT_TOKEN}" quiesced
 
+run_coordinator assert "${DEPLOYMENT_TOKEN}" quiesced
 rsync -az --chmod=F600 -e "${RSYNC_RSH}" \
   "${ENV_FILE}" "${REMOTE_TARGET}:${REMOTE_DIR}/.env"
-run_coordinator renew "${DEPLOYMENT_TOKEN}"
-
-ssh "${SSH_OPTS[@]}" "${REMOTE_TARGET}" bash -s -- "${REMOTE_DIR}" <<'REMOTE_BUILD'
-set -euo pipefail
-cd -- "$1"
-docker compose config >/dev/null
-docker compose build web worker
-docker compose up -d db
-db_container="$(docker compose ps -q db)"
-[[ -n "${db_container}" ]] || { echo "Atlas V2 database container did not start." >&2; exit 1; }
-for _attempt in $(seq 1 60); do
-  db_health="$(docker inspect --format '{{.State.Health.Status}}' "${db_container}")"
-  [[ "${db_health}" == "healthy" ]] && break
-  [[ "${db_health}" != "unhealthy" ]] || { docker compose logs db >&2; exit 1; }
-  sleep 2
-done
-[[ "$(docker inspect --format '{{.State.Health.Status}}' "${db_container}")" == "healthy" ]] \
-  || { echo "Atlas V2 database did not become healthy." >&2; docker compose logs db >&2; exit 1; }
-REMOTE_BUILD
-run_coordinator renew "${DEPLOYMENT_TOKEN}"
+run_coordinator renew "${DEPLOYMENT_TOKEN}" quiesced
+run_coordinator candidate "${DEPLOYMENT_TOKEN}" "${LOCAL_COMMIT}"
+run_coordinator guard "${DEPLOYMENT_TOKEN}" quiesced build-db
 
 # Credentials and schema can become incompatible with the prior release after
 # this exact durable transition. Every later failure remains fail closed.
 run_coordinator transition "${DEPLOYMENT_TOKEN}" quiesced boundary
 BOUNDARY_CROSSED=1
 
-ssh "${SSH_OPTS[@]}" "${REMOTE_TARGET}" bash -s -- "${REMOTE_DIR}" <<'REMOTE_MIGRATE_AND_START'
-set -euo pipefail
-cd -- "$1"
-docker compose exec -T db /docker-entrypoint-initdb.d/001-atlas-roles.sh
-docker compose --profile operations run --rm migrator
-docker compose up -d web worker caddy
-docker compose up -d --wait --wait-timeout 180
-docker compose ps
-REMOTE_MIGRATE_AND_START
-run_coordinator renew "${DEPLOYMENT_TOKEN}"
+run_coordinator guard "${DEPLOYMENT_TOKEN}" boundary rotate-roles
+run_coordinator guard "${DEPLOYMENT_TOKEN}" boundary migrate
+run_coordinator guard "${DEPLOYMENT_TOKEN}" boundary verify-contract
+run_coordinator guard "${DEPLOYMENT_TOKEN}" boundary start-writers
+run_coordinator renew "${DEPLOYMENT_TOKEN}" boundary
 
 TARGET_HEALTH_RESPONSE="$(ssh "${SSH_OPTS[@]}" "${REMOTE_TARGET}" bash -s -- <<'REMOTE_HEALTH'
 set -euo pipefail
@@ -338,23 +419,38 @@ curl --fail --silent --show-error \
   --retry 12 --retry-delay 5 --retry-all-errors --max-time 10 \
   --noproxy '*' \
   --resolve atlas.rangeway.app:443:127.0.0.1 \
-  https://atlas.rangeway.app/api/v2/health
+  https://atlas.rangeway.app/api/v2/ready
 REMOTE_HEALTH
 )"
 HEALTH_JSON="${TARGET_HEALTH_RESPONSE}" node --input-type=module -e '
   const health = JSON.parse(process.env.HEALTH_JSON ?? "null");
-  if (health?.apiVersion !== "v2") throw new Error("Target health was not Atlas V2.");
-'
-run_coordinator renew "${DEPLOYMENT_TOKEN}"
+  if (health?.apiVersion !== "v2" || health?.contractVersion !== "atlas-v2-foundation-v1" || health?.release !== process.argv[1]) {
+    throw new Error("Target readiness did not match the exact Atlas V2 release contract.");
+  }
+' "${LOCAL_COMMIT}"
+run_coordinator renew "${DEPLOYMENT_TOKEN}" boundary
+
+run_coordinator assert "${DEPLOYMENT_TOKEN}" boundary
+ssh "${SSH_OPTS[@]}" "${REMOTE_TARGET}" bash -s -- "${REMOTE_DIR}" <<'REMOTE_WORKER_HEALTH'
+set -euo pipefail
+cd -- "$1"
+worker_container="$(docker compose ps -q worker)"
+[[ -n "${worker_container}" ]]
+[[ "$(docker inspect --format '{{.State.Health.Status}}' "${worker_container}")" == "healthy" ]]
+REMOTE_WORKER_HEALTH
+run_coordinator renew "${DEPLOYMENT_TOKEN}" boundary
 
 PUBLIC_HEALTH_RESPONSE="$(curl --fail --silent --show-error \
   --retry 12 --retry-delay 5 --retry-all-errors --max-time 10 \
-  https://atlas.rangeway.app/api/v2/health)"
+  https://atlas.rangeway.app/api/v2/ready)"
 HEALTH_JSON="${PUBLIC_HEALTH_RESPONSE}" node --input-type=module -e '
   const health = JSON.parse(process.env.HEALTH_JSON ?? "null");
-  if (health?.apiVersion !== "v2") throw new Error("Public health was not Atlas V2.");
-'
+  if (health?.apiVersion !== "v2" || health?.contractVersion !== "atlas-v2-foundation-v1" || health?.release !== process.argv[1]) {
+    throw new Error("Public readiness did not match the exact Atlas V2 release contract.");
+  }
+' "${LOCAL_COMMIT}"
 
+run_coordinator assert "${DEPLOYMENT_TOKEN}" boundary
 run_coordinator complete "${DEPLOYMENT_TOKEN}" "${LOCAL_COMMIT}"
 DEPLOYMENT_COMPLETE=1
 trap - EXIT INT TERM

@@ -32,7 +32,7 @@ export function validateProductionPostgresUrl(
   if (contract.database && parsed.pathname !== `/${contract.database}`) {
     return `must use the ${contract.database} database`;
   }
-  if (parsed.port && parsed.port !== "5432") {
+  if (parsed.port !== "5432") {
     return "must use PostgreSQL port 5432";
   }
   if (parsed.search || parsed.hash) {

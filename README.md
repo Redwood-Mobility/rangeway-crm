@@ -15,6 +15,8 @@ Atlas V2 is a TypeScript modular monolith built and deployed from one repository
 
 PostgreSQL 17 is authoritative for V2 records, append-only audit history, API idempotency records, and the transactional outbox. A separate `atlas-artifacts` volume is reserved for uploaded and generated artifacts. Caddy terminates production TLS. The web and worker use the same image but start with different commands. Production migrations run through the operations-only `atlas_migrator` service; web and worker never migrate on startup and connect as `atlas_web` and `atlas_worker` respectively.
 
+`GET /api/v2/health` is process liveness only. `GET /api/v2/ready` is the deploy and traffic-readiness contract: it proves a real PostgreSQL query, the expected web database identity and grants, API/contract version, and the exact 40-character release SHA. The worker has an equivalent container health check that proves its real database identity and column-level outbox permissions.
+
 Every client, human, agent, automation, and future integration crosses the API and shared permission boundary. No client receives direct database access. A successful business mutation, audit event, and outbox event commit in one PostgreSQL transaction.
 
 ## V1 preservation and migration status
@@ -26,7 +28,7 @@ The preserved V1 reference is branch `codex/atlas-v1-archive` at commit `2d90e4d
 ## Local prerequisites
 
 - Node.js 22 and npm.
-- PostgreSQL 17 reachable through the `DATABASE_URL` in `.env`.
+- PostgreSQL 17 reachable through the explicit `:5432` port in `DATABASE_URL`. Production web, worker, migrator, and owner-provisioning URLs reject an omitted or different port.
 - Docker only if using the local PostgreSQL container shown below or validating the production topology.
 - Git.
 
@@ -138,6 +140,12 @@ npx --yes @redocly/cli lint openapi/atlas-v2.yaml
 docker compose config >/dev/null
 git diff --check
 ```
+
+## Production operator model
+
+Production deployment is performed as the dedicated unprivileged `atlas` account against the fixed `/opt/atlas-v2` release directory and `/var/backups/atlas-v2` backup root. Bootstrap adds `atlas` to the Docker group (which is effectively root-equivalent and must be treated as privileged access) and grants only the exact root commands needed to run the coordinator, atomically install reviewed coordinator/systemd bytes, and verify the loaded unit. It does not grant a root shell or general `sudo` access.
+
+Every deploy stages and hashes the reviewed coordinator and guardian unit before acquiring ownership. Active coordinator bytes are never replaced underneath an active guardian or durable state record. One host-wide, boot-reconciled lease then fences backup, restore proof, build/config validation, role rotation, migration, permission verification, and writer start. Fencing covers `web`, `worker`, and operations-only `migrator` containers; heartbeats retain the exact token and phase during long actions. See the operations runbook for the complete ceremony and equipped-host gates.
 
 The smoke test is available directly with:
 

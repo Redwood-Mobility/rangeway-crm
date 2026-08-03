@@ -13,7 +13,8 @@ const productionEnv = {
   GOOGLE_CLIENT_ID: "atlas-client-id",
   GOOGLE_CLIENT_SECRET: "atlas-client-secret",
   GOOGLE_REDIRECT_URI: "https://atlas.rangeway.app/api/auth/google/callback",
-  WORKER_POLL_MS: "2500"
+  WORKER_POLL_MS: "2500",
+  ATLAS_RELEASE_SHA: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 };
 
 function expectConfigIssue(env: NodeJS.ProcessEnv, path: string[], message: string) {
@@ -57,6 +58,7 @@ describe("parseConfig", () => {
     ["postgresql://atlas_web:too-short@db:5432/atlas", /24-128 character/i],
     ["postgresql://atlas_web:p%40ssword@db:5432/atlas", /URL-safe password/i],
     ["postgresql://atlas_web:p%2Fssword@db:5432/atlas", /URL-safe password/i],
+    ["postgresql://atlas_web:safe-password-0123456789@db/atlas", /port 5432/i],
     ["postgresql://atlas_web:safe-password-0123456789@db:6432/atlas", /port 5432/i],
     ["postgresql://atlas_web:safe-password-0123456789@db:5432/atlas?sslmode=disable", /query parameters/i],
   ])("rejects an unsafe production database URL: %s", (databaseUrl, message) => {

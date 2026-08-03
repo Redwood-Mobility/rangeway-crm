@@ -555,6 +555,73 @@ describe("Atlas V2 API contract", () => {
     expect(response.body.error.details).toBeDefined();
   });
 
+  it("maps malformed JSON to a safe V2 envelope without logging the raw body", async () => {
+    const secret = "query-secret-body-canary";
+    const logged: Array<{ message: string; context: Record<string, unknown> }> = [];
+    const response = await request(createApp({
+      config: {
+        ...config,
+        nodeEnv: "test",
+        authMode: "local",
+        isProduction: false,
+        sessionSecret: "contract-test-session-secret-at-least-32-characters",
+      },
+      v2Identity: new ContractIdentity(),
+      logger: { error: (message, context) => logged.push({ message, context }) },
+    }))
+      .post(`/api/v2/auth/local/login?token=${secret}`)
+      .set("Content-Type", "application/json")
+      .send(`{"email":"admin@rangeway.energy","password":"${secret}"`);
+
+    expect(response.status).toBe(400);
+    expect(response.body.error).toEqual({
+      code: "INVALID_INPUT",
+      message: "Malformed JSON body.",
+      requestId: response.headers["x-request-id"],
+    });
+    expect(JSON.stringify(response.body)).not.toContain(secret);
+    expect(JSON.stringify(logged)).not.toContain(secret);
+  });
+
+  it("maps an oversized JSON body to a safe 413 envelope", async () => {
+    const secret = "oversized-body-secret-canary";
+    const response = await request(testApp())
+      .post("/api/v2/auth/local/login")
+      .set("Content-Type", "application/json")
+      .send({ email: "admin@rangeway.energy", password: `${secret}${"x".repeat(1024 * 1024)}` });
+
+    expect(response.status).toBe(413);
+    expect(response.body.error).toEqual({
+      code: "PAYLOAD_TOO_LARGE",
+      message: "Request body is too large.",
+      requestId: response.headers["x-request-id"],
+    });
+    expect(JSON.stringify(response.body)).not.toContain(secret);
+  });
+
+  it("treats a JSON-looking text body as invalid input without parsing or logging it", async () => {
+    const secret = "text-content-secret-canary";
+    const logged: Array<{ message: string; context: Record<string, unknown> }> = [];
+    const response = await request(createApp({
+      config: {
+        ...config,
+        nodeEnv: "test",
+        authMode: "local",
+        isProduction: false,
+        sessionSecret: "contract-test-session-secret-at-least-32-characters",
+      },
+      v2Identity: new ContractIdentity(),
+      logger: { error: (message, context) => logged.push({ message, context }) },
+    }))
+      .post("/api/v2/auth/local/login")
+      .set("Content-Type", "text/plain")
+      .send(`{"password":"${secret}"}`);
+
+    expect(response.status).toBe(400);
+    expect(response.body.error).toMatchObject({ code: "INVALID_INPUT" });
+    expect(JSON.stringify(logged)).not.toContain(secret);
+  });
+
   it("logs internal failures with request context without exposing stack or SQL details", async () => {
     const logged: Array<{ message: string; context: Record<string, unknown> }> = [];
     const app = createApp({
@@ -596,6 +663,29 @@ describe("Atlas V2 API contract", () => {
       },
     });
     expect(logged[0].context.error).toBeInstanceOf(Error);
+  });
+
+  it("logs only the path and allowlisted actor identifiers, never query secrets", async () => {
+    const secret = "query-secret-canary";
+    const logged: Array<{ message: string; context: Record<string, unknown> }> = [];
+    const response = await request(createApp({
+      config: {
+        ...config,
+        nodeEnv: "test",
+        authMode: "local",
+        isProduction: false,
+        sessionSecret: "contract-test-session-secret-at-least-32-characters",
+      },
+      v2Identity: new ContractIdentity(),
+      logger: { error: (message, context) => logged.push({ message, context }) },
+    }))
+      .get(`/api/v2/me?token=${secret}`)
+      .set("Authorization", `Bearer ${internalFailureKey}`);
+
+    expect(response.status).toBe(500);
+    expect(logged[0]?.context).toMatchObject({ method: "GET", path: "/api/v2/me" });
+    expect(logged[0]?.context).not.toHaveProperty("actor");
+    expect(JSON.stringify(logged)).not.toContain(secret);
   });
 
   it("clears the signed session without requiring an active credential", async () => {

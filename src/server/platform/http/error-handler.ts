@@ -34,6 +34,44 @@ export function createApiErrorHandler(
       return;
     }
 
+    if (
+      typeof error === "object" &&
+      error !== null &&
+      "type" in error &&
+      error.type === "entity.parse.failed" &&
+      "status" in error &&
+      error.status === 400
+    ) {
+      const body: ApiErrorBody = {
+        error: {
+          code: "INVALID_INPUT",
+          message: "Malformed JSON body.",
+          requestId,
+        },
+      };
+      res.status(400).json(body);
+      return;
+    }
+
+    if (
+      typeof error === "object" &&
+      error !== null &&
+      "type" in error &&
+      error.type === "entity.too.large" &&
+      "status" in error &&
+      error.status === 413
+    ) {
+      const body: ApiErrorBody = {
+        error: {
+          code: "PAYLOAD_TOO_LARGE",
+          message: "Request body is too large.",
+          requestId,
+        },
+      };
+      res.status(413).json(body);
+      return;
+    }
+
     if (error instanceof ApiError) {
       const body: ApiErrorBody = {
         error: {
@@ -49,9 +87,15 @@ export function createApiErrorHandler(
 
     logger.error("Atlas API request failed.", {
       requestId,
-      actor: req.actor,
       method: req.method,
-      path: req.originalUrl,
+      path: req.path,
+      ...(req.actor
+        ? {
+            actorId: req.actor.actorId,
+            actorType: req.actor.actorType,
+            organizationId: req.actor.organizationId,
+          }
+        : {}),
       error,
     });
 

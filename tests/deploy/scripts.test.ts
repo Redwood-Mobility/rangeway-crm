@@ -67,6 +67,8 @@ type DeployFixture = {
   binDirectory: string;
   logDirectory: string;
   coordinator: string;
+  guardianUnit: string;
+  coordinatorStage: string;
   coordinatorStateRoot: string;
   coordinatorConfig: string;
 };
@@ -79,9 +81,11 @@ function createDeployFixture(): DeployFixture {
   const binDirectory = path.join(root, "bin");
   const logDirectory = path.join(root, "logs");
   const coordinator = path.join(root, "atlas-v2-deployment-coordinator");
+  const guardianUnit = path.join(root, "atlas-v2-deployment-guardian.service");
+  const coordinatorStage = path.join(root, "coordinator-stage");
   const coordinatorStateRoot = path.join(root, "coordinator-state");
   const coordinatorConfig = path.join(root, "coordinator.conf");
-  mkdirSync(path.join(repository, "deploy"), { recursive: true });
+  mkdirSync(path.join(repository, "deploy/systemd"), { recursive: true });
   mkdirSync(path.join(repository, "openapi"), { recursive: true });
   mkdirSync(path.join(repository, "nested"), { recursive: true });
   mkdirSync(binDirectory, { recursive: true });
@@ -90,8 +94,14 @@ function createDeployFixture(): DeployFixture {
   mkdirSync(backupRoot, { recursive: true });
   copyFileSync(path.join(sourceRoot, "deploy/deploy.sh"), path.join(repository, "deploy/deploy.sh"));
   chmodSync(path.join(repository, "deploy/deploy.sh"), 0o755);
+  copyFileSync(path.join(sourceRoot, "deploy/deployment-coordinator.sh"), path.join(repository, "deploy/deployment-coordinator.sh"));
+  copyFileSync(
+    path.join(sourceRoot, "deploy/systemd/atlas-v2-deployment-guardian.service"),
+    path.join(repository, "deploy/systemd/atlas-v2-deployment-guardian.service"),
+  );
   copyFileSync(path.join(sourceRoot, "deploy/deployment-coordinator.sh"), coordinator);
   chmodSync(coordinator, 0o755);
+  copyFileSync(path.join(sourceRoot, "deploy/systemd/atlas-v2-deployment-guardian.service"), guardianUnit);
   writeFileSync(path.join(repository, "package.json"), "{}\n");
   writeFileSync(path.join(repository, "openapi/atlas-v2.yaml"), "openapi: 3.1.0\n");
   const environmentFile = path.join(repository, ".env.production");
@@ -120,7 +130,20 @@ counter=0
 counter=$((counter + 1))
 printf '%s\\n' "\${counter}" > "\${counter_file}"
 printf '%s\\n' "$@" > "\${FAKE_LOG_DIR}/rsync-\${counter}.args"
-if [[ "\${FAKE_RSYNC_SIGNAL:-}" =~ ^(TERM|INT|KILL)$ ]]; then
+destination=""
+for argument in "$@"; do destination="\${argument}"; done
+destination="\${destination#*:}"
+if [[ "\${counter}" == "1" ]]; then
+  mkdir -p -- "\${destination}"
+  for argument in "$@"; do
+    case "\${argument}" in
+      */deployment-coordinator.sh|*/atlas-v2-deployment-guardian.service)
+        /bin/cp "\${argument}" "\${destination}/"
+        ;;
+    esac
+  done
+fi
+if [[ "\${counter}" != "1" && "\${FAKE_RSYNC_SIGNAL:-}" =~ ^(TERM|INT|KILL)$ ]]; then
   kill -"\${FAKE_RSYNC_SIGNAL}" "$PPID"
   exit 70
 fi
@@ -129,9 +152,9 @@ exit 0`);
   fakeTool(binDirectory, "curl", `
 printf '%s\\n' "$*" >> "\${FAKE_LOG_DIR}/curl.log"
 if [[ "$*" == *"--resolve atlas.rangeway.app:443:127.0.0.1"* ]]; then
-  [[ "\${FAKE_TARGET_HEALTH_FAIL:-0}" == "1" ]] && printf '%s\\n' '{"apiVersion":"v1"}' || printf '%s\\n' '{"apiVersion":"v2"}'
+  [[ "\${FAKE_TARGET_HEALTH_FAIL:-0}" == "1" ]] && printf '%s\\n' '{"apiVersion":"v1"}' || printf '%s\\n' '{"apiVersion":"v2","contractVersion":"atlas-v2-foundation-v1","release":"${releaseCommit}"}'
 else
-  [[ "\${FAKE_PUBLIC_HEALTH_FAIL:-0}" == "1" ]] && printf '%s\\n' '{"apiVersion":"v1"}' || printf '%s\\n' '{"apiVersion":"v2"}'
+  [[ "\${FAKE_PUBLIC_HEALTH_FAIL:-0}" == "1" ]] && printf '%s\\n' '{"apiVersion":"v1"}' || printf '%s\\n' '{"apiVersion":"v2","contractVersion":"atlas-v2-foundation-v1","release":"${releaseCommit}"}'
 fi`);
   fakeTool(binDirectory, "sha256sum", `
 if [[ "\${1:-}" == "--check" ]]; then
@@ -162,9 +185,20 @@ exit 0`);
 printf '%s\\n' "$*" >> "\${FAKE_LOG_DIR}/systemctl.log"
 case "$*" in
   "enable --now atlas-v2-deployment-guardian.service"|"restart atlas-v2-deployment-guardian.service")
+    : > "\${FAKE_LOG_DIR}/guardian-active"
     '${coordinator}' guardian-once
     ;;
-  "is-active --quiet atlas-v2-deployment-guardian.service") exit 0 ;;
+  "is-active --quiet atlas-v2-deployment-guardian.service")
+    [[ -f "\${FAKE_LOG_DIR}/guardian-active" ]]
+    ;;
+  "disable --now atlas-v2-deployment-guardian.service")
+    /bin/unlink "\${FAKE_LOG_DIR}/guardian-active" 2>/dev/null || true
+    ;;
+  "daemon-reload") exit 0 ;;
+  "cat --no-pager --full atlas-v2-deployment-guardian.service")
+    printf '%s\\n' '# /etc/systemd/system/atlas-v2-deployment-guardian.service'
+    /bin/cat "\${FAKE_GUARDIAN_UNIT_PATH}"
+    ;;
   *) exit 0 ;;
 esac`);
   fakeTool(binDirectory, "ssh", `
@@ -203,6 +237,8 @@ exit 64`);
     binDirectory,
     logDirectory,
     coordinator,
+    guardianUnit,
+    coordinatorStage,
     coordinatorStateRoot,
     coordinatorConfig,
   };
@@ -222,11 +258,15 @@ function deploy(fixture: DeployFixture, overrides: NodeJS.ProcessEnv = {}) {
       ATLAS_BACKUP_ROOT: fixture.backupRoot,
       ATLAS_ENV_FILE: fixture.environmentFile,
       ATLAS_COORDINATOR_PATH: fixture.coordinator,
+      ATLAS_GUARDIAN_UNIT_PATH: fixture.guardianUnit,
+      ATLAS_COORDINATOR_STATE_FILE: path.join(fixture.coordinatorStateRoot, "active.state"),
+      ATLAS_COORDINATOR_STAGE: fixture.coordinatorStage,
       ATLAS_COORDINATOR_TEST_MODE: "1",
       ATLAS_COORDINATOR_STATE_ROOT: fixture.coordinatorStateRoot,
       ATLAS_COORDINATOR_CONFIG_FILE: fixture.coordinatorConfig,
       ATLAS_COORDINATOR_GLOBAL_LOCK: path.join(fixture.root, "coordinator.lock"),
       ATLAS_COORDINATOR_NOW_EPOCH: "100",
+      FAKE_GUARDIAN_UNIT_PATH: fixture.guardianUnit,
       ...overrides,
     },
   });
@@ -307,6 +347,93 @@ describe("deploy.sh behavior", () => {
     expect(unitSource).toContain("Restart=on-failure");
   });
 
+  it("verifies reviewed coordinator and unit bytes before the first coordinator command", () => {
+    const deploySource = readFileSync(path.join(sourceRoot, "deploy/deploy.sh"), "utf8");
+    const trustPosition = deploySource.indexOf("install_verified_coordinator");
+    const beginPosition = deploySource.indexOf("run_coordinator begin");
+    expect(trustPosition).toBeGreaterThan(0);
+    expect(beginPosition).toBeGreaterThan(trustPosition);
+    expect(deploySource).toContain("deploy/deployment-coordinator.sh");
+    expect(deploySource).toContain("deploy/systemd/atlas-v2-deployment-guardian.service");
+    expect(deploySource).toContain("COORDINATOR_SHA256");
+    expect(deploySource).toContain("GUARDIAN_UNIT_SHA256");
+    expect(deploySource).toMatch(/createHash\("sha256"\)/);
+    expect(deploySource).toContain("sha256sum --");
+    expect(deploySource).toContain("systemctl cat --no-pager --full");
+    expect(deploySource).toContain("systemctl daemon-reload");
+    expect(deploySource).toMatch(/owner.*root.*root|root:root/i);
+    expect(deploySource).toMatch(/0755/);
+    expect(deploySource).toMatch(/0644/);
+  });
+
+  it("refuses to replace coordinator code underneath active durable ownership", () => {
+    const deploySource = readFileSync(path.join(sourceRoot, "deploy/deploy.sh"), "utf8");
+    expect(deploySource).toMatch(/active\.state[\s\S]*refus|refus[\s\S]*active\.state/i);
+    expect(deploySource).toMatch(/is-active[\s\S]*guardian/i);
+    expect(deploySource).toContain('coordinator_next="${coordinator}.next"');
+    expect(deploySource.indexOf("active.state")).toBeLessThan(
+      deploySource.indexOf('privileged mv -f -- "${coordinator_next}"'),
+    );
+  });
+
+  it.each(["coordinator", "unit"])(
+    "replaces and verifies a stale or tampered installed %s before begin",
+    (target) => {
+      const fixture = createDeployFixture();
+      const installed = target === "coordinator" ? fixture.coordinator : fixture.guardianUnit;
+      const reviewed = target === "coordinator"
+        ? path.join(sourceRoot, "deploy/deployment-coordinator.sh")
+        : path.join(sourceRoot, "deploy/systemd/atlas-v2-deployment-guardian.service");
+      writeFileSync(installed, "tampered-installed-bytes\n", { mode: target === "coordinator" ? 0o755 : 0o644 });
+
+      const result = deploy(fixture);
+
+      expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+      expect(readFileSync(installed, "utf8")).toBe(readFileSync(reviewed, "utf8"));
+      const sshScripts = readFileSync(path.join(fixture.logDirectory, "ssh-scripts.log"), "utf8");
+      expect(sshScripts.indexOf("expected_coordinator_hash")).toBeLessThan(
+        sshScripts.indexOf('coordinator="$1"'),
+      );
+    },
+  );
+
+  it("does not replace tampered coordinator bytes while durable state is active", () => {
+    const fixture = createDeployFixture();
+    const tampered = "tampered-active-coordinator\n";
+    writeFileSync(fixture.coordinator, tampered, { mode: 0o755 });
+    mkdirSync(fixture.coordinatorStateRoot, { recursive: true });
+    writeFileSync(path.join(fixture.coordinatorStateRoot, "active.state"), "operator-resolution-required\n");
+
+    const result = deploy(fixture);
+
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toMatch(/active\.state|active.*coordinator/i);
+    expect(readFileSync(fixture.coordinator, "utf8")).toBe(tampered);
+  });
+
+  it("bootstraps the dedicated atlas operator with constrained root actions", () => {
+    const bootstrapSource = readFileSync(path.join(sourceRoot, "deploy/bootstrap-ubuntu.sh"), "utf8");
+    expect(bootstrapSource).toMatch(/useradd[\s\S]*atlas/);
+    expect(bootstrapSource).toMatch(/usermod[\s\S]*docker[\s\S]*atlas/);
+    expect(bootstrapSource).toContain("/etc/sudoers.d/atlas-v2-deploy");
+    expect(bootstrapSource).toMatch(/ATLAS_COORDINATOR =[^\n]*atlas-v2-deployment-coordinator/);
+    expect(bootstrapSource).toContain(
+      "atlas ALL=(root) NOPASSWD: ATLAS_COORDINATOR, ATLAS_COORDINATOR_INSTALL, ATLAS_SYSTEMD_VERIFY",
+    );
+    expect(bootstrapSource).not.toMatch(/NOPASSWD:\s*ALL|NOPASSWD:[^\n]*(?:bash|sh)\b/);
+    expect(bootstrapSource).toMatch(/-o atlas -g atlas[\s\S]*\/opt\/atlas-v2/);
+    expect(bootstrapSource).toMatch(/-o atlas -g atlas[\s\S]*\/var\/backups\/atlas-v2/);
+  });
+
+  it("fences every long mutation and writer start with the exact token and phase", () => {
+    const deploySource = readFileSync(path.join(sourceRoot, "deploy/deploy.sh"), "utf8");
+    for (const action of ["build-db", "rotate-roles", "migrate", "start-writers", "verify-contract"]) {
+      expect(deploySource).toContain(`guard \"\${DEPLOYMENT_TOKEN}\"`);
+      expect(deploySource).toContain(action);
+    }
+    expect(deploySource).not.toContain("REMOTE_MIGRATE_AND_START");
+  });
+
   it.each([
     "POSTGRES_BOOTSTRAP_PASSWORD",
     "ATLAS_MIGRATOR_PASSWORD",
@@ -376,7 +503,7 @@ describe("deploy.sh behavior", () => {
     expect(readFileSync(path.join(fixture.logDirectory, "restore-test.log"), "utf8").trim()).toBe(
       exactBackup,
     );
-    expect(existsSync(path.join(fixture.logDirectory, "rsync-1.args"))).toBe(true);
+    expect(existsSync(path.join(fixture.logDirectory, "rsync-2.args"))).toBe(true);
   });
 
   it("recovers exact prior writers when a local signal interrupts after durable acquisition", () => {
@@ -422,7 +549,7 @@ describe("deploy.sh behavior", () => {
     expect(readFileSync(path.join(fixture.logDirectory, "restore-test.log"), "utf8").trim()).toBe(
       exactBackup,
     );
-    expect(existsSync(path.join(fixture.logDirectory, "rsync-counter"))).toBe(false);
+    expect(readFileSync(path.join(fixture.logDirectory, "rsync-counter"), "utf8").trim()).toBe("1");
     expect(result.stderr).toContain(`Previous Git commit: ${releaseCommit}`);
     expect(result.stderr).toContain(`Exact pre-deploy backup: ${exactBackup}`);
     expect(result.stderr).toMatch(/before migration|durable guardian/i);
@@ -448,8 +575,8 @@ describe("deploy.sh behavior", () => {
 
 
     expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
-    const treeSync = readFileSync(path.join(fixture.logDirectory, "rsync-1.args"), "utf8");
-    const secretSync = readFileSync(path.join(fixture.logDirectory, "rsync-2.args"), "utf8");
+    const treeSync = readFileSync(path.join(fixture.logDirectory, "rsync-2.args"), "utf8");
+    const secretSync = readFileSync(path.join(fixture.logDirectory, "rsync-3.args"), "utf8");
     expect(treeSync).toContain(".env\n");
     expect(treeSync).toContain(".env.*\n");
     expect(treeSync).toContain("/.env.production\n");
@@ -469,15 +596,15 @@ describe("deploy.sh behavior", () => {
 
     expect(result.status).not.toBe(0);
     expect(`${result.stdout}${result.stderr}`).toMatch(/canonical path/i);
-    expect(readFileSync(path.join(fixture.logDirectory, "ssh.log"), "utf8").trim().split("\n")).toHaveLength(1);
+    expect(readFileSync(path.join(fixture.logDirectory, "ssh.log"), "utf8").trim().split("\n")).toHaveLength(3);
     expect(existsSync(path.join(fixture.logDirectory, "docker.log"))).toBe(false);
-    expect(existsSync(path.join(fixture.logDirectory, "rsync-counter"))).toBe(false);
+    expect(readFileSync(path.join(fixture.logDirectory, "rsync-counter"), "utf8").trim()).toBe("1");
   });
 
   it("restarts the exact prior-active containers after a failure before migration begins", () => {
     const fixture = createDeployFixture();
     const exactBackup = installRemoteBackup(fixture);
-    const result = deploy(fixture, { FAKE_HAS_DB: "1", FAKE_RSYNC_FAIL_ON: "1" });
+    const result = deploy(fixture, { FAKE_HAS_DB: "1", FAKE_RSYNC_FAIL_ON: "2" });
 
     expect(result.status).not.toBe(0);
     expect(result.stderr).toContain(`Previous Git commit: ${releaseCommit}`);

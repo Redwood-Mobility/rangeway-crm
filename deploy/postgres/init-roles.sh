@@ -64,6 +64,12 @@ SELECT format('ALTER ROLE atlas_migrator PASSWORD %L', :'migrator_password') \ge
 SELECT format('ALTER ROLE atlas_web PASSWORD %L', :'web_password') \gexec
 SELECT format('ALTER ROLE atlas_worker PASSWORD %L', :'worker_password') \gexec
 
+-- Install migration dependencies while connected as the bootstrap owner. The
+-- immutable migrations retain IF NOT EXISTS for development compatibility;
+-- production therefore keeps extension ownership outside application roles.
+CREATE EXTENSION IF NOT EXISTS citext;
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
 -- The first foundation Compose topology ran migrations as atlas. Transfer only
 -- the known Atlas schema objects so an existing V2 database can cross into the
 -- dedicated migration role without granting that role bootstrap privileges.
@@ -103,6 +109,24 @@ BEGIN
     WHERE n.nspname = 'public' AND t.typname = 'organization_role'
   ) THEN
     ALTER TYPE public.organization_role OWNER TO atlas_migrator;
+  END IF;
+
+  IF to_regprocedure('public.atlas_reject_audit_mutation()') IS NOT NULL THEN
+    EXECUTE 'ALTER FUNCTION public.atlas_reject_audit_mutation() OWNER TO atlas_migrator';
+  END IF;
+
+  -- PostgreSQL extensions do not expose an ALTER EXTENSION ... OWNER command.
+  -- The migration-managed citext and pgcrypto extensions therefore remain
+  -- bootstrap-owned by atlas; future migrations consume their objects but do
+  -- not update or drop the extensions without an explicit bootstrap ceremony.
+  IF EXISTS (
+    SELECT 1
+      FROM pg_extension e
+      JOIN pg_roles r ON r.oid = e.extowner
+     WHERE e.extname IN ('citext', 'pgcrypto')
+       AND r.rolname <> 'atlas'
+  ) THEN
+    RAISE EXCEPTION 'Atlas migration extension ownership is not bootstrap-owned';
   END IF;
 END
 $ownership$;

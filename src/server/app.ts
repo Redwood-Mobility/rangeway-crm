@@ -6,7 +6,7 @@ import cors from "cors";
 import express from "express";
 import multer from "multer";
 import { nanoid } from "nanoid";
-import type { Pool } from "pg";
+import type { Pool, QueryConfig, QueryResult } from "pg";
 import { ZodError } from "zod";
 import { config as defaultConfig } from "./config.js";
 import {
@@ -162,6 +162,44 @@ app.use(
     }),
   ),
 );
+app.get("/api/v2/ready", async (_req, res, next) => {
+  try {
+    type ReadinessRow = { role_ok?: boolean; database_ok?: boolean; permissions_ok?: boolean };
+    const boundedQuery = v2Pool.query.bind(v2Pool) as (
+      query: QueryConfig & { query_timeout: number },
+    ) => Promise<QueryResult<ReadinessRow>>;
+    const result = await boundedQuery({
+      text: `SELECT
+        current_user = 'atlas_web' AS role_ok,
+        current_database() = 'atlas' AS database_ok,
+        has_table_privilege(current_user, 'public.organizations', 'SELECT')
+          AND has_table_privilege(current_user, 'public.audit_events', 'INSERT')
+          AND NOT has_table_privilege(current_user, 'public.schema_migrations', 'SELECT')
+          AS permissions_ok`,
+      query_timeout: 2_000,
+    });
+    const readiness = result.rows[0];
+    const contractReady =
+      readiness?.permissions_ok === true &&
+      (!config.isProduction || (readiness.role_ok === true && readiness.database_ok === true));
+    if (!contractReady) {
+      throw new ApiError(503, "SERVICE_UNAVAILABLE", "Service is not ready.");
+    }
+    res.json({
+      status: "ready",
+      service: "atlas-web",
+      apiVersion: "v2",
+      contractVersion: "atlas-v2-foundation-v1",
+      release: config.releaseSha,
+    });
+  } catch (error) {
+    if (error instanceof ApiError) {
+      next(error);
+      return;
+    }
+    next(new ApiError(503, "SERVICE_UNAVAILABLE", "Service is not ready."));
+  }
+});
 app.use("/api/v2", createOrganizationRouter(v2Organizations));
 app.use("/api/v2", requireActor, (_req, _res, next) => {
   next(new ApiError(404, "NOT_FOUND", "Resource not found."));

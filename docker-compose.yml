@@ -25,6 +25,7 @@ services:
       GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
       GOOGLE_REDIRECT_URI: ${GOOGLE_REDIRECT_URI:-}
       GOOGLE_ALLOWED_DOMAIN: ${GOOGLE_ALLOWED_DOMAIN:-rangeway.energy}
+      ATLAS_RELEASE_SHA: ${ATLAS_RELEASE_SHA:-}
     depends_on:
       db:
         condition: service_healthy
@@ -33,7 +34,7 @@ services:
     volumes:
       - atlas-artifacts:/app/artifacts
     healthcheck:
-      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8080/api/v2/health').then(async (response) => { const body = await response.json(); process.exit(response.ok && body.apiVersion === 'v2' ? 0 : 1); }).catch(() => process.exit(1))"]
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8080/api/v2/ready').then(async (response) => { const body = await response.json(); process.exit(response.ok && body.apiVersion === 'v2' && body.contractVersion === 'atlas-v2-foundation-v1' ? 0 : 1); }).catch(() => process.exit(1))"]
       interval: 15s
       timeout: 5s
       retries: 5
@@ -53,6 +54,12 @@ services:
         condition: service_healthy
     volumes:
       - atlas-artifacts:/app/artifacts
+    healthcheck:
+      test: ["CMD", "node", "dist/worker/readiness.js"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
     mem_limit: 384m
     cpus: 0.5
 

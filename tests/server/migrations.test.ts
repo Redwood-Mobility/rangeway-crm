@@ -98,6 +98,8 @@ describe("PostgreSQL platform migrations", () => {
       "http://atlas_migrator:migrator-password-0123456789@db:5432/atlas",
       "postgresql://atlas_migrator:migrator-password-0123456789@postgres:5432/atlas",
       "postgresql://atlas_migrator:migrator-password-0123456789@db:5432/postgres",
+      "postgresql://atlas_migrator:migrator-password-0123456789@db/atlas",
+      "postgresql://atlas_migrator:migrator-password-0123456789@db:6432/atlas",
       "postgresql://atlas_migrator:migrator-password-0123456789@db:5432/atlas?sslmode=disable",
       "postgresql://atlas_migrator:p%40ssword-with-reserved-chars@db:5432/atlas",
     ]) {

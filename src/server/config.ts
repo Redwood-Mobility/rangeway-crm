@@ -26,6 +26,7 @@ const configSchema = z
     googleClientSecret: optionalString,
     googleRedirectUri: optionalString,
     workerPollMs: z.coerce.number().int().positive().default(1000),
+    releaseSha: z.string().trim().default("development"),
     // V1 compatibility fields remain until the V2 identity and persistence work replaces them.
     adminEmail: z.string().trim().email().default("admin@rangeway.energy"),
     adminPassword: z.string().default("rangeway-dev"),
@@ -39,6 +40,9 @@ const configSchema = z
 
     if (value.authMode !== "google") {
       context.addIssue({ code: "custom", path: ["authMode"], message: "AUTH_MODE must be google in production." });
+    }
+    if (!/^[0-9a-f]{40}$/.test(value.releaseSha)) {
+      context.addIssue({ code: "custom", path: ["releaseSha"], message: "ATLAS_RELEASE_SHA must be the exact 40-character release commit in production." });
     }
     if (!value.databaseUrl) {
       context.addIssue({ code: "custom", path: ["databaseUrl"], message: "DATABASE_URL is required in production." });
@@ -110,6 +114,7 @@ export function parseConfig(env: NodeJS.ProcessEnv): Config {
     googleClientSecret: env.GOOGLE_CLIENT_SECRET,
     googleRedirectUri: env.GOOGLE_REDIRECT_URI,
     workerPollMs: env.WORKER_POLL_MS,
+    releaseSha: env.ATLAS_RELEASE_SHA,
     adminEmail: env.ADMIN_EMAIL,
     adminPassword: env.ADMIN_PASSWORD,
     googleAllowedDomain: env.GOOGLE_ALLOWED_DOMAIN,

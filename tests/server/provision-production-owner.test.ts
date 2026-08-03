@@ -167,6 +167,16 @@ describe("one-time production owner provisioning", () => {
     ).toThrow(/Google subject.*verified login/i);
   });
 
+  it.each([
+    "postgresql://atlas_web:production-web-password-01@db/atlas",
+    "postgresql://atlas_web:production-web-password-01@db:6432/atlas",
+  ])("requires the explicit production PostgreSQL port for provisioning: %s", (databaseUrl) => {
+    expect(() => readProductionOwnerProvisionInput({
+      ...productionEnvironment,
+      DATABASE_URL: databaseUrl,
+    })).toThrow(/port 5432/i);
+  });
+
   it("atomically creates one owner plus attributable private audit and minimal outbox evidence", async () => {
     const state = harness();
     const input = readProductionOwnerProvisionInput(productionEnvironment);

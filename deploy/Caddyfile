@@ -10,5 +10,8 @@ atlas.rangeway.app {
     -Server
   }
 
+  @atlas_system path /api/v2/health /api/v2/ready
+  header @atlas_system Cache-Control "no-store"
+
   reverse_proxy web:8080
 }

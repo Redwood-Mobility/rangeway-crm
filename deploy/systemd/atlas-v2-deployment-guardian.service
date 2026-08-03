@@ -5,6 +5,9 @@ After=docker.service
 
 [Service]
 Type=simple
+User=root
+Group=root
+UMask=0077
 ExecStart=/usr/local/sbin/atlas-v2-deployment-coordinator guardian
 Restart=on-failure
 RestartSec=1
