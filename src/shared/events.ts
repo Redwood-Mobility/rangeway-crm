@@ -26,6 +26,7 @@ export const atlasEventTypes = {
   pursuitChanged: "pursuit.changed.v1",
   workspaceChanged: "workspace.changed.v1",
   agentChanged: "agent.changed.v1",
+  reportChanged: "report.changed.v1",
 } as const;
 
 export type AtlasEventType =
