@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import { mkdtemp, rm, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -11,6 +12,8 @@ import {
   isPostgreSqlUnreachable,
   PostgreSqlUnavailableError,
 } from "../helpers/database.js";
+
+const repositoryRoot = path.resolve(import.meta.dirname, "../..");
 
 const expectedRelations = [
   "schema_migrations",
@@ -80,6 +83,55 @@ function fakePoolWithAppliedMigrations(
 }
 
 describe("PostgreSQL platform migrations", () => {
+  it("loads DATABASE_URL from a fresh-shell .env while preserving an explicit environment value", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "atlas-migrate-env-"));
+    const migrationEntrypoint = path.join(
+      repositoryRoot,
+      "src/server/platform/db/migrate.ts",
+    );
+    const tsxEntrypoint = path.join(
+      repositoryRoot,
+      "node_modules/tsx/dist/cli.mjs",
+    );
+    const environment = { ...process.env };
+    delete environment.DATABASE_URL;
+    delete environment.DOTENV_CONFIG_PATH;
+    delete environment.DOTENV_CONFIG_OVERRIDE;
+
+    try {
+      await writeFile(
+        path.join(directory, ".env"),
+        "DATABASE_URL=postgresql://atlas@127.0.0.1:5432/atlas_env_probe\n",
+      );
+      const loadedFromFile = spawnSync(
+        process.execPath,
+        [tsxEntrypoint, migrationEntrypoint],
+        { cwd: directory, encoding: "utf8", env: environment },
+      );
+      const loadedOutput = `${loadedFromFile.stdout}${loadedFromFile.stderr}`;
+
+      expect(loadedFromFile.status).not.toBe(0);
+      expect(loadedOutput).toMatch(/ENOENT|no such file or directory/i);
+      expect(loadedOutput).not.toContain("DATABASE_URL is required");
+      expect(loadedOutput).not.toContain("atlas_env_probe");
+
+      const explicitEmpty = spawnSync(
+        process.execPath,
+        [tsxEntrypoint, migrationEntrypoint],
+        {
+          cwd: directory,
+          encoding: "utf8",
+          env: { ...environment, DATABASE_URL: "" },
+        },
+      );
+      expect(`${explicitEmpty.stdout}${explicitEmpty.stderr}`).toContain(
+        "DATABASE_URL is required to run migrations.",
+      );
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it("applies all migrations idempotently", async (context) => {
     await withTemporaryPostgreSql(context, async (pool) => {
       await runMigrations(pool);

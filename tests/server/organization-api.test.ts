@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+import path from "node:path";
 import request from "supertest";
 import { describe, expect, it } from "vitest";
 import { createApp } from "../../src/server/app.js";
@@ -22,6 +24,31 @@ const config = parseConfig({
 });
 
 describe("organization API", () => {
+  it("keeps organization transport outside the identity router", () => {
+    const repositoryRoot = path.resolve(import.meta.dirname, "../..");
+    const identityRoutes = readFileSync(
+      path.join(repositoryRoot, "src/server/modules/identity/identity.routes.ts"),
+      "utf8",
+    );
+    const organizationRoutesPath = path.join(
+      repositoryRoot,
+      "src/server/modules/organizations/organization.routes.ts",
+    );
+    const organizationRoutes = (() => {
+      try {
+        return readFileSync(organizationRoutesPath, "utf8");
+      } catch {
+        return "";
+      }
+    })();
+    const app = readFileSync(path.join(repositoryRoot, "src/server/app.ts"), "utf8");
+
+    expect(identityRoutes).not.toMatch(/OrganizationMutationPort|organizations\/:organizationId/);
+    expect(organizationRoutes).toContain("createOrganizationRouter");
+    expect(organizationRoutes).toContain('router.patch("/organizations/:organizationId"');
+    expect(app).toContain("createOrganizationRouter(v2Organizations)");
+  });
+
   it("passes the authenticated actor and request attribution to the name mutation", async () => {
     const calls: unknown[][] = [];
     const app = createApp({

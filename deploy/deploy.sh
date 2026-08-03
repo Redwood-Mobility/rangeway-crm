@@ -240,6 +240,27 @@ if docker volume inspect atlas-db >/dev/null 2>&1; then
       || { echo "Exact backup is incomplete: ${backup_file}." >&2; exit 1; }
   done
   (cd "${exact_backup}" && sha256sum --check manifest.sha256) >&2
+
+  if [[ ! -x "${remote_dir}/deploy/restore-test.sh" ]]; then
+    echo "Existing Atlas V2 database found, but the non-destructive restore test is unavailable." >&2
+    echo "Deployment stopped before source sync or migration." >&2
+    echo "No rollback was run automatically." >&2
+    echo "Previous Git commit: ${previous_commit}" >&2
+    echo "Exact pre-deploy backup: ${exact_backup}" >&2
+    exit 1
+  fi
+  if ! (
+    cd "${remote_dir}"
+    ./deploy/restore-test.sh "${exact_backup}"
+  ) >&2; then
+    echo "Fresh pre-deploy backup failed its non-destructive restore test." >&2
+    echo "Deployment stopped before source sync or migration." >&2
+    echo "No rollback was run automatically." >&2
+    echo "Previous Git commit: ${previous_commit}" >&2
+    echo "Exact pre-deploy backup: ${exact_backup}" >&2
+    exit 1
+  fi
+  echo "Fresh pre-deploy backup passed its non-destructive restore test: ${exact_backup}" >&2
 fi
 
 printf 'PREVIOUS_COMMIT=%s\n' "${previous_commit}"

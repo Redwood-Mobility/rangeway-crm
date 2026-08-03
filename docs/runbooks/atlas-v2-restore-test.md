@@ -44,7 +44,7 @@ ATLAS_RESTORE_TMP_ROOT=/var/tmp \
 ./deploy/restore-test.sh /var/backups/atlas-v2/20260802T210000Z-AbCd12
 ```
 
-The script creates unique temporary database and artifact volumes, extracts the artifact archive, starts a temporary PostgreSQL 17 container, restores the custom dump with `pg_restore`, verifies the expected migration row and Rangeway organization, and removes its temporary containers, volumes, and work directory.
+The script creates unique temporary database and artifact volumes, extracts the artifact archive, starts a temporary PostgreSQL 17 container, restores the custom dump with `pg_restore`, verifies the expected migration row and the immutable Rangeway organization UUID `00000000-0000-4000-8000-000000000001`, and removes its temporary containers, volumes, and work directory. The mutable organization display name is deliberately not part of restore validity.
 
 ## Required evidence
 
@@ -54,11 +54,11 @@ A passing record includes all of the following:
 - The three successful checksum lines.
 - Exit status `0` from `deploy/restore-test.sh`.
 - `Restore test passed for <exact-directory>.`
-- `Verified schema migration row, Rangeway organization, and artifact archive extraction.`
+- `Verified schema migration row, immutable Rangeway organization ID, and artifact archive extraction.`
 - Confirmation that the live `atlas-db` and `atlas-artifacts` volumes were not mounted, changed, renamed, or deleted.
 - The operator, UTC date, and evidence location.
 
-Any checksum mismatch, restore error, missing migration row, missing Rangeway organization, artifact extraction error, or cleanup error fails the test. Quarantine the backup; do not repair its manifest or relabel it trusted. Create a new backup after correcting the underlying issue, then test that new artifact.
+Any checksum mismatch, restore error, missing migration row, missing immutable Rangeway organization ID, artifact extraction error, or cleanup error fails the test. A changed organization display name does not. Quarantine a failed backup; do not repair its manifest or relabel it trusted. Create a new backup after correcting the underlying issue, then test that new artifact.
 
 ## Cadence and sign-off
 

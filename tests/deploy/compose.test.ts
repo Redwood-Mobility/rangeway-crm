@@ -166,8 +166,11 @@ describe("deterministic deployment source contract", () => {
 
   it("backs up before replacement and verifies migration, startup, and live V2 health", () => {
     const backupPosition = deployScript.indexOf("deploy/backup.sh");
+    const restorePosition = deployScript.indexOf("deploy/restore-test.sh");
     const syncPosition = deployScript.indexOf('rsync "${RSYNC_TREE_ARGS[@]}"');
     expect(backupPosition).toBeGreaterThan(0);
+    expect(restorePosition).toBeGreaterThan(backupPosition);
+    expect(syncPosition).toBeGreaterThan(restorePosition);
     expect(syncPosition).toBeGreaterThan(backupPosition);
     expect(deployScript).toContain("npm test");
     expect(deployScript).toContain("npm run typecheck");
@@ -214,6 +217,11 @@ describe("deterministic deployment source contract", () => {
     expect(restoreScript).toContain("docker volume create");
     expect(restoreScript).toContain("docker volume rm");
     expect(restoreScript).not.toMatch(/docker compose down|docker system prune/);
+  });
+
+  it("accepts a backup after the mutable Rangeway organization name has changed", () => {
+    expect(restoreScript).toContain("00000000-0000-4000-8000-000000000001");
+    expect(restoreScript).not.toMatch(/name\s*=\s*'Rangeway'/);
   });
 
   it("reports restore success only after temporary resources are removed", () => {

@@ -122,7 +122,7 @@ This section documents the mechanism for a later approved release; it is not app
 3. Confirm the equipped foundation gates, Operating Core, representative acceptance projects, and cutover plan are approved.
 4. Confirm the production environment file contains no placeholders, uses `NODE_ENV=production`, `AUTH_MODE=google`, an HTTPS `ATLAS_ORIGIN`, and a `DATABASE_URL` targeting `db:5432/atlas`. Development-owner seed variables must be absent.
 5. Confirm the V1 archive and V1 volumes are intact.
-6. If an Atlas V2 database already exists, require the pre-deploy backup emitted by the deployment script and pass its restore test before any operator-reviewed data restore.
+6. If an Atlas V2 database already exists, the deployment script must create an exact fresh backup and run the deployed `deploy/restore-test.sh` against that exact `ATLAS_BACKUP_PATH` before any source synchronization or migration. Any missing or failed restore test stops deployment with the previous commit and exact backup path. A first-ever deployment with no V2 database has no prior state to back up and may proceed without this pre-deploy restore step.
 7. Run the deploy script from the exact reviewed commit:
 
 ```bash
@@ -134,7 +134,7 @@ ATLAS_ENV_FILE=/etc/atlas-v2/production.env \
 ./deploy/deploy.sh
 ```
 
-The script validates the clean source tree, runs the local gates, resolves remote paths before mutation, backs up an existing V2 database, synchronizes source without data or secrets, builds, migrates, starts the services, verifies target-bound and public HTTPS health, and only then records `.atlas-release`.
+The script validates the clean source tree, runs the local gates, resolves remote paths before mutation, backs up an existing V2 database, proves that exact backup with a non-destructive restore test, and only then synchronizes source without data or secrets, builds, migrates, starts the services, verifies target-bound and public HTTPS health, and records `.atlas-release`.
 
 Record the released commit, previous commit, exact backup path, target-bound health response, public health response, migration rows, and service status in the change record.
 

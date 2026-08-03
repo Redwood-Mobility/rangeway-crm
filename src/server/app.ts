@@ -18,6 +18,7 @@ import {
 } from "./auth.js";
 import { db, now, upsertUser } from "./db.js";
 import { IdentityService } from "./modules/identity/identity.service.js";
+import { createOrganizationRouter } from "./modules/organizations/organization.routes.js";
 import {
   OrganizationService,
   type OrganizationMutationPort,
@@ -31,7 +32,10 @@ import {
   createApiErrorHandler,
   type ErrorLogger,
 } from "./platform/http/error-handler.js";
-import { assignRequestContext } from "./platform/http/request-context.js";
+import {
+  assignRequestContext,
+  requireActor,
+} from "./platform/http/request-context.js";
 import { ApiError } from "./platform/http/api-error.js";
 import {
   contactSchema,
@@ -153,9 +157,12 @@ app.use(
           provider: "local",
         }),
       ),
-    v2Organizations,
   ),
 );
+app.use("/api/v2", createOrganizationRouter(v2Organizations));
+app.use("/api/v2", requireActor, (_req, _res, next) => {
+  next(new ApiError(404, "NOT_FOUND", "Resource not found."));
+});
 
 function normalizeRecord(row: Row) {
   const record: Row = {};

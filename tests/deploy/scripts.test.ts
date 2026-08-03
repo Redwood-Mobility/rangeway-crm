@@ -197,10 +197,60 @@ printf metadata > "\${exact}/metadata.txt"
 (cd "\${exact}" && sha256sum atlas-postgres.dump atlas-artifacts.tgz metadata.txt > manifest.sha256)
 printf 'ATLAS_BACKUP_PATH=%s\\n' "\${exact}"
 `);
+  executable(path.join(fixture.remoteDirectory, "deploy/restore-test.sh"), `#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\\n' "$1" > "\${FAKE_LOG_DIR}/restore-test.log"
+if [[ "\${FAKE_RESTORE_FAIL:-0}" == "1" ]]; then
+  echo "simulated restore-test failure" >&2
+  exit 58
+fi
+echo "simulated restore-test success" >&2
+`);
   return exactBackup;
 }
 
 describe("deploy.sh behavior", () => {
+  it("allows a first deployment with no existing V2 database and no backup restore", () => {
+    const fixture = createDeployFixture();
+    const result = deploy(fixture);
+
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+    expect(existsSync(path.join(fixture.logDirectory, "restore-test.log"))).toBe(false);
+  });
+
+  it("restore-tests the exact fresh backup before syncing an existing V2 deployment", () => {
+    const fixture = createDeployFixture();
+    const exactBackup = installRemoteBackup(fixture);
+    const result = deploy(fixture, { FAKE_HAS_DB: "1" });
+
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+    expect(readFileSync(path.join(fixture.logDirectory, "restore-test.log"), "utf8").trim()).toBe(
+      exactBackup,
+    );
+    expect(existsSync(path.join(fixture.logDirectory, "rsync-1.args"))).toBe(true);
+  });
+
+  it("fails closed with recovery evidence before sync when the fresh backup restore test fails", () => {
+    const fixture = createDeployFixture();
+    const exactBackup = installRemoteBackup(fixture);
+    const result = deploy(fixture, {
+      FAKE_HAS_DB: "1",
+      FAKE_RESTORE_FAIL: "1",
+    });
+
+    expect(result.status).not.toBe(0);
+    expect(readFileSync(path.join(fixture.logDirectory, "restore-test.log"), "utf8").trim()).toBe(
+      exactBackup,
+    );
+    expect(existsSync(path.join(fixture.logDirectory, "rsync-counter"))).toBe(false);
+    expect(result.stderr).toContain(`Previous Git commit: ${releaseCommit}`);
+    expect(result.stderr).toContain(`Exact pre-deploy backup: ${exactBackup}`);
+    expect(result.stderr).toMatch(/stopped before source sync or migration/i);
+    expect(readFileSync(path.join(fixture.remoteDirectory, ".atlas-release"), "utf8").trim()).toBe(
+      releaseCommit,
+    );
+  });
+
   it("rejects a canonical backup root inside the synchronized remote tree before SSH", () => {
     const fixture = createDeployFixture();
     const result = deploy(fixture, {

@@ -137,12 +137,12 @@ MIGRATION_COUNT="$(
 ORGANIZATION_COUNT="$(
   docker exec "${TEMP_DB_CONTAINER}" psql \
     --username=atlas_restore --dbname=atlas_restore --tuples-only --no-align \
-    --command="SELECT count(*) FROM organizations WHERE slug = 'rangeway' AND name = 'Rangeway';"
+    --command="SELECT count(*) FROM organizations WHERE id = '00000000-0000-4000-8000-000000000001';"
 )"
 [[ "${ORGANIZATION_COUNT}" == "1" ]] \
-  || fail "restored database did not contain the Rangeway organization."
+  || fail "restored database did not contain the immutable Rangeway organization ID."
 
 trap - EXIT INT TERM
 cleanup_resources || fail "temporary restore-test resources could not all be removed."
 echo "Restore test passed for ${BACKUP_DIR}."
-echo "Verified schema migration row, Rangeway organization, and artifact archive extraction."
+echo "Verified schema migration row, immutable Rangeway organization ID, and artifact archive extraction."
