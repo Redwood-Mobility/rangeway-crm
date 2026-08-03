@@ -1,169 +1,133 @@
-# Atlas
+# Atlas V2 foundation
 
-Atlas is Rangeway's internal relationship and site-development system. It is intentionally not a generic sales CRM. It tracks the people, locations, diligence, and next steps behind a hospitality-driven EV charging network.
+Atlas is Rangeway's internal relationship and site-development system. It is being built as an operating office for the people, locations, diligence, decisions, and next actions behind a hospitality-driven EV charging network. It is not a generic sales CRM.
 
-## What Is Included
+> **Foundation status — do not deploy yet.** This branch proves the Atlas V2 platform foundation; it is not the complete operating-office UI. Do not deploy or cut over to it until the equipped foundation gates, the Operating Core, representative acceptance projects, and the cutover plan are separately reviewed and approved.
 
-- Google Workspace sign-in for `rangeway.energy` accounts.
-- Development password fallback for local work.
-- User profiles, with next steps assignable to Atlas users.
-- Stakeholders with Rangeway-specific types: hotel operators, real estate partners, landowners, utilities, energy partners, charging partners, investors, public agencies, vendors, team members, and community contacts.
-- Location pursuits with Rangeway network fields: Trailhead, Waystation, Basecamp, Summit, development phase, corridor, road context, land status, utility status, power strategy, hospitality scope, next milestone, and risk level.
-- Next steps that can be tied to a stakeholder, location pursuit, or both.
-- Diligence document uploads for PDF, DOC, DOCX, XLS, and XLSX with document type and development phase.
-- Activity timelines for stakeholders and location pursuits, including notes, calls, meetings, site visits, decisions, risks, and milestones.
-- A daily network briefing with priority pursuits, overdue follow-through, high-risk items, pipeline position, and recent activity.
-- Global Atlas search across stakeholders, location pursuits, next steps, and diligence (`⌘K` / `Ctrl+K`).
-- CSV exports for stakeholders, location pursuits, and next steps.
-- Auth-protected downloads from local storage.
-- SQLite persistence with Docker volumes for `data` and `uploads`.
-- VPS deployment using Docker Compose and Caddy HTTPS.
+The current foundation includes PostgreSQL migrations, organization-scoped human/agent/automation identities, stable API envelopes and request IDs, an atomic mutation/audit/outbox path, a bounded-retry outbox worker, and recoverable deployment and backup tooling. Project Rooms, Workstreams, universal Work Items, Today, portfolio health, decisions, risks, milestones, and their Kanban/list/calendar projections belong to the next Operating Core plan.
 
-## Rangeway Workflow Model
+## Architecture
 
-The app is organized around the work Rangeway actually does:
+Atlas V2 is a TypeScript modular monolith built and deployed from one repository as two long-running application processes:
 
-- **Stakeholders**: relationship intelligence for people and organizations that can unlock a site, fund it, power it, permit it, build it, operate it, or support it.
-- **Location Pursuits**: the project tracker for prospective Rangeway sites and corridors.
-- **Diligence**: controlled storage for site, land, utility, design, permitting, capital, partner, and operations files.
-- **Next Steps**: the practical follow-through layer for introductions, LOIs, utility screens, partner reviews, permitting items, and internal action items.
-- **Activity**: the running context log that explains what happened, who logged it, and what decisions or risks changed.
+- `atlas-web`: Express, the versioned `/api/v2` boundary, and the built React client.
+- `atlas-worker`: background outbox processing with bounded retries and safe concurrent claims.
 
-The dashboard focuses on active site pursuits, early-stage development, risk, development phase, format mix, upcoming next steps, and recent diligence.
+PostgreSQL 17 is authoritative for V2 records, audit history, and the transactional outbox. A separate `atlas-artifacts` volume is reserved for uploaded and generated artifacts. Caddy terminates production TLS. The web and worker use the same image but start with different commands.
 
-## Local Development
+Every client, human, agent, automation, and future integration crosses the API and shared permission boundary. No client receives direct database access. A successful business mutation, audit event, and outbox event commit in one PostgreSQL transaction.
+
+## V1 preservation and migration status
+
+The preserved V1 reference is branch `codex/atlas-v1-archive` at commit `2d90e4d281c477fa6290d62dfe7c6e9b1d8fe1c5`. V1 uses SQLite and its original upload storage.
+
+**No V1 data has been migrated to V2.** The V2 deployment files intentionally use only `atlas-db` and `atlas-artifacts`; they must never rename, delete, mount, or repurpose the V1 `crm-data` or `crm-uploads` volumes. Migration and cutover require a later, approved plan.
+
+## Local prerequisites
+
+- Node.js 22 and npm.
+- PostgreSQL 17 reachable through the `DATABASE_URL` in `.env`.
+- Docker only if using the local PostgreSQL container shown below or validating the production topology.
+- Git.
+
+The test suite may skip PostgreSQL integration tests only when PostgreSQL is recognizably unreachable. A skip is not passing integration evidence.
+
+## First local run
+
+Install the application and create the local environment file:
 
 ```bash
 npm install
 cp .env.example .env
-npm run dev
 ```
 
-Open `http://localhost:5173`.
+Edit `.env` and set explicit development-only values for:
 
-Google SSO is optional locally. Default development credentials are:
+```dotenv
+NODE_ENV=development
+AUTH_MODE=local
+DATABASE_URL=postgresql://atlas:atlas@localhost:5432/atlas
+ATLAS_DEV_OWNER_EMAIL=zak@winnick.io
+ATLAS_DEV_OWNER_NAME=Zak Winnick
+ATLAS_DEV_OWNER_PASSWORD=replace-with-a-local-password-of-at-least-12-characters
+```
 
-- Email: `admin@rangeway.energy`
-- Password: `rangeway-dev`
-
-Set real credentials in `.env` before production.
-
-## Useful Commands
+For a local PostgreSQL 17 container, create a dedicated development volume and container once:
 
 ```bash
+docker volume create atlas-v2-local-dev-db
+docker run --name atlas-v2-local-db --detach \
+  --publish 127.0.0.1:5432:5432 \
+  --env POSTGRES_USER=atlas \
+  --env POSTGRES_PASSWORD=atlas \
+  --env POSTGRES_DB=atlas \
+  --volume atlas-v2-local-dev-db:/var/lib/postgresql/data \
+  postgres:17-bookworm
+```
+
+On later runs, start that exact container with:
+
+```bash
+docker start atlas-v2-local-db
+```
+
+Build the server tools, migrate, and explicitly seed the one local Rangeway owner:
+
+```bash
+npm run build
+npm run db:migrate
+npm run db:seed:development
+```
+
+The seed command compiles to `dist/server/platform/db/seed-development.js`. It migrates first, creates the human owner through `IdentityService`, hashes the password with Argon2id, and is safe to rerun with the same credentials. It refuses `NODE_ENV=production`, any environment other than `development`, and any auth mode other than `local`. Web and worker startup never seed implicitly. Do not set the development-owner variables in a production environment file.
+
+Run the three local development processes in separate terminals:
+
+```bash
+npm run dev:server
+```
+
+```bash
+npm run dev:worker
+```
+
+```bash
+npm run dev:client
+```
+
+Open `http://localhost:5173`. `npm run dev` is a convenience command for web plus client; the worker still needs its own process.
+
+## Authentication and actors
+
+- **Human:** a real user with an organization membership. Local password login is available only with `AUTH_MODE=local` outside production and issues the canonical signed `rw_session` cookie. Production is constrained to Google Workspace mode.
+- **Agent:** a named service actor such as Codex or Hermes. It uses its own one-time `atlas_…` bearer credential and never impersonates an unrecorded human.
+- **Automation:** a non-human scheduled or event-driven actor. It also has its own bearer credential and distinct audit attribution.
+
+An HTTP request may present one human session cookie or one Atlas bearer credential, never both. Every authenticated actor is organization-scoped and every mutation carries the actor and request ID into audit and outbox records.
+
+## Verification commands
+
+```bash
+npm test
 npm run typecheck
 npm run build
-npm start
+npx --yes @redocly/cli lint openapi/atlas-v2.yaml
+docker compose config >/dev/null
+git diff --check
 ```
 
-## Environment
-
-Copy `.env.example` to `.env` and update:
+The smoke test is available directly with:
 
 ```bash
-CRM_DOMAIN=atlas.rangeway.app
-PUBLIC_URL=https://atlas.rangeway.app
-ADMIN_EMAIL=admin@rangeway.energy
-ADMIN_PASSWORD=use-a-long-password
-SESSION_SECRET=use-a-long-random-secret
-GOOGLE_CLIENT_ID=your-google-oauth-client-id
-GOOGLE_CLIENT_SECRET=your-google-oauth-client-secret
-GOOGLE_ALLOWED_DOMAIN=rangeway.energy
-DATABASE_PATH=/app/data/rangeway-crm.sqlite
-UPLOAD_DIR=/app/uploads
-MAX_UPLOAD_MB=30
+npm test -- tests/smoke/platform-foundation.test.ts
 ```
 
-Generate a session secret with:
+## Source documents and operator guides
 
-```bash
-openssl rand -base64 48
-```
+- [Approved Atlas V2 design](docs/superpowers/specs/2026-08-02-atlas-v2-design.md)
+- [Platform foundation implementation plan](docs/superpowers/plans/2026-08-02-atlas-v2-platform-foundation.md)
+- [Atlas V2 OpenAPI contract](openapi/atlas-v2.yaml)
+- [Operations runbook](docs/runbooks/atlas-v2-operations.md)
+- [Restore-test runbook](docs/runbooks/atlas-v2-restore-test.md)
 
-## VPS Deployment
-
-This app is designed to run on an Ubuntu VPS with Docker.
-
-1. Point DNS for `atlas.rangeway.app` to the VPS public IP.
-2. Install Docker and the Compose plugin on the VPS.
-3. Create production env values locally.
-4. Deploy over SSH.
-
-```bash
-cp deploy/env.production.example .env.production
-openssl rand -base64 48
-# Edit .env.production and paste SESSION_SECRET plus Google OAuth values.
-
-ATLAS_HOST=your-vps-ip ATLAS_USER=root ./deploy/deploy.sh
-```
-
-Caddy will request and renew HTTPS certificates automatically once DNS points at the server and ports `80` and `443` are open.
-
-If the VPS does not have Docker yet, copy and run the bootstrap script once:
-
-```bash
-scp deploy/bootstrap-ubuntu.sh root@your-vps-ip:/tmp/bootstrap-ubuntu.sh
-ssh root@your-vps-ip 'bash /tmp/bootstrap-ubuntu.sh'
-```
-
-## Google Workspace SSO
-
-Create an OAuth client in Google Cloud for a web application.
-
-Use these values for production:
-
-- Authorized JavaScript origin: `https://atlas.rangeway.app`
-- Authorized redirect URI: `https://atlas.rangeway.app/api/auth/google/callback`
-
-For local testing with Google SSO, add:
-
-- Authorized JavaScript origin: `http://localhost:5173`
-- Authorized redirect URI: `http://localhost:5173/api/auth/google/callback`
-
-Then set:
-
-```bash
-GOOGLE_CLIENT_ID=...
-GOOGLE_CLIENT_SECRET=...
-GOOGLE_ALLOWED_DOMAIN=rangeway.energy
-PUBLIC_URL=https://atlas.rangeway.app
-```
-
-Atlas sends `hd=rangeway.energy` to Google for Workspace routing and also verifies the signed-in user has a verified `rangeway.energy` email before creating or updating their profile.
-
-## Updating Production
-
-```bash
-git pull
-docker compose up -d --build
-docker compose logs -f crm
-```
-
-## Backups
-
-The important production data lives in Docker volumes. Compose names them after the project, which is the directory name on the server (`/opt/atlas`):
-
-- `atlas_crm-data`
-- `atlas_crm-uploads`
-
-The Compose project name is pinned to `atlas`, so these volume names remain stable even if the checkout directory changes.
-
-For a simple server-side backup:
-
-```bash
-mkdir -p ~/atlas-backups
-docker run --rm -v atlas_crm-data:/data -v "$HOME/atlas-backups:/backup" alpine tar czf /backup/crm-data-$(date +%F).tgz -C /data .
-docker run --rm -v atlas_crm-uploads:/uploads -v "$HOME/atlas-backups:/backup" alpine tar czf /backup/crm-uploads-$(date +%F).tgz -C /uploads .
-```
-
-## Hostinger API Notes
-
-Hostinger has an API for account and VPS operations, including VPS stats and management. Their docs say API tokens are generated in hPanel account settings, and they provide official PHP, Python, and TypeScript SDKs plus a `hapi` CLI.
-
-For Atlas, the simplest first deployment path is still SSH plus Docker Compose. The Hostinger API is useful later for automation such as listing VPS instances, checking metrics, restarting a VPS, or wiring deployment commands into CI.
-
-References:
-
-- [What Is Hostinger API](https://www.hostinger.com/support/10840865-what-is-hostinger-api/)
-- [Introduction to Hostinger API SDKs](https://www.hostinger.com/support/11080244-introduction-to-hostinger-api-sdks/)
-- [How to Use Hostinger API CLI](https://www.hostinger.com/support/11679133-how-to-use-hostinger-api-cli/)
+The deployment scripts are foundation artifacts, not deployment approval. Production deployment remains blocked by the warning at the top of this guide.

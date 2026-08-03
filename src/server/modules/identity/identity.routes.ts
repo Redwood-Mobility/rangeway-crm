@@ -11,12 +11,21 @@ import {
   setHumanSessionCookie,
 } from "../../platform/http/request-context.js";
 import { ApiError } from "../../platform/http/api-error.js";
+import type { OrganizationMutationPort } from "../organizations/organization.service.js";
 
 const rangewayOrganizationId = "00000000-0000-4000-8000-000000000001";
 
 const localLoginSchema = z.object({
   email: z.email().transform((email) => email.toLowerCase()),
   password: z.string().min(1),
+});
+
+const organizationParamsSchema = z.object({
+  organizationId: z.uuid(),
+});
+
+const organizationNameSchema = z.strictObject({
+  name: z.string().trim().min(1).max(200),
 });
 
 export interface V2IdentityPort extends IdentityAuthenticationPort {
@@ -40,6 +49,7 @@ export function createIdentityRouter(
   config: Config,
   identity: V2IdentityPort,
   resolveSessionUser: SessionUserResolver,
+  organizations?: OrganizationMutationPort,
 ): Router {
   const router = Router();
 
@@ -89,6 +99,19 @@ export function createIdentityRouter(
   router.get("/me", requireActor, (req, res) => {
     res.json({ actor: req.actor });
   });
+
+  if (organizations) {
+    router.patch("/organizations/:organizationId", requireActor, async (req, res) => {
+      const { organizationId } = organizationParamsSchema.parse(req.params);
+      const { name } = organizationNameSchema.parse(req.body);
+      const organization = await organizations.rename(
+        req.actor!,
+        organizationId,
+        name,
+      );
+      res.json({ organization });
+    });
+  }
 
   router.use(requireActor, (_req, _res, next) => {
     next(notFound());

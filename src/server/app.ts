@@ -6,6 +6,7 @@ import cors from "cors";
 import express from "express";
 import multer from "multer";
 import { nanoid } from "nanoid";
+import type { Pool } from "pg";
 import { ZodError } from "zod";
 import { config as defaultConfig } from "./config.js";
 import {
@@ -17,6 +18,10 @@ import {
 } from "./auth.js";
 import { db, now, upsertUser } from "./db.js";
 import { IdentityService } from "./modules/identity/identity.service.js";
+import {
+  OrganizationService,
+  type OrganizationMutationPort,
+} from "./modules/organizations/organization.service.js";
 import {
   createIdentityRouter,
   type V2IdentityPort,
@@ -65,6 +70,8 @@ const allowedMimeTypes = new Set([
 export interface CreateAppOptions {
   config?: typeof defaultConfig;
   v2Identity?: V2IdentityPort;
+  v2Organizations?: OrganizationMutationPort;
+  v2Pool?: Pool;
   googleOAuth?: GoogleOAuthGateway;
   logger?: ErrorLogger;
 }
@@ -75,8 +82,11 @@ const app = express();
 const clientDir = path.join(process.cwd(), "dist", "client");
 const documentDir = path.join(config.uploadDir, "documents");
 const tempDir = path.join(config.uploadDir, "tmp");
+const v2Pool = options.v2Pool ?? createPool(config.databaseUrl);
 const v2Identity =
-  options.v2Identity ?? new IdentityService(createPool(config.databaseUrl));
+  options.v2Identity ?? new IdentityService(v2Pool);
+const v2Organizations =
+  options.v2Organizations ?? new OrganizationService(v2Pool);
 const v2ErrorHandler = createApiErrorHandler(options.logger);
 const requireV1Auth = createRequireAuth(config.sessionSecret);
 const googleOAuth: GoogleOAuthGateway = options.googleOAuth ?? {
@@ -131,15 +141,19 @@ if (!config.isProduction) {
 
 app.use(
   "/api/v2",
-  createIdentityRouter(config, v2Identity, (identity, email) =>
-    sessionUser(
-      upsertUser({
-        email,
-        name: identity.actorName,
-        picture: "",
-        provider: "local",
-      }),
-    ),
+  createIdentityRouter(
+    config,
+    v2Identity,
+    (identity, email) =>
+      sessionUser(
+        upsertUser({
+          email,
+          name: identity.actorName,
+          picture: "",
+          provider: "local",
+        }),
+      ),
+    v2Organizations,
   ),
 );
 

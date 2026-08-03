@@ -17,6 +17,8 @@ tags:
     description: Service health and readiness.
   - name: Identity
     description: Actor authentication and session lifecycle.
+  - name: Organizations
+    description: Organization-scoped foundation operations.
 security:
   - sessionCookie: []
   - atlasBearer: []
@@ -148,6 +150,50 @@ paths:
           $ref: "#/components/responses/ApiError"
         4XX:
           $ref: "#/components/responses/ApiError"
+  /organizations/{organizationId}:
+    patch:
+      operationId: updateOrganization
+      summary: Update an organization name
+      description: >-
+        Updates the authenticated actor's organization name. Cross-organization
+        targets use the same safe NOT_FOUND envelope as unknown resources. This
+        narrow foundation operation exists to prove atomic mutation, audit, and
+        outbox behavior before Operating Core resources are introduced.
+      tags: [Organizations]
+      parameters:
+        - $ref: "#/components/parameters/RequestId"
+        - name: organizationId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/OrganizationUpdateRequest"
+      responses:
+        "200":
+          description: The organization name was updated and audit/outbox records were committed.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OrganizationResponse"
+        "400":
+          $ref: "#/components/responses/ApiError"
+        "401":
+          $ref: "#/components/responses/ApiError"
+        "403":
+          $ref: "#/components/responses/ApiError"
+        "404":
+          $ref: "#/components/responses/ApiError"
+        "500":
+          $ref: "#/components/responses/ApiError"
 components:
   securitySchemes:
     sessionCookie:
@@ -215,6 +261,32 @@ components:
           type: string
           format: password
           minLength: 1
+    OrganizationUpdateRequest:
+      type: object
+      additionalProperties: false
+      required: [name]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 200
+    OrganizationResponse:
+      type: object
+      additionalProperties: false
+      required: [organization]
+      properties:
+        organization:
+          type: object
+          additionalProperties: false
+          required: [id, name]
+          properties:
+            id:
+              type: string
+              format: uuid
+            name:
+              type: string
+              minLength: 1
+              maxLength: 200
     ActorContext:
       type: object
       additionalProperties: false
