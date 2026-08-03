@@ -205,9 +205,9 @@ describe("PostgreSQL platform migrations", () => {
       ]);
       await pool.query(
         `INSERT INTO actors
-           (id, organization_id, type, service_key_prefix, service_key_hash, display_name)
-         VALUES ($1, $2, 'automation', $3, $4, $5)`,
-        [rangewayActorId, rangewayOrganizationId, "crossorgtest", "test-hash", "Test automation"],
+           (id, organization_id, type, role, service_key_prefix, service_key_hash, display_name)
+         VALUES ($1, $2, 'automation', 'member', $3, $4, $5)`,
+        [rangewayActorId, rangewayOrganizationId, "crossorgtest", "a".repeat(64), "Test automation"],
       );
 
       await expect(

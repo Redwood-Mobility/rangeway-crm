@@ -28,6 +28,7 @@ CREATE TABLE actors (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   organization_id UUID NOT NULL REFERENCES organizations(id) ON DELETE RESTRICT,
   type actor_type NOT NULL,
+  role organization_role NOT NULL,
   user_id UUID REFERENCES users(id) ON DELETE RESTRICT,
   service_key_prefix TEXT UNIQUE,
   service_key_hash TEXT,
@@ -48,7 +49,14 @@ CREATE TABLE actors (
       AND service_key_hash IS NOT NULL
     )
   ),
-  CONSTRAINT actors_organization_id_id_unique UNIQUE (organization_id, id)
+  CONSTRAINT actors_service_key_prefix_length_check CHECK (
+    service_key_prefix IS NULL OR char_length(service_key_prefix) = 12
+  ),
+  CONSTRAINT actors_service_key_hash_shape_check CHECK (
+    service_key_hash IS NULL OR service_key_hash ~ '^[0-9a-f]{64}$'
+  ),
+  CONSTRAINT actors_organization_id_id_unique UNIQUE (organization_id, id),
+  CONSTRAINT actors_organization_user_role_unique UNIQUE (organization_id, user_id, role)
 );
 
 CREATE UNIQUE INDEX actors_organization_user_unique
@@ -61,8 +69,22 @@ CREATE TABLE organization_memberships (
   user_id UUID NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
   role organization_role NOT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  PRIMARY KEY (organization_id, user_id)
+  PRIMARY KEY (organization_id, user_id),
+  CONSTRAINT organization_memberships_organization_user_role_unique
+    UNIQUE (organization_id, user_id, role),
+  CONSTRAINT organization_memberships_actor_role_fk
+    FOREIGN KEY (organization_id, user_id, role)
+    REFERENCES actors (organization_id, user_id, role)
+    ON DELETE RESTRICT
+    DEFERRABLE INITIALLY DEFERRED
 );
+
+ALTER TABLE actors
+  ADD CONSTRAINT actors_human_membership_role_fk
+  FOREIGN KEY (organization_id, user_id, role)
+  REFERENCES organization_memberships (organization_id, user_id, role)
+  ON DELETE RESTRICT
+  DEFERRABLE INITIALLY DEFERRED;
 
 CREATE INDEX organization_memberships_user_id_idx
   ON organization_memberships (user_id);
