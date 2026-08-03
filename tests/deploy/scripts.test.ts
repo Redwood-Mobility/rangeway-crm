@@ -14,7 +14,12 @@ import {
 } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+// Each case spawns deploy.sh plus a tree of shell subprocesses and takes several
+// seconds on its own. The 15s default is exceeded only when they run together,
+// so the budget is raised here rather than leaving the suite intermittently red.
+vi.setConfig({ testTimeout: 90_000, hookTimeout: 90_000 });
 
 const sourceRoot = path.resolve(import.meta.dirname, "../..");
 const temporaryRoots: string[] = [];
@@ -236,6 +241,13 @@ else
 fi`);
   fakeTool(binDirectory, "flock", "exit 0");
   fakeTool(binDirectory, "sleep", "exit 0");
+  // deploy.sh runs a real `npm run typecheck` and `npm run build`. These cases
+  // exercise deploy.sh's own behaviour, not the compiler, and running the real
+  // build once per case grows with the codebase until every case times out.
+  // The invocation is still recorded so a deploy that skipped the build fails.
+  fakeTool(binDirectory, "npm", `
+printf '%s\\n' "$*" >> "\${FAKE_LOG_DIR}/npm.log"
+exit \${FAKE_NPM_EXIT:-0}`);
   fakeTool(binDirectory, "docker", `
 printf '%s\\n' "$*" >> "\${FAKE_LOG_DIR}/docker.log"
 if [[ "\${1:-}" == "compose" && ! -f "\${FAKE_REMOTE_DIR}/docker-compose.yml" ]]; then

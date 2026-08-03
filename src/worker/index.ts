@@ -45,6 +45,9 @@ export function createProductionOutboxHandlers(): OutboxHandlerRegistry {
     [atlasEventTypes.counterpartyChanged]: acknowledgeFoundationEvent,
     [atlasEventTypes.projectRelationshipChanged]: acknowledgeFoundationEvent,
     [atlasEventTypes.savedViewChanged]: acknowledgeFoundationEvent,
+    [atlasEventTypes.artifactChanged]: acknowledgeFoundationEvent,
+    [atlasEventTypes.evidenceChanged]: acknowledgeFoundationEvent,
+    [atlasEventTypes.pursuitChanged]: acknowledgeFoundationEvent,
   } satisfies Record<AtlasEventType, OutboxHandler>;
 }
 

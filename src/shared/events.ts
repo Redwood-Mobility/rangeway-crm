@@ -21,6 +21,9 @@ export const atlasEventTypes = {
   counterpartyChanged: "counterparty.changed.v1",
   projectRelationshipChanged: "project.relationship-changed.v1",
   savedViewChanged: "saved-view.changed.v1",
+  artifactChanged: "artifact.changed.v1",
+  evidenceChanged: "evidence.changed.v1",
+  pursuitChanged: "pursuit.changed.v1",
 } as const;
 
 export type AtlasEventType =

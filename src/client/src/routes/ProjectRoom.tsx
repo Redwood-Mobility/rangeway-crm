@@ -1,6 +1,7 @@
 import React, { useState, type FormEvent } from "react";
 import { Link, NavLink, useParams } from "react-router";
 import { Pencil } from "lucide-react";
+import { Gates } from "./Gates.js";
 import { useAddHealthUpdate, useProjectContext, useUpdateProject } from "../api/queries.js";
 import {
   boardLanes,
@@ -118,7 +119,9 @@ export function ProjectRoom() {
       {tab === "overview" ? <Overview data={data} /> : null}
       {tab === "work" ? <WorkSection data={data} /> : null}
       {tab === "milestones" ? <Milestones data={data} /> : null}
-      {tab === "gates" ? <Gates project={project} /> : null}
+      {tab === "gates" ? (
+        <Gates projectId={project.id} templateType={project.templateType} />
+      ) : null}
       {tab === "stakeholders" ? <Stakeholders data={data} /> : null}
       {tab === "decisions" ? <DecisionsAndRisks data={data} /> : null}
       {tab === "activity" ? <Activity data={data} /> : null}
@@ -448,27 +451,6 @@ function Milestones({ data }: { data: Context }) {
         </tbody>
       </table>
     </div>
-  );
-}
-
-/**
- * The Location Pursuit gate engine is Task 3. This slot states that plainly
- * rather than showing a placeholder that looks like working functionality.
- */
-function Gates({ project }: { project: Context["project"] }) {
-  return (
-    <EmptyState
-      title={
-        project.templateType === "location_pursuit"
-          ? "Development-area gates are not built yet"
-          : "This project does not use the Location Pursuit template"
-      }
-      description={
-        project.templateType === "location_pursuit"
-          ? "The eight development areas, requirement states, evidence and phase reconciliation arrive with the Location Pursuit engine. Nothing is being tracked here yet."
-          : "Only Location Pursuit projects carry development-area gates."
-      }
-    />
   );
 }
 

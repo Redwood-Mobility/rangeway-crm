@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { Pool } from "pg";
 import { describe, expect, it, type TestContext } from "vitest";
+import { atlasEventTypes } from "../../src/shared/events.js";
 import { createPool } from "../../src/server/platform/db/client.js";
 import { runMigrations } from "../../src/server/platform/db/migrate.js";
 import {
@@ -139,30 +140,11 @@ describe("outbox worker entrypoint lifecycle", () => {
 
   it("registers an explicit production handler for every event the foundation emits", async () => {
     const handlers = createProductionOutboxHandlers();
-    expect(Object.keys(handlers).sort()).toEqual([
-      "activity.recorded.v1",
-      "blocker.changed.v1",
-      "counterparty.changed.v1",
-      "decision.changed.v1",
-      "identity.google-linked.v1",
-      "identity.google-profile-updated.v1",
-      "identity.owner-provisioned.v1",
-      "identity.service-actor-created.v1",
-      "identity.service-actor-disabled.v1",
-      "label.changed.v1",
-      "milestone.changed.v1",
-      "organization.updated.v1",
-      "person.changed.v1",
-      "project.changed.v1",
-      "project.health-changed.v1",
-      "project.membership-changed.v1",
-      "project.relationship-changed.v1",
-      "risk.changed.v1",
-      "saved-view.changed.v1",
-      "work-item.changed.v1",
-      "work-item.dependency-changed.v1",
-      "workstream.changed.v1",
-    ]);
+    // Derived from the shared registry so a newly emitted event type fails
+    // this test until a production handler is registered for it.
+    expect(Object.keys(handlers).sort()).toEqual(
+      [...new Set(Object.values(atlasEventTypes))].sort(),
+    );
     for (const eventType of Object.keys(handlers)) {
       await expect(handlers[eventType as keyof typeof handlers]!(
         {
