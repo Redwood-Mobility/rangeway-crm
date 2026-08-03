@@ -6,6 +6,7 @@ import { AtlasApiError } from "./api/client.js";
 import { useMe } from "./api/queries.js";
 import { AppShell } from "./app/AppShell.js";
 import { ErrorState, LoadingState } from "./components/primitives.js";
+import { Agents } from "./routes/Agents.js";
 import { CommandCenter } from "./routes/CommandCenter.js";
 import { NotFound } from "./routes/NotFound.js";
 import { People } from "./routes/People.js";
@@ -67,6 +68,7 @@ function App() {
         <Route path="/projects/:projectId/:tab" element={<ProjectRoom />} />
         <Route path="/work" element={<Work />} />
         <Route path="/work/:view" element={<Work />} />
+        <Route path="/settings/agents" element={<Agents />} />
         <Route path="/stakeholders" element={<People />} />
         <Route path="/stakeholders/:index" element={<People />} />
         <Route path="*" element={<NotFound />} />

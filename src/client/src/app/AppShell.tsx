@@ -13,6 +13,7 @@ import {
   Sun,
   Sunrise,
   UsersRound,
+  Bot,
 } from "lucide-react";
 import { useMe, useSignOut } from "../api/queries.js";
 import { ToastRegion } from "../components/toast.js";
@@ -25,6 +26,7 @@ const navigation = [
   { to: "/work", label: "Work", icon: FolderKanban },
   { to: "/work/calendar", label: "Calendar", icon: CalendarDays, end: true },
   { to: "/stakeholders", label: "Stakeholders", icon: UsersRound },
+  { to: "/settings/agents", label: "Agents", icon: Bot },
 ];
 
 type Theme = "light" | "dark";
