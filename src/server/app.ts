@@ -8,7 +8,13 @@ import multer from "multer";
 import { nanoid } from "nanoid";
 import { ZodError } from "zod";
 import { config as defaultConfig } from "./config.js";
-import { clearSessionCookie, constantTimeEqual, currentUser, requireAuth, setSessionCookie } from "./auth.js";
+import {
+  clearSessionCookie,
+  constantTimeEqual,
+  createRequireAuth,
+  currentUser,
+  setSessionCookie,
+} from "./auth.js";
 import { db, migrate, now, upsertUser } from "./db.js";
 import { IdentityService } from "./modules/identity/identity.service.js";
 import {
@@ -21,6 +27,7 @@ import {
   type ErrorLogger,
 } from "./platform/http/error-handler.js";
 import { assignRequestContext } from "./platform/http/request-context.js";
+import { ApiError } from "./platform/http/api-error.js";
 import {
   contactSchema,
   activitySchema,
@@ -33,6 +40,18 @@ import {
 } from "./schemas.js";
 
 type Row = Record<string, unknown>;
+const rangewayOrganizationId = "00000000-0000-4000-8000-000000000001";
+
+export interface GoogleProfile {
+  email: string;
+  name: string;
+  picture: string;
+}
+
+export interface GoogleOAuthGateway {
+  exchangeCode(code: string): Promise<string>;
+  verifyIdToken(idToken: string): Promise<GoogleProfile>;
+}
 
 const allowedExtensions = new Set([".pdf", ".doc", ".docx", ".xls", ".xlsx"]);
 const allowedMimeTypes = new Set([
@@ -46,6 +65,7 @@ const allowedMimeTypes = new Set([
 export interface CreateAppOptions {
   config?: typeof defaultConfig;
   v2Identity?: V2IdentityPort;
+  googleOAuth?: GoogleOAuthGateway;
   logger?: ErrorLogger;
 }
 
@@ -58,6 +78,31 @@ const tempDir = path.join(config.uploadDir, "tmp");
 const v2Identity =
   options.v2Identity ?? new IdentityService(createPool(config.databaseUrl));
 const v2ErrorHandler = createApiErrorHandler(options.logger);
+const requireV1Auth = createRequireAuth(config.sessionSecret);
+const googleOAuth: GoogleOAuthGateway = options.googleOAuth ?? {
+  async exchangeCode(code) {
+    const tokenResponse = await fetch("https://oauth2.googleapis.com/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        code,
+        client_id: config.googleClientId,
+        client_secret: config.googleClientSecret,
+        redirect_uri: redirectUri(),
+        grant_type: "authorization_code"
+      })
+    });
+    const tokenData = (await tokenResponse.json()) as {
+      id_token?: string;
+      error_description?: string;
+    };
+    if (!tokenResponse.ok || !tokenData.id_token) {
+      throw new Error(tokenData.error_description || "Google sign-in failed.");
+    }
+    return tokenData.id_token;
+  },
+  verifyIdToken: verifyGoogleIdToken,
+};
 
 fs.mkdirSync(documentDir, { recursive: true });
 fs.mkdirSync(tempDir, { recursive: true });
@@ -84,7 +129,19 @@ if (!config.isProduction) {
   app.use(cors({ origin: "http://localhost:5173", credentials: true }));
 }
 
-app.use("/api/v2", createIdentityRouter(config, v2Identity));
+app.use(
+  "/api/v2",
+  createIdentityRouter(config, v2Identity, (identity, email) =>
+    sessionUser(
+      upsertUser({
+        email,
+        name: identity.actorName,
+        picture: "",
+        provider: "local",
+      }),
+    ),
+  ),
+);
 
 function normalizeRecord(row: Row) {
   const record: Row = {};
@@ -283,7 +340,7 @@ app.get("/api/health", (_req, res) => {
 });
 
 app.get("/api/me", (req, res) => {
-  res.json({ user: currentUser(req) });
+  res.json({ user: currentUser(req, config.sessionSecret) });
 });
 
 app.get("/api/auth/google", (_req, res) => {
@@ -324,26 +381,28 @@ app.get("/api/auth/google/callback", async (req, res, next) => {
       return;
     }
 
-    const tokenResponse = await fetch("https://oauth2.googleapis.com/token", {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({
-        code,
-        client_id: config.googleClientId,
-        client_secret: config.googleClientSecret,
-        redirect_uri: redirectUri(),
-        grant_type: "authorization_code"
-      })
-    });
-
-    const tokenData = (await tokenResponse.json()) as { id_token?: string; error_description?: string };
-    if (!tokenResponse.ok || !tokenData.id_token) {
-      throw new Error(tokenData.error_description || "Google sign-in failed.");
+    const idToken = await googleOAuth.exchangeCode(code);
+    const verifiedGoogleUser = await googleOAuth.verifyIdToken(idToken);
+    const googleUser = {
+      ...verifiedGoogleUser,
+      email: verifiedGoogleUser.email.toLowerCase(),
+    };
+    const actor = await v2Identity.authenticateHuman(
+      rangewayOrganizationId,
+      googleUser.email,
+    );
+    if (actor.actorType !== "human" || !actor.userId) {
+      throw new ApiError(401, "UNAUTHENTICATED", "Authentication required.");
     }
-
-    const googleUser = await verifyGoogleIdToken(tokenData.id_token);
     const user = upsertUser({ ...googleUser, provider: "google" });
-    setSessionCookie(res, sessionUser(user));
+    setSessionCookie(
+      res,
+      {
+        ...sessionUser(user),
+        organizationId: actor.organizationId,
+      },
+      config.sessionSecret,
+    );
     res.redirect(config.publicUrl);
   } catch (error) {
     next(error);
@@ -363,7 +422,11 @@ app.post("/api/login", (req, res) => {
   }
   const user = upsertUser({ email: config.adminEmail, name: "Atlas Admin", provider: "local" });
   const payload = sessionUser(user);
-  setSessionCookie(res, payload);
+  setSessionCookie(
+    res,
+    { ...payload, organizationId: rangewayOrganizationId },
+    config.sessionSecret,
+  );
   res.json({ user: payload });
 });
 
@@ -372,8 +435,8 @@ app.post("/api/logout", (_req, res) => {
   res.json({ ok: true });
 });
 
-app.use("/api", requireAuth);
-app.use("/documents", requireAuth);
+app.use("/api", requireV1Auth);
+app.use("/documents", requireV1Auth);
 
 app.get("/api/users", (_req, res) => {
   const users = db.prepare("SELECT id, email, name, picture, role, last_login_at FROM users ORDER BY name ASC").all() as Row[];
@@ -949,6 +1012,10 @@ app.delete("/api/tasks/:id", (req, res) => {
 app.use((error: unknown, req: express.Request, res: express.Response, next: express.NextFunction) => {
   if (req.originalUrl.startsWith("/api/v2")) {
     v2ErrorHandler(error, req, res, next);
+    return;
+  }
+  if (error instanceof ApiError) {
+    res.status(error.status).json({ error: error.publicMessage });
     return;
   }
   if (error instanceof ZodError) {

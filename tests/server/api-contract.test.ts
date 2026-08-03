@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import request from "supertest";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createApp } from "../../src/server/app.js";
 import { config } from "../../src/server/config.js";
 import { ApiError } from "../../src/server/platform/http/api-error.js";
@@ -88,6 +88,10 @@ function expectRequestId(response: request.Response): string {
 }
 
 describe("Atlas V2 API contract", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
   it("adds a request UUID to every response and retains only a valid supplied UUID", async () => {
     const generated = await request(testApp()).get("/api/v2/health");
     const suppliedRequestId = randomUUID();
@@ -194,6 +198,7 @@ describe("Atlas V2 API contract", () => {
     expect(setCookie).toContain("HttpOnly");
     expect(setCookie).toContain("Secure");
     expect(setCookie).toContain("SameSite=Lax");
+    expect(setCookie).toContain("Max-Age=43200");
     expect(setCookie).not.toContain("correct-horse-battery-staple");
 
     const cookie = setCookie.split(";")[0];
@@ -201,6 +206,41 @@ describe("Atlas V2 API contract", () => {
     const meRequestId = expectRequestId(me);
     expect(me.status).toBe(200);
     expect(me.body).toEqual({ actor: { ...humanIdentity, requestId: meRequestId } });
+
+    const legacyMe = await request(app).get("/api/me").set("Cookie", cookie);
+    expect(legacyMe.status).toBe(200);
+    expect(legacyMe.body).toEqual({
+      user: {
+        id: expect.any(String),
+        email: "admin@rangeway.energy",
+        name: "Atlas Admin",
+        picture: "",
+      },
+    });
+  });
+
+  it("expires a signed session after exactly the configured 12-hour lifetime", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-08-02T12:00:00.000Z"));
+    const app = testApp();
+    const login = await request(app).post("/api/v2/auth/local/login").send({
+      email: "admin@rangeway.energy",
+      password: "correct-horse-battery-staple",
+    });
+    const cookie = login.headers["set-cookie"][0].split(";")[0];
+
+    vi.setSystemTime(new Date("2026-08-03T00:00:00.001Z"));
+    const response = await request(app).get("/api/v2/me").set("Cookie", cookie);
+    const requestId = expectRequestId(response);
+
+    expect(response.status).toBe(401);
+    expect(response.body).toEqual({
+      error: {
+        code: "UNAUTHENTICATED",
+        message: "Authentication required.",
+        requestId,
+      },
+    });
   });
 
   it("never creates a human session for a non-human local identity", async () => {
@@ -244,6 +284,106 @@ describe("Atlas V2 API contract", () => {
 
     expect(response.status).toBe(200);
     expect(response.body).toEqual({ actor: { ...serviceIdentity, requestId } });
+  });
+
+  it("accepts the Bearer scheme case-insensitively with separating whitespace", async () => {
+    const response = await request(testApp())
+      .get("/api/v2/me")
+      .set("Authorization", `bearer\t${serviceKey}`);
+    const requestId = expectRequestId(response);
+
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual({ actor: { ...serviceIdentity, requestId } });
+  });
+
+  it("uses the canonical human session for Google callback and V2 actor resolution", async () => {
+    const identity = new ContractIdentity();
+    const authenticateHuman = vi.spyOn(identity, "authenticateHuman");
+    const googleOAuth = {
+      exchangeCode: vi.fn(async () => "verified-google-id-token"),
+      verifyIdToken: vi.fn(async () => ({
+        email: "ADMIN@RANGEWAY.ENERGY",
+        name: "Atlas Admin",
+        picture: "https://example.test/avatar.png",
+      })),
+    };
+    const app = createApp({
+      config: {
+        ...config,
+        nodeEnv: "test",
+        authMode: "google",
+        isProduction: false,
+        sessionSecret: "contract-test-session-secret-at-least-32-characters",
+        googleClientId: "google-client-id",
+        googleClientSecret: "google-client-secret",
+        publicUrl: "http://localhost:5173",
+      },
+      v2Identity: identity,
+      googleOAuth,
+      logger: { error: () => undefined },
+    });
+    const begin = await request(app).get("/api/auth/google");
+    const stateCookie = begin.headers["set-cookie"][0].split(";")[0];
+    const state = new URL(begin.headers.location).searchParams.get("state");
+    const callback = await request(app)
+      .get("/api/auth/google/callback")
+      .query({ code: "authorization-code", state })
+      .set("Cookie", stateCookie);
+    const sessionCookieHeader = callback.headers["set-cookie"].find((value: string) =>
+      value.startsWith("rw_session="),
+    );
+    const sessionCookie = sessionCookieHeader.split(";")[0];
+
+    expect(callback.status).toBe(302);
+    expect(googleOAuth.exchangeCode).toHaveBeenCalledWith("authorization-code");
+    expect(googleOAuth.verifyIdToken).toHaveBeenCalledWith("verified-google-id-token");
+    expect(authenticateHuman).toHaveBeenCalledWith(
+      organizationId,
+      "admin@rangeway.energy",
+    );
+
+    const me = await request(app).get("/api/v2/me").set("Cookie", sessionCookie);
+    const requestId = expectRequestId(me);
+    expect(me.status).toBe(200);
+    expect(me.body).toEqual({ actor: { ...humanIdentity, requestId } });
+  });
+
+  it("does not issue a Google session when V2 actor validation rejects the human", async () => {
+    const identity = new ContractIdentity();
+    vi.spyOn(identity, "authenticateHuman").mockRejectedValue(
+      new ApiError(401, "UNAUTHENTICATED", "Authentication required."),
+    );
+    const app = createApp({
+      config: {
+        ...config,
+        nodeEnv: "test",
+        authMode: "google",
+        isProduction: false,
+        sessionSecret: "contract-test-session-secret-at-least-32-characters",
+        googleClientId: "google-client-id",
+        googleClientSecret: "google-client-secret",
+      },
+      v2Identity: identity,
+      googleOAuth: {
+        exchangeCode: async () => "verified-google-id-token",
+        verifyIdToken: async () => ({
+          email: "admin@rangeway.energy",
+          name: "Disabled Atlas Admin",
+          picture: "",
+        }),
+      },
+      logger: { error: () => undefined },
+    });
+    const response = await request(app)
+      .get("/api/auth/google/callback")
+      .query({ code: "authorization-code", state: "known-oauth-state" })
+      .set("Cookie", "rw_oauth_state=known-oauth-state");
+
+    expect(response.status).toBe(401);
+    expect(response.body).toEqual({ error: "Authentication required." });
+    expect(response.headers["set-cookie"] ?? []).not.toEqual(
+      expect.arrayContaining([expect.stringMatching(/^rw_session=/)]),
+    );
   });
 
   it("does not expose local login outside local non-production mode", async () => {

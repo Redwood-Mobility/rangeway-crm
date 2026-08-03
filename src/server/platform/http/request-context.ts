@@ -1,6 +1,13 @@
-import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import type { NextFunction, Request, RequestHandler, Response } from "express";
 import type { ActorContext } from "../../../shared/identity.js";
+import {
+  clearSessionCookie,
+  readHumanSession,
+  sessionCookieName,
+  setSessionCookie,
+  type SessionUser,
+} from "../../auth.js";
 import { ApiError } from "./api-error.js";
 
 declare global {
@@ -12,17 +19,9 @@ declare global {
   }
 }
 
-export const sessionCookieName = "rw_session";
-const sessionMaxAgeMs = 12 * 60 * 60 * 1000;
 const uuidPattern =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-const bearerPattern = /^Bearer (atlas_[A-Za-z0-9_-]{12}\.[A-Za-z0-9_-]+)$/;
-
-type HumanSession = {
-  organizationId: string;
-  email: string;
-  expiresAt: number;
-};
+const bearerPattern = /^Bearer[ \t]+(atlas_[A-Za-z0-9_-]{12}\.[A-Za-z0-9_-]+)$/i;
 
 type ActorIdentity = Omit<ActorContext, "requestId">;
 
@@ -35,77 +34,17 @@ function unauthenticated(): ApiError {
   return new ApiError(401, "UNAUTHENTICATED", "Authentication required.");
 }
 
-function signature(payload: string, secret: string): Buffer {
-  return createHmac("sha256", secret).update(payload).digest();
-}
-
-function parseHumanSession(token: string, secret: string): HumanSession | null {
-  const [payload, presentedSignature, extra] = token.split(".");
-  if (!payload || !presentedSignature || extra) return null;
-
-  let decodedSignature: Buffer;
-  try {
-    decodedSignature = Buffer.from(presentedSignature, "base64url");
-  } catch {
-    return null;
-  }
-  const expectedSignature = signature(payload, secret);
-  if (
-    decodedSignature.length !== expectedSignature.length ||
-    !timingSafeEqual(decodedSignature, expectedSignature)
-  ) {
-    return null;
-  }
-
-  try {
-    const session = JSON.parse(
-      Buffer.from(payload, "base64url").toString("utf8"),
-    ) as Partial<HumanSession>;
-    if (
-      typeof session.organizationId !== "string" ||
-      typeof session.email !== "string" ||
-      typeof session.expiresAt !== "number" ||
-      session.expiresAt <= Date.now()
-    ) {
-      return null;
-    }
-    return session as HumanSession;
-  } catch {
-    return null;
-  }
-}
-
 export function setHumanSessionCookie(
   res: Response,
   sessionSecret: string,
   organizationId: string,
-  email: string,
+  user: SessionUser,
 ): void {
-  const payload = Buffer.from(
-    JSON.stringify({
-      organizationId,
-      email: email.toLowerCase(),
-      expiresAt: Date.now() + sessionMaxAgeMs,
-    } satisfies HumanSession),
-  ).toString("base64url");
-  const token = `${payload}.${signature(payload, sessionSecret).toString("base64url")}`;
-
-  res.cookie(sessionCookieName, token, {
-    httpOnly: true,
-    secure: true,
-    sameSite: "lax",
-    maxAge: sessionMaxAgeMs,
-    path: "/",
-  });
+  setSessionCookie(res, { ...user, organizationId }, sessionSecret);
 }
 
 export function clearHumanSessionCookie(res: Response): void {
-  res.clearCookie(sessionCookieName, {
-    httpOnly: true,
-    secure: true,
-    sameSite: "lax",
-    path: "/",
-  });
+  clearSessionCookie(res);
 }
 
 export const assignRequestContext: RequestHandler = (req, res, next) => {
@@ -140,7 +79,7 @@ export function authenticateRequest(
     try {
       let identityContext: ActorIdentity;
       if (hasSession) {
-        const session = parseHumanSession(sessionToken, sessionSecret);
+        const session = readHumanSession(req, sessionSecret);
         if (!session) throw unauthenticated();
         identityContext = await identity.authenticateHuman(
           session.organizationId,

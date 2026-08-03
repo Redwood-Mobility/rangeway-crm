@@ -159,7 +159,9 @@ components:
       type: http
       scheme: bearer
       bearerFormat: atlas_<12-character-prefix>.<secret>
-      description: Atlas agent or automation credential.
+      description: >-
+        Atlas agent or automation credential. The Bearer scheme is
+        case-insensitive; the Atlas key shape remains strict.
   parameters:
     RequestId:
       name: X-Request-Id

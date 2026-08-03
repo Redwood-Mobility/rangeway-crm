@@ -1,5 +1,6 @@
 import { Router } from "express";
 import { z } from "zod";
+import type { SessionUser } from "../../auth.js";
 import type { Config } from "../../config.js";
 import type { ActorIdentity } from "./identity.service.js";
 import {
@@ -26,6 +27,11 @@ export interface V2IdentityPort extends IdentityAuthenticationPort {
   ): Promise<ActorIdentity>;
 }
 
+export type SessionUserResolver = (
+  identity: ActorIdentity & { actorType: "human"; userId: string },
+  email: string,
+) => SessionUser;
+
 function notFound(): ApiError {
   return new ApiError(404, "NOT_FOUND", "Resource not found.");
 }
@@ -33,6 +39,7 @@ function notFound(): ApiError {
 export function createIdentityRouter(
   config: Config,
   identity: V2IdentityPort,
+  resolveSessionUser: SessionUserResolver,
 ): Router {
   const router = Router();
 
@@ -65,12 +72,16 @@ export function createIdentityRouter(
     if (identityContext.actorType !== "human" || !identityContext.userId) {
       throw new ApiError(401, "UNAUTHENTICATED", "Authentication required.");
     }
+    const sessionUser = resolveSessionUser(
+      { ...identityContext, actorType: "human", userId: identityContext.userId },
+      input.email,
+    );
     req.actor = { ...identityContext, requestId: req.requestId };
     setHumanSessionCookie(
       res,
       config.sessionSecret,
       identityContext.organizationId,
-      input.email,
+      sessionUser,
     );
     res.json({ actor: req.actor });
   });
