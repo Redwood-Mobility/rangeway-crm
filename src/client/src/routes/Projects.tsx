@@ -20,6 +20,7 @@ import {
   SkeletonRows,
   formatDate,
 } from "../components/primitives.js";
+import { SavedViews } from "../components/SavedViews.js";
 
 /**
  * Filters live in the URL so every view is a restorable, shareable link and the
@@ -123,6 +124,8 @@ export function Projects() {
           </select>
         </div>
       </div>
+
+      <SavedViews surface="projects" />
 
       {error ? (
         <ErrorState error={error} onRetry={() => void refetch()} />

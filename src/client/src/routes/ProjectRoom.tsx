@@ -1,8 +1,10 @@
-import React from "react";
+import React, { useState, type FormEvent } from "react";
 import { Link, NavLink, useParams } from "react-router";
-import { useProjectContext } from "../api/queries.js";
+import { Pencil } from "lucide-react";
+import { useAddHealthUpdate, useProjectContext, useUpdateProject } from "../api/queries.js";
 import {
   boardLanes,
+  projectHealthValues,
   projectStatusLabels,
   workItemStatusLabels,
   type ProjectHealth,
@@ -10,8 +12,10 @@ import {
 } from "../api/types.js";
 import {
   Badge,
+  Dialog,
   EmptyState,
   ErrorState,
+  Field,
   HealthBadge,
   PageHeader,
   Panel,
@@ -36,6 +40,8 @@ const tabs = [
 export function ProjectRoom() {
   const { projectId, tab = "overview" } = useParams();
   const { data, isPending, error, refetch } = useProjectContext(projectId);
+  const [editing, setEditing] = useState(false);
+  const [reportingHealth, setReportingHealth] = useState(false);
 
   if (error) return <ErrorState error={error} onRetry={() => void refetch()} />;
   if (isPending) return <SkeletonRows rows={8} />;
@@ -52,9 +58,21 @@ export function ProjectRoom() {
           <>
             <HealthBadge health={project.health as ProjectHealth} />
             <Badge tone="neutral">{projectStatusLabels[project.status as ProjectStatus]}</Badge>
+            <button type="button" className="button" onClick={() => setReportingHealth(true)}>
+              Report health
+            </button>
+            <button type="button" className="button" onClick={() => setEditing(true)}>
+              <Pencil aria-hidden="true" />
+              Edit
+            </button>
           </>
         }
       />
+
+      {editing ? <EditProjectDialog project={project} onClose={() => setEditing(false)} /> : null}
+      {reportingHealth ? (
+        <HealthDialog project={project} onClose={() => setReportingHealth(false)} />
+      ) : null}
 
       {/* The four operating questions every active project must answer. */}
       <div className="panel" style={{ marginBottom: "var(--section-gap)" }}>
@@ -116,6 +134,157 @@ export function ProjectRoom() {
 }
 
 type Context = NonNullable<ReturnType<typeof useProjectContext>["data"]>;
+
+const editableFields = [
+  { key: "objective", label: "Objective", multiline: true },
+  { key: "currentFocus", label: "Current focus", multiline: true },
+  { key: "blockerSummary", label: "Blocker", multiline: true },
+  { key: "nextDecision", label: "Next decision", multiline: true },
+  { key: "nextAction", label: "Next action", multiline: true },
+  { key: "strategicArea", label: "Strategic area", multiline: false },
+] as const;
+
+function EditProjectDialog({
+  project,
+  onClose,
+}: {
+  project: Context["project"];
+  onClose: () => void;
+}) {
+  const updateProject = useUpdateProject();
+  const [values, setValues] = useState<Record<string, string>>(() =>
+    Object.fromEntries(editableFields.map((field) => [field.key, project[field.key] ?? ""])),
+  );
+  const [name, setName] = useState(project.name);
+
+  function onSubmit(event: FormEvent) {
+    event.preventDefault();
+    updateProject.mutate({ projectId: project.id, name, ...values }, { onSuccess: onClose });
+  }
+
+  return (
+    <Dialog
+      title="Edit project"
+      wide
+      onClose={onClose}
+      footer={
+        <>
+          <button type="button" className="button" onClick={onClose}>
+            Cancel
+          </button>
+          <button
+            type="submit"
+            form="edit-project"
+            className="button button--primary"
+            disabled={updateProject.isPending || name.trim().length === 0}
+          >
+            {updateProject.isPending ? "Saving…" : "Save changes"}
+          </button>
+        </>
+      }
+    >
+      <form id="edit-project" onSubmit={onSubmit} style={{ display: "contents" }}>
+        <Field label="Name" htmlFor="edit-project-name">
+          <input
+            id="edit-project-name"
+            className="input"
+            required
+            value={name}
+            onChange={(event) => setName(event.target.value)}
+          />
+        </Field>
+        {editableFields.map((field) => (
+          <Field key={field.key} label={field.label} htmlFor={`edit-${field.key}`}>
+            {field.multiline ? (
+              <textarea
+                id={`edit-${field.key}`}
+                className="textarea"
+                value={values[field.key]}
+                onChange={(event) =>
+                  setValues((current) => ({ ...current, [field.key]: event.target.value }))
+                }
+              />
+            ) : (
+              <input
+                id={`edit-${field.key}`}
+                className="input"
+                value={values[field.key]}
+                onChange={(event) =>
+                  setValues((current) => ({ ...current, [field.key]: event.target.value }))
+                }
+              />
+            )}
+          </Field>
+        ))}
+      </form>
+    </Dialog>
+  );
+}
+
+/**
+ * Health is reported with a rationale rather than set silently, so every change
+ * carries the reasoning behind it into the project history.
+ */
+function HealthDialog({ project, onClose }: { project: Context["project"]; onClose: () => void }) {
+  const addHealth = useAddHealthUpdate();
+  const [health, setHealth] = useState<string>(project.health);
+  const [rationale, setRationale] = useState("");
+
+  return (
+    <Dialog
+      title="Report project health"
+      onClose={onClose}
+      footer={
+        <>
+          <button type="button" className="button" onClick={onClose}>
+            Cancel
+          </button>
+          <button
+            type="submit"
+            form="report-health"
+            className="button button--primary"
+            disabled={addHealth.isPending || rationale.trim().length === 0}
+          >
+            {addHealth.isPending ? "Recording…" : "Record health"}
+          </button>
+        </>
+      }
+    >
+      <form
+        id="report-health"
+        style={{ display: "contents" }}
+        onSubmit={(event) => {
+          event.preventDefault();
+          addHealth.mutate({ projectId: project.id, health, rationale }, { onSuccess: onClose });
+        }}
+      >
+        <Field label="Health" htmlFor="health-value">
+          <select
+            id="health-value"
+            className="select"
+            value={health}
+            onChange={(event) => setHealth(event.target.value)}
+          >
+            {projectHealthValues.map((value) => (
+              <option key={value} value={value}>
+                {value.replace("_", " ")}
+              </option>
+            ))}
+          </select>
+        </Field>
+        <Field label="Rationale" htmlFor="health-rationale">
+          <textarea
+            id="health-rationale"
+            className="textarea"
+            required
+            value={rationale}
+            onChange={(event) => setRationale(event.target.value)}
+          />
+        </Field>
+      </form>
+    </Dialog>
+  );
+}
 
 function Overview({ data }: { data: Context }) {
   const counts = boardLanes.map((lane) => ({

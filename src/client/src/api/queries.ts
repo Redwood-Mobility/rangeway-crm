@@ -243,6 +243,7 @@ export function useUpdateWorkItem() {
         idempotencyKey: newIdempotencyKey("work-update"),
       }),
     onSuccess: (result) => invalidateWorkSurfaces(client, result.workItem.projectId),
+    onError: (error) => publishMutationError(error, "That change was not saved."),
   });
 }
 
@@ -287,6 +288,108 @@ export function useUpdateProject() {
       void client.invalidateQueries({ queryKey: keys.project(result.project.id) });
       void client.invalidateQueries({ queryKey: keys.projectContext(result.project.id) });
     },
+  });
+}
+
+export interface SavedView {
+  id: string;
+  name: string;
+  surface: string;
+  filters: Record<string, string>;
+  isDefault: boolean;
+}
+
+export function useSavedViews(surface: string) {
+  return useQuery({
+    queryKey: ["saved-views", surface],
+    queryFn: () =>
+      apiRequest<{ savedViews: SavedView[]; page: Page }>("/saved-views", { query: { surface } }),
+  });
+}
+
+export function useCreateSavedView() {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: (input: { name: string; surface: string; filters: Record<string, string> }) =>
+      apiRequest<{ savedView: SavedView }>("/saved-views", {
+        method: "POST",
+        body: { ...input, isDefault: false },
+        idempotencyKey: newIdempotencyKey("saved-view-create"),
+      }),
+    onSuccess: (_result, input) => {
+      void client.invalidateQueries({ queryKey: ["saved-views", input.surface] });
+      publishToast(`Saved view “${input.name}”.`);
+    },
+    onError: (error) => publishMutationError(error, "That view could not be saved."),
+  });
+}
+
+export function useArchiveSavedView() {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: (input: { savedViewId: string; surface: string }) =>
+      apiRequest<unknown>(`/saved-views/${input.savedViewId}/archive`, {
+        method: "POST",
+        body: { archived: true },
+        idempotencyKey: newIdempotencyKey("saved-view-archive"),
+      }),
+    onSuccess: (_result, input) => {
+      void client.invalidateQueries({ queryKey: ["saved-views", input.surface] });
+      publishToast("Saved view removed.");
+    },
+    onError: (error) => publishMutationError(error, "That view could not be removed."),
+  });
+}
+
+/** Applies one status change across a selection, reporting partial failures. */
+export function useBulkMoveWorkItems() {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: async (input: { ids: string[]; status: WorkItemStatus; items: WorkItem[] }) => {
+      const outcomes = await Promise.allSettled(
+        input.ids.map((id) => {
+          const item = input.items.find((candidate) => candidate.id === id);
+          return apiRequest<{ workItem: WorkItem }>(`/work-items/${id}/move`, {
+            method: "POST",
+            body: { status: input.status, position: Number(item?.position) || 1000 },
+            idempotencyKey: newIdempotencyKey("work-bulk-move"),
+          });
+        }),
+      );
+      return {
+        moved: outcomes.filter((outcome) => outcome.status === "fulfilled").length,
+        rejected: outcomes.filter((outcome) => outcome.status === "rejected").length,
+      };
+    },
+    onSuccess: ({ moved, rejected }) => {
+      publishToast(
+        rejected === 0
+          ? `Moved ${moved} item${moved === 1 ? "" : "s"}.`
+          : `Moved ${moved}; ${rejected} rejected because the transition is not allowed.`,
+        rejected === 0 ? "info" : "error",
+      );
+    },
+    onSettled: () => invalidateWorkSurfaces(client),
+  });
+}
+
+export function useAddHealthUpdate() {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: (input: { projectId: string; health: string; rationale: string }) =>
+      apiRequest<unknown>(`/projects/${input.projectId}/health-updates`, {
+        method: "POST",
+        body: { health: input.health, rationale: input.rationale },
+        idempotencyKey: newIdempotencyKey("health-add"),
+      }),
+    onSuccess: (_result, input) => {
+      void client.invalidateQueries({ queryKey: keys.projectContext(input.projectId) });
+      void client.invalidateQueries({ queryKey: ["projects"] });
+      void client.invalidateQueries({ queryKey: ["portfolio"] });
+      void client.invalidateQueries({ queryKey: ["today"] });
+      publishToast("Health update recorded.");
+    },
+    onError: (error) => publishMutationError(error, "That health update was not recorded."),
   });
 }
 

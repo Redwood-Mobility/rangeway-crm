@@ -2,12 +2,14 @@ import React, { useMemo, useState, type FormEvent } from "react";
 import { Link, useParams, useSearchParams } from "react-router";
 import { Plus } from "lucide-react";
 import {
+  useBulkMoveWorkItems,
   useCreateWorkItem,
   useMe,
   useMoveWorkItem,
   useProjects,
   useWork,
 } from "../api/queries.js";
+import { SavedViews } from "../components/SavedViews.js";
 import {
   boardLanes,
   priorityValues,
@@ -178,6 +180,8 @@ export function Work() {
         </div>
       </div>
 
+      <SavedViews surface="work" />
+
       {error ? (
         <ErrorState error={error} onRetry={() => void refetch()} />
       ) : isPending ? (
@@ -320,12 +324,80 @@ function BoardView({
 }
 
 function ListView({ items, onSelect }: { items: WorkItem[]; onSelect: (id: string) => void }) {
+  const [selectedIds, setSelectedIds] = useState<string[]>([]);
+  const bulkMove = useBulkMoveWorkItems();
+  const allSelected = items.length > 0 && selectedIds.length === items.length;
+
+  function toggle(id: string) {
+    setSelectedIds((current) =>
+      current.includes(id) ? current.filter((value) => value !== id) : [...current, id],
+    );
+  }
+
   return (
     <div className="panel table-scroll">
+      {/*
+        Bulk actions apply one transition across a selection. Items whose current
+        status forbids that transition are reported rather than silently skipped.
+      */}
+      <div
+        style={{
+          display: "flex",
+          flexWrap: "wrap",
+          gap: "0.5rem",
+          alignItems: "center",
+          padding: "0.625rem 0.875rem",
+          borderBottom: "1px solid var(--border-subtle)",
+        }}
+      >
+        <span aria-live="polite" style={{ fontSize: "var(--text-sm)", color: "var(--text-muted)" }}>
+          {selectedIds.length === 0
+            ? `${items.length} item${items.length === 1 ? "" : "s"}`
+            : `${selectedIds.length} selected`}
+        </span>
+        <label className="visually-hidden" htmlFor="bulk-status">
+          Move selected items to status
+        </label>
+        <select
+          id="bulk-status"
+          className="select"
+          style={{ width: "auto" }}
+          value=""
+          disabled={selectedIds.length === 0 || bulkMove.isPending}
+          onChange={(event) => {
+            if (!event.target.value) return;
+            bulkMove.mutate(
+              { ids: selectedIds, status: event.target.value as WorkItemStatus, items },
+              { onSuccess: () => setSelectedIds([]) },
+            );
+          }}
+        >
+          <option value="">Move selected to…</option>
+          {workItemStatuses.map((status) => (
+            <option key={status} value={status}>
+              {workItemStatusLabels[status]}
+            </option>
+          ))}
+        </select>
+        {selectedIds.length > 0 ? (
+          <button type="button" className="button button--quiet" onClick={() => setSelectedIds([])}>
+            Clear selection
+          </button>
+        ) : null}
+      </div>
+
       <table className="data-table">
         <caption className="visually-hidden">Work items with status, type, priority and due date</caption>
         <thead>
           <tr>
+            <th scope="col">
+              <input
+                type="checkbox"
+                checked={allSelected}
+                aria-label="Select all work items"
+                onChange={(event) => setSelectedIds(event.target.checked ? items.map((item) => item.id) : [])}
+              />
+            </th>
             <th scope="col">Title</th>
             <th scope="col">Status</th>
             <th scope="col">Type</th>
@@ -336,6 +408,14 @@ function ListView({ items, onSelect }: { items: WorkItem[]; onSelect: (id: strin
         <tbody>
           {items.map((item) => (
             <tr key={item.id}>
+              <td>
+                <input
+                  type="checkbox"
+                  checked={selectedIds.includes(item.id)}
+                  aria-label={`Select ${item.title}`}
+                  onChange={() => toggle(item.id)}
+                />
+              </td>
               <td className="wrap">
                 <button
                   type="button"
