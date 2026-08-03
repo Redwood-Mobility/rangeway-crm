@@ -28,6 +28,8 @@ import { OperatingCoreService } from "./modules/operating-core/operating-core.se
 import { createPursuitRouter } from "./modules/pursuit/pursuit.routes.js";
 import type { PursuitPort } from "./modules/pursuit/pursuit.service.js";
 import { PursuitService } from "./modules/pursuit/pursuit.service.js";
+import { createWorkspaceRouter } from "./modules/workspace/workspace.routes.js";
+import { WorkspaceService, type GoogleGateway, type WorkspacePort } from "./modules/workspace/workspace.service.js";
 import {
   OrganizationService,
   type OrganizationMutationPort,
@@ -89,6 +91,8 @@ export interface CreateAppOptions {
   v2OperatingCore?: OperatingCorePort;
   v2Pool?: Pool;
   v2Pursuit?: PursuitPort;
+  v2Workspace?: WorkspacePort;
+  googleGateway?: GoogleGateway;
   googleOAuth?: GoogleOAuthGateway;
   logger?: ErrorLogger;
 }
@@ -107,6 +111,8 @@ const v2Organizations =
 const v2OperatingCore =
   options.v2OperatingCore ?? new OperatingCoreService(v2Pool);
 const v2Pursuit = options.v2Pursuit ?? new PursuitService(v2Pool);
+const v2Workspace =
+  options.v2Workspace ?? new WorkspaceService(v2Pool, options.googleGateway);
 const errorLogger: ErrorLogger = options.logger ?? {
   error(message, context) {
     console.error(message, context);
@@ -212,6 +218,7 @@ app.get("/api/v2/ready", async (_req, res, next) => {
 app.use("/api/v2", createOrganizationRouter(v2Organizations));
 app.use("/api/v2", createOperatingCoreRouter(v2OperatingCore));
 app.use("/api/v2", createPursuitRouter(v2Pursuit));
+app.use("/api/v2", createWorkspaceRouter(v2Workspace));
 app.use("/api/v2", requireActor, (_req, _res, next) => {
   next(new ApiError(404, "NOT_FOUND", "Resource not found."));
 });
