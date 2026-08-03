@@ -6,6 +6,8 @@ fail() {
   exit 1
 }
 
+UNRELEASED_PROVENANCE="unreleased-v2-foundation"
+
 DEPLOYMENT_TOKEN="${ATLAS_DEPLOYMENT_TOKEN:-}"
 if [[ -n "${DEPLOYMENT_TOKEN}" ]]; then
   [[ "${DEPLOYMENT_TOKEN}" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] \
@@ -58,6 +60,34 @@ EXPECTED_FILES="$(printf '%s\n' atlas-artifacts.tgz atlas-postgres.dump metadata
   cd "${BACKUP_DIR}"
   sha256sum --check manifest.sha256
 ) || fail "backup checksum verification failed."
+
+metadata_value() {
+  local key="$1"
+  local count value
+  count="$(grep -c "^${key}=" "${BACKUP_DIR}/metadata.txt" || true)"
+  [[ "${count}" == "1" ]] || fail "metadata.txt must contain ${key} exactly once."
+  value="$(sed -n "s/^${key}=//p" "${BACKUP_DIR}/metadata.txt")"
+  [[ -n "${value}" ]] || fail "metadata.txt contains an empty ${key}."
+  printf '%s\n' "${value}"
+}
+
+BACKUP_FORMAT="$(metadata_value backup_format)"
+BACKUP_COMMIT="$(metadata_value git_commit)"
+MIGRATION_PROVENANCE="$(metadata_value migration_provenance)"
+MIGRATION_SET_SHA256="$(metadata_value migration_set_sha256)"
+[[ "${BACKUP_FORMAT}" == "atlas-v2-postgres-artifacts-v1" ]] \
+  || fail "metadata.txt has an unsupported backup format."
+if [[ "${BACKUP_COMMIT}" == "${UNRELEASED_PROVENANCE}" ]]; then
+  [[ "${MIGRATION_PROVENANCE}" == "zero" ]] \
+    || fail "unreleased backup metadata must identify zero migration provenance."
+  [[ "${MIGRATION_SET_SHA256}" =~ ^[0-9a-f]{64}$ ]] \
+    || fail "unreleased backup metadata lacks an immutable migration-set identity."
+else
+  [[ "${BACKUP_COMMIT}" =~ ^[0-9a-f]{40}$ ]] \
+    || fail "backup metadata has an invalid release commit."
+  [[ "${MIGRATION_PROVENANCE}" == "released" && "${MIGRATION_SET_SHA256}" == "none" ]] \
+    || fail "released backup metadata has invalid migration provenance."
+fi
 
 RESTORE_TMP_ROOT="${ATLAS_RESTORE_TMP_ROOT:-/tmp}"
 [[ "${RESTORE_TMP_ROOT}" == /* && "${RESTORE_TMP_ROOT}" != "/" && -d "${RESTORE_TMP_ROOT}" ]] \
@@ -137,23 +167,38 @@ docker exec -i "${TEMP_DB_CONTAINER}" \
   pg_restore --username=atlas_restore --dbname=atlas_restore --no-owner --no-privileges \
   < "${BACKUP_DIR}/atlas-postgres.dump"
 
-MIGRATION_COUNT="$(
-  docker exec "${TEMP_DB_CONTAINER}" env "PGAPPNAME=${PGAPPNAME}" psql \
-    --username=atlas_restore --dbname=atlas_restore --tuples-only --no-align \
-    --command="SELECT count(*) FROM schema_migrations WHERE filename = '0001_platform.sql';"
-)"
-[[ "${MIGRATION_COUNT}" == "1" ]] \
-  || fail "restored database did not contain the expected schema_migrations row."
+if [[ "${BACKUP_COMMIT}" == "${UNRELEASED_PROVENANCE}" ]]; then
+  INITIAL_DATABASE_STATE="$(
+    docker exec "${TEMP_DB_CONTAINER}" env "PGAPPNAME=${PGAPPNAME}" psql \
+      --username=atlas_restore --dbname=atlas_restore --tuples-only --no-align \
+      --variable=ON_ERROR_STOP=1 \
+      --command="SELECT CASE WHEN to_regclass('public.schema_migrations') IS NULL AND to_regclass('public.organizations') IS NULL THEN 'atlas-initial-empty' ELSE 'atlas-initial-unknown' END;"
+  )"
+  [[ "${INITIAL_DATABASE_STATE}" == "atlas-initial-empty" ]] \
+    || fail "restored unreleased backup was not the exact zero-migration state."
+else
+  MIGRATION_COUNT="$(
+    docker exec "${TEMP_DB_CONTAINER}" env "PGAPPNAME=${PGAPPNAME}" psql \
+      --username=atlas_restore --dbname=atlas_restore --tuples-only --no-align \
+      --command="SELECT count(*) FROM schema_migrations WHERE filename = '0001_platform.sql';"
+  )"
+  [[ "${MIGRATION_COUNT}" == "1" ]] \
+    || fail "restored database did not contain the expected schema_migrations row."
 
-ORGANIZATION_COUNT="$(
-  docker exec "${TEMP_DB_CONTAINER}" env "PGAPPNAME=${PGAPPNAME}" psql \
-    --username=atlas_restore --dbname=atlas_restore --tuples-only --no-align \
-    --command="SELECT count(*) FROM organizations WHERE id = '00000000-0000-4000-8000-000000000001';"
-)"
-[[ "${ORGANIZATION_COUNT}" == "1" ]] \
-  || fail "restored database did not contain the immutable Rangeway organization ID."
+  ORGANIZATION_COUNT="$(
+    docker exec "${TEMP_DB_CONTAINER}" env "PGAPPNAME=${PGAPPNAME}" psql \
+      --username=atlas_restore --dbname=atlas_restore --tuples-only --no-align \
+      --command="SELECT count(*) FROM organizations WHERE id = '00000000-0000-4000-8000-000000000001';"
+  )"
+  [[ "${ORGANIZATION_COUNT}" == "1" ]] \
+    || fail "restored database did not contain the immutable Rangeway organization ID."
+fi
 
 trap - EXIT INT TERM
 cleanup_resources || fail "temporary restore-test resources could not all be removed."
 echo "Restore test passed for ${BACKUP_DIR}."
-echo "Verified schema migration row, immutable Rangeway organization ID, and artifact archive extraction."
+if [[ "${BACKUP_COMMIT}" == "${UNRELEASED_PROVENANCE}" ]]; then
+  echo "Verified zero-migration provenance and artifact archive extraction."
+else
+  echo "Verified schema migration row, immutable Rangeway organization ID, and artifact archive extraction."
+fi

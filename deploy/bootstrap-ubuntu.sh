@@ -6,6 +6,39 @@ if [[ "${EUID}" -ne 0 ]]; then
   exit 1
 fi
 
+[[ -r /etc/os-release ]] || {
+  echo "Atlas V2 requires readable /etc/os-release metadata." >&2
+  exit 1
+}
+os_id="$(sed -n 's/^ID=//p' /etc/os-release | tr -d '"')"
+os_version="$(sed -n 's/^VERSION_ID=//p' /etc/os-release | tr -d '"')"
+if [[ "${os_id}" != "ubuntu" || "${os_version}" != "24.04" ]]; then
+  echo "Atlas V2 requires Ubuntu 24.04 LTS." >&2
+  exit 1
+fi
+systemd_version="$(systemctl --version | sed -n '1s/^systemd \([0-9][0-9]*\).*/\1/p')"
+if [[ ! "${systemd_version}" =~ ^[0-9]+$ || "${systemd_version}" -lt 255 ]]; then
+  echo "Atlas V2 requires systemd 255 or newer." >&2
+  exit 1
+fi
+probe_unit="atlas-v2-exittype-probe-$$.service"
+cleanup_probe() {
+  systemctl stop "${probe_unit}" >/dev/null 2>&1 || true
+  systemctl reset-failed "${probe_unit}" >/dev/null 2>&1 || true
+}
+trap cleanup_probe EXIT INT TERM
+systemd-run --quiet --wait --collect --unit="${probe_unit}" --service-type=exec \
+  --property=ExitType=cgroup --property=KillMode=control-group /bin/true || {
+  echo "Atlas V2 requires transient ExitType=cgroup support." >&2
+  exit 1
+}
+cleanup_probe
+if [[ "$(systemctl show --property=LoadState --value "${probe_unit}")" != "not-found" ]]; then
+  echo "Atlas V2 host capability probe left a transient unit loaded." >&2
+  exit 1
+fi
+trap - EXIT INT TERM
+
 apt-get update
 apt-get install -y ca-certificates curl git gnupg python3 rsync ufw util-linux
 

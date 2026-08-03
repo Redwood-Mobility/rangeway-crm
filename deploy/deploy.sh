@@ -55,8 +55,13 @@ valid_path "${ROLE_INITIALIZER_PATH}" || fail "ATLAS_ROLE_INITIALIZER_PATH must 
 valid_path "${CADDY_CONFIG_PATH}" || fail "ATLAS_CADDY_CONFIG_PATH must be a canonical absolute path."
 path_is_equal_or_descendant "${REMOTE_BACKUP_ROOT}" "${REMOTE_DIR}" \
   && fail "ATLAS_BACKUP_ROOT must be outside the synchronized ATLAS_DIR tree."
-[[ "${LEASE_SECONDS}" =~ ^[0-9]+$ && "${LEASE_SECONDS}" -ge 2 && "${LEASE_SECONDS}" -le 900 ]] \
-  || fail "ATLAS_DEPLOYMENT_LEASE_SECONDS must be between 2 and 900 seconds."
+if [[ "${ATLAS_COORDINATOR_TEST_MODE:-0}" == "1" ]]; then
+  [[ "${LEASE_SECONDS}" =~ ^[0-9]+$ && "${LEASE_SECONDS}" -ge 2 && "${LEASE_SECONDS}" -le 900 ]] \
+    || fail "ATLAS_DEPLOYMENT_LEASE_SECONDS must be between 2 and 900 seconds in the test harness."
+else
+  [[ "${LEASE_SECONDS}" =~ ^[0-9]+$ && "${LEASE_SECONDS}" -ge 30 && "${LEASE_SECONDS}" -le 900 ]] \
+    || fail "ATLAS_DEPLOYMENT_LEASE_SECONDS must be between 30 and 900 seconds in production."
+fi
 if [[ "${ATLAS_COORDINATOR_TEST_MODE:-0}" != "1" ]]; then
   [[ "${REMOTE_USER}" == "root" ]] || fail "ATLAS_USER must be root for the supported root-admin deployment model."
   [[ "${REMOTE_DIR}" == "/opt/atlas-v2" ]] || fail "ATLAS_DIR must be /opt/atlas-v2 for the supported operator model."
@@ -176,6 +181,28 @@ set -euo pipefail
 test_mode="$1"
 if [[ "${test_mode}" != "1" ]]; then
   [[ "$(id -u)" -eq 0 ]] || { echo "Atlas deployment requires a root SSH administrator." >&2; exit 1; }
+  [[ -r /etc/os-release ]] \
+    || { echo "Atlas deployment requires readable /etc/os-release metadata." >&2; exit 1; }
+  os_id="$(sed -n 's/^ID=//p' /etc/os-release | tr -d '"')"
+  os_version="$(sed -n 's/^VERSION_ID=//p' /etc/os-release | tr -d '"')"
+  [[ "${os_id}" == "ubuntu" && "${os_version}" == "24.04" ]] \
+    || { echo "Atlas deployment requires Ubuntu 24.04 LTS." >&2; exit 1; }
+  systemd_version="$(systemctl --version | sed -n '1s/^systemd \([0-9][0-9]*\).*/\1/p')"
+  [[ "${systemd_version}" =~ ^[0-9]+$ && "${systemd_version}" -ge 255 ]] \
+    || { echo "Atlas deployment requires systemd 255 or newer." >&2; exit 1; }
+  probe_unit="atlas-v2-exittype-probe-$$.service"
+  cleanup_probe() {
+    systemctl stop "${probe_unit}" >/dev/null 2>&1 || true
+    systemctl reset-failed "${probe_unit}" >/dev/null 2>&1 || true
+  }
+  trap cleanup_probe EXIT INT TERM
+  systemd-run --quiet --wait --collect --unit="${probe_unit}" --service-type=exec \
+    --property=ExitType=cgroup --property=KillMode=control-group /bin/true \
+    || { echo "Atlas deployment host does not support transient ExitType=cgroup units." >&2; exit 1; }
+  cleanup_probe
+  [[ "$(systemctl show --property=LoadState --value "${probe_unit}")" == "not-found" ]] \
+    || { echo "Atlas deployment capability probe left a transient unit loaded." >&2; exit 1; }
+  trap - EXIT INT TERM
 fi
 REMOTE_ROOT_PREFLIGHT
 
@@ -219,14 +246,73 @@ CADDY_CONFIG_SHA256="$(node --input-type=module -e \
   && "${BACKUP_SHA256}" =~ ^[0-9a-f]{64}$ && "${RESTORE_SHA256}" =~ ^[0-9a-f]{64}$ \
   && "${ROLE_INITIALIZER_SHA256}" =~ ^[0-9a-f]{64}$ && "${CADDY_CONFIG_SHA256}" =~ ^[0-9a-f]{64}$ ]] \
   || fail "could not hash reviewed coordinator assets."
+MIGRATION_SET_SHA256="$(node --input-type=module -e '
+import crypto from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
+const root = process.argv[1];
+const directory = path.join(root, "db/migrations");
+const filenames = fs.readdirSync(directory).filter((name) => /^\d+_.+\.sql$/.test(name)).sort();
+if (filenames.length === 0) process.exit(2);
+const hash = crypto.createHash("sha256");
+for (const filename of filenames) {
+  hash.update(filename, "utf8");
+  hash.update("\0", "utf8");
+  hash.update(fs.readFileSync(path.join(directory, filename)));
+  hash.update("\0", "utf8");
+}
+process.stdout.write(hash.digest("hex"));
+' "${REPOSITORY_ROOT}")"
+[[ "${MIGRATION_SET_SHA256}" =~ ^[0-9a-f]{64}$ ]] \
+  || fail "could not identify the immutable migration set."
 
 LOCAL_CANDIDATE_STAGE="$(mktemp -d "${TMPDIR:-/tmp}/atlas-v2-candidate.XXXXXX")"
+REMOTE_STAGE_PREPARED=0
+REMOTE_STAGE_OWNED=0
+DEPLOYMENT_FAILURE_HANDLER_ACTIVE=0
+cleanup_remote_candidate_stage() {
+  ssh "${SSH_OPTS[@]}" "${REMOTE_TARGET}" bash -s -- \
+    "${COORDINATOR_STAGE}" "${REMOTE_CANDIDATE_STAGE}" "${DEPLOYMENT_TOKEN}" \
+    "${ATLAS_COORDINATOR_TEST_MODE:-0}" <<'REMOTE_STAGE_CLEANUP'
+set -euo pipefail
+stage_root="$1"
+stage="$2"
+deployment_token="$3"
+test_mode="$4"
+[[ "${deployment_token}" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]
+[[ "${stage}" == "${stage_root}/${deployment_token}" ]]
+if [[ "${test_mode}" != "1" ]]; then
+  [[ "$(id -u)" -eq 0 ]]
+  [[ "${stage_root}" == "/var/lib/atlas-v2-deployment/staging" ]]
+  [[ -d "${stage_root}" && ! -L "${stage_root}" ]]
+  [[ "$(stat -c '%U:%G:%a' "${stage_root}")" == "root:root:700" ]]
+fi
+if [[ -e "${stage}" ]]; then
+  [[ -d "${stage}" && ! -L "${stage}" ]]
+  find -P "${stage}" -depth -delete
+fi
+[[ ! -e "${stage}" ]]
+REMOTE_STAGE_CLEANUP
+}
 cleanup_local_candidate() {
   local cleanup_status="$?"
+  local remote_cleanup_status=0
   trap - EXIT INT TERM
+  if [[ "${REMOTE_STAGE_PREPARED:-0}" -eq 1 && "${REMOTE_STAGE_OWNED:-0}" -eq 0 ]]; then
+    cleanup_remote_candidate_stage || remote_cleanup_status=1
+  elif [[ "${cleanup_status}" -ne 0 && "${REMOTE_STAGE_OWNED:-0}" -eq 1 \
+    && "${DEPLOYMENT_FAILURE_HANDLER_ACTIVE:-0}" -eq 0 ]]; then
+    set +e
+    run_coordinator fail "${DEPLOYMENT_TOKEN}" >/dev/null
+    set -e
+  fi
   case "${LOCAL_CANDIDATE_STAGE:-}" in
     "${TMPDIR:-/tmp}"/atlas-v2-candidate.*) /bin/rm -rf -- "${LOCAL_CANDIDATE_STAGE}" ;;
   esac
+  if [[ "${remote_cleanup_status}" -ne 0 ]]; then
+    echo "Atlas V2 deployment could not prove cleanup of its exact pre-acquisition stage." >&2
+    [[ "${cleanup_status}" -ne 0 ]] || cleanup_status=1
+  fi
   exit "${cleanup_status}"
 }
 trap cleanup_local_candidate EXIT INT TERM
@@ -243,23 +329,27 @@ ENVIRONMENT_SHA256="$(node --input-type=module -e \
 
 install_verified_coordinator_and_begin() {
   ssh "${SSH_OPTS[@]}" "${REMOTE_TARGET}" bash -s -- \
-    "${COORDINATOR_STAGE}" "${REMOTE_CANDIDATE_STAGE}" "${ATLAS_COORDINATOR_TEST_MODE:-0}" \
+    "${COORDINATOR_STAGE}" "${REMOTE_CANDIDATE_STAGE}" "${DEPLOYMENT_TOKEN}" \
+    "${ATLAS_COORDINATOR_TEST_MODE:-0}" \
     <<'REMOTE_STAGE' || fail "remote immutable staging directory preparation failed."
 set -euo pipefail
 stage_root="$1"
 stage="$2"
-test_mode="$3"
+deployment_token="$3"
+test_mode="$4"
+[[ "${deployment_token}" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]
+[[ "${stage}" == "${stage_root}/${deployment_token}" ]]
 if [[ "${test_mode}" == "1" ]]; then
   install -d -m 0700 -- "${stage_root}" "${stage}"
 else
   [[ "$(id -u)" -eq 0 ]] || exit 1
   [[ "${stage_root}" == "/var/lib/atlas-v2-deployment/staging" ]] || exit 1
-  [[ "${stage}" == "${stage_root}/"* ]] || exit 1
   [[ -d "${stage_root}" && ! -L "${stage_root}" ]] || exit 1
   [[ "$(stat -c '%U:%G:%a' "${stage_root}")" == "root:root:700" ]] || exit 1
   install -o root -g root -m 0700 -d -- "${stage}"
 fi
 REMOTE_STAGE
+  REMOTE_STAGE_PREPARED=1
 
   rsync -az --chmod=F600 -e "${RSYNC_RSH}" \
     "${COORDINATOR_SOURCE}" "${GUARDIAN_UNIT_SOURCE}" "${BACKUP_SOURCE}" "${RESTORE_SOURCE}" \
@@ -277,6 +367,7 @@ REMOTE_STAGE
     "${RELEASE_ARCHIVE_SHA256}" \
     "${ENVIRONMENT_SHA256}" "${DEPLOYMENT_TOKEN}" "${REMOTE_DIR}" \
     "${REMOTE_BACKUP_ROOT}" "${LEASE_SECONDS}" "${LOCAL_COMMIT}" \
+    "${MIGRATION_SET_SHA256}" \
     "${ATLAS_COORDINATOR_TEST_MODE:-0}" \
     <<'REMOTE_INSTALL' || fail "immutable deployment bundle install or ownership acquisition failed."
 set -euo pipefail
@@ -302,7 +393,8 @@ remote_dir="${19}"
 backup_root="${20}"
 lease_seconds="${21}"
 bundle_version="${22}"
-test_mode="${23}"
+migration_set_hash="${23}"
+test_mode="${24}"
 staged_coordinator="${stage}/deployment-coordinator.sh"
 staged_unit="${stage}/atlas-v2-deployment-guardian.service"
 staged_backup="${stage}/backup.sh"
@@ -321,6 +413,8 @@ caddy_config_next="${caddy_config}.next"
 hash_file() {
   sha256sum -- "$1" | awk '{print $1}'
 }
+
+[[ "${migration_set_hash}" =~ ^[0-9a-f]{64}$ ]] || exit 1
 
 if [[ "${test_mode}" != "1" ]]; then
   [[ "$(id -u)" -eq 0 ]] || { echo "Atlas deployment requires root." >&2; exit 1; }
@@ -453,7 +547,7 @@ ATLAS_COORDINATOR_INSTALL_LOCK_HELD=1 exec "${coordinator}" begin \
   "${bundle_version}" "${expected_coordinator_hash}" "${expected_unit_hash}" \
   "${expected_backup_hash}" "${expected_restore_hash}" \
   "${expected_role_initializer_hash}" "${expected_caddy_config_hash}" "${stage}" \
-  "${expected_archive_hash}" "${expected_environment_hash}"
+  "${expected_archive_hash}" "${expected_environment_hash}" "${migration_set_hash}"
 REMOTE_INSTALL
 }
 
@@ -478,7 +572,10 @@ REMOTE_COORDINATOR
 
 # The coordinator takes the host-wide durable claim before backup, quiescence,
 # source synchronization, role rotation, or migration can mutate the release.
-BEGIN_OUTPUT="$(install_verified_coordinator_and_begin)"
+BEGIN_OUTPUT_FILE="${LOCAL_CANDIDATE_STAGE}/begin.output"
+install_verified_coordinator_and_begin > "${BEGIN_OUTPUT_FILE}"
+REMOTE_STAGE_OWNED=1
+BEGIN_OUTPUT="$(< "${BEGIN_OUTPUT_FILE}")"
 
 PREVIOUS_COMMIT="none"
 EXACT_BACKUP="none"
@@ -505,7 +602,8 @@ done <<< "${BEGIN_OUTPUT}"
 [[ "${BEGIN_TOKEN}" == "${DEPLOYMENT_TOKEN}" ]] || fail "coordinator returned a mismatched deployment token."
 [[ "${BEGIN_REMOTE_DIR}" == "${REMOTE_DIR}" && "${BEGIN_BACKUP_ROOT}" == "${REMOTE_BACKUP_ROOT}" ]] \
   || fail "coordinator returned mismatched deployment paths."
-[[ "${PREVIOUS_COMMIT}" == "none" || "${PREVIOUS_COMMIT}" =~ ^[0-9a-f]{40}$ ]] \
+[[ "${PREVIOUS_COMMIT}" == "none" || "${PREVIOUS_COMMIT}" == "unreleased-v2-foundation" \
+  || "${PREVIOUS_COMMIT}" =~ ^[0-9a-f]{40}$ ]] \
   || fail "coordinator returned an invalid previous commit."
 [[ "${BEGIN_WEB_CONTAINER}" == "none" || "${BEGIN_WEB_CONTAINER}" =~ ^[A-Za-z0-9_.-]+$ ]] \
   || fail "coordinator returned an invalid web writer snapshot."
@@ -540,6 +638,7 @@ on_deploy_exit() {
 trap on_deploy_exit EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+DEPLOYMENT_FAILURE_HANDLER_ACTIVE=1
 
 run_coordinator assert "${DEPLOYMENT_TOKEN}" prepared
 BACKUP_OUTPUT="$(run_coordinator guard "${DEPLOYMENT_TOKEN}" prepared backup)"
@@ -575,46 +674,9 @@ run_coordinator guard "${DEPLOYMENT_TOKEN}" boundary rotate-roles
 run_coordinator guard "${DEPLOYMENT_TOKEN}" boundary migrate
 run_coordinator guard "${DEPLOYMENT_TOKEN}" boundary verify-contract
 run_coordinator guard "${DEPLOYMENT_TOKEN}" boundary start-writers
-run_coordinator renew "${DEPLOYMENT_TOKEN}" boundary
-
-TARGET_HEALTH_RESPONSE="$(ssh "${SSH_OPTS[@]}" "${REMOTE_TARGET}" bash -s -- <<'REMOTE_HEALTH'
-set -euo pipefail
-curl --fail --silent --show-error \
-  --retry 12 --retry-delay 5 --retry-all-errors --max-time 10 \
-  --noproxy '*' \
-  --resolve atlas.rangeway.app:443:127.0.0.1 \
-  https://atlas.rangeway.app/api/v2/ready
-REMOTE_HEALTH
-)"
-HEALTH_JSON="${TARGET_HEALTH_RESPONSE}" node --input-type=module -e '
-  const health = JSON.parse(process.env.HEALTH_JSON ?? "null");
-  if (health?.apiVersion !== "v2" || health?.contractVersion !== "atlas-v2-foundation-v1" || health?.release !== process.argv[1]) {
-    throw new Error("Target readiness did not match the exact Atlas V2 release contract.");
-  }
-' "${LOCAL_COMMIT}"
-run_coordinator renew "${DEPLOYMENT_TOKEN}" boundary
-
-run_coordinator assert "${DEPLOYMENT_TOKEN}" boundary
-ssh "${SSH_OPTS[@]}" "${REMOTE_TARGET}" bash -s -- "${REMOTE_DIR}" <<'REMOTE_WORKER_HEALTH'
-set -euo pipefail
-cd -- "$1"
-worker_container="$(docker compose ps -q worker)"
-[[ -n "${worker_container}" ]]
-[[ "$(docker inspect --format '{{.State.Health.Status}}' "${worker_container}")" == "healthy" ]]
-REMOTE_WORKER_HEALTH
-run_coordinator renew "${DEPLOYMENT_TOKEN}" boundary
-
-PUBLIC_HEALTH_RESPONSE="$(curl --fail --silent --show-error \
-  --retry 12 --retry-delay 5 --retry-all-errors --max-time 10 \
-  https://atlas.rangeway.app/api/v2/ready)"
-HEALTH_JSON="${PUBLIC_HEALTH_RESPONSE}" node --input-type=module -e '
-  const health = JSON.parse(process.env.HEALTH_JSON ?? "null");
-  if (health?.apiVersion !== "v2" || health?.contractVersion !== "atlas-v2-foundation-v1" || health?.release !== process.argv[1]) {
-    throw new Error("Public readiness did not match the exact Atlas V2 release contract.");
-  }
-' "${LOCAL_COMMIT}"
-
-run_coordinator assert "${DEPLOYMENT_TOKEN}" boundary
+VERIFY_RELEASE_OUTPUT="$(run_coordinator guard "${DEPLOYMENT_TOKEN}" boundary verify-release)"
+[[ "${VERIFY_RELEASE_OUTPUT}" == "VERIFIED_RELEASE=${LOCAL_COMMIT}" ]] \
+  || fail "coordinator returned invalid exact release verification evidence."
 run_coordinator complete "${DEPLOYMENT_TOKEN}" "${LOCAL_COMMIT}"
 DEPLOYMENT_COMPLETE=1
 /bin/rm -rf -- "${LOCAL_CANDIDATE_STAGE}"
@@ -627,7 +689,7 @@ echo "Exact pre-deploy backup: ${EXACT_BACKUP}"
 if [[ "${PREVIOUS_COMMIT}" =~ ^[0-9a-f]{40}$ ]]; then
   echo "Rollback guidance: create a clean worktree at ${PREVIOUS_COMMIT}, review it, and deploy that release through this coordinator."
 else
-  echo "Rollback guidance: no previous Atlas V2 Git commit was recorded; do not attempt an automated code rollback."
+  echo "Rollback guidance: no prior released Atlas V2 Git commit was recorded; do not attempt an automated code rollback."
 fi
 if [[ "${EXACT_BACKUP}" != "none" ]]; then
   echo "Data rollback guidance: verify ${EXACT_BACKUP} with deploy/restore-test.sh, then use an operator-reviewed restore procedure."

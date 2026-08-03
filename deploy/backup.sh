@@ -2,10 +2,22 @@
 set -euo pipefail
 
 ATLAS_BACKUP_FORMAT="atlas-v2-postgres-artifacts-v1"
+UNRELEASED_PROVENANCE="unreleased-v2-foundation"
 BACKUP_ROOT_INPUT="${BACKUP_ROOT:-/var/backups/atlas-v2}"
 COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-atlas-v2}"
 KEEP_QUIESCED="${ATLAS_KEEP_QUIESCED:-0}"
-REPOSITORY_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+BACKUP_TEST_MODE="${ATLAS_BACKUP_TEST_MODE:-0}"
+REPOSITORY_ROOT_INPUT="${ATLAS_REPOSITORY_ROOT:-}"
+
+if [[ "${1:-}" == "--repository-root" ]]; then
+  [[ "$#" -eq 2 ]] || { echo "Atlas V2 backup refused: --repository-root requires exactly one path." >&2; exit 1; }
+  [[ -z "${REPOSITORY_ROOT_INPUT}" || "${REPOSITORY_ROOT_INPUT}" == "$2" ]] \
+    || { echo "Atlas V2 backup refused: repository-root inputs disagree." >&2; exit 1; }
+  REPOSITORY_ROOT_INPUT="$2"
+elif [[ "$#" -ne 0 ]]; then
+  echo "Atlas V2 backup refused: usage: $0 [--repository-root ABSOLUTE_PATH]" >&2
+  exit 1
+fi
 
 fail() {
   echo "Atlas V2 backup refused: $*" >&2
@@ -40,6 +52,29 @@ canonicalize_absolute_path() {
     printf '/%s\n' "${joined}"
   fi
 }
+
+[[ "${BACKUP_TEST_MODE}" == "0" || "${BACKUP_TEST_MODE}" == "1" ]] \
+  || fail "ATLAS_BACKUP_TEST_MODE must be 0 or 1."
+[[ -n "${REPOSITORY_ROOT_INPUT}" ]] \
+  || fail "ATLAS_REPOSITORY_ROOT or --repository-root is required."
+[[ "${REPOSITORY_ROOT_INPUT}" != *'*'* && "${REPOSITORY_ROOT_INPUT}" != *'?'* \
+  && "${REPOSITORY_ROOT_INPUT}" != *'['* ]] \
+  || fail "repository root cannot contain a glob."
+LEXICAL_REPOSITORY_ROOT="$(canonicalize_absolute_path "${REPOSITORY_ROOT_INPUT}")" \
+  || fail "repository root must be an absolute path."
+[[ "${LEXICAL_REPOSITORY_ROOT}" == "${REPOSITORY_ROOT_INPUT}" ]] \
+  || fail "repository root must be an exact canonical absolute path."
+if [[ "${BACKUP_TEST_MODE}" != "1" ]]; then
+  [[ "${LEXICAL_REPOSITORY_ROOT}" == "/opt/atlas-v2" ]] \
+    || fail "production repository root must be exactly /opt/atlas-v2."
+fi
+[[ -d "${LEXICAL_REPOSITORY_ROOT}" && ! -L "${LEXICAL_REPOSITORY_ROOT}" ]] \
+  || fail "repository root must be a real directory."
+REPOSITORY_ROOT="$(cd -- "${LEXICAL_REPOSITORY_ROOT}" && pwd -P)"
+[[ "${REPOSITORY_ROOT}" == "${LEXICAL_REPOSITORY_ROOT}" ]] \
+  || fail "repository root must not traverse a symlink."
+[[ -f "${REPOSITORY_ROOT}/docker-compose.yml" && ! -L "${REPOSITORY_ROOT}/docker-compose.yml" ]] \
+  || fail "repository root does not contain the reviewed Compose file."
 
 [[ "${BACKUP_ROOT_INPUT}" != *'*'* && "${BACKUP_ROOT_INPUT}" != *'?'* && "${BACKUP_ROOT_INPUT}" != *'['* ]] \
   || fail "BACKUP_ROOT cannot contain a glob."
@@ -76,6 +111,27 @@ for command_name in docker sha256sum mktemp git rm; do
 done
 
 cd "${REPOSITORY_ROOT}"
+GIT_COMMIT="${ATLAS_GIT_COMMIT:-}"
+if [[ -z "${GIT_COMMIT}" && -f .atlas-release ]]; then
+  GIT_COMMIT="$(tr -d '[:space:]' < .atlas-release)"
+fi
+if [[ -z "${GIT_COMMIT}" ]] && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  GIT_COMMIT="$(git rev-parse --verify HEAD)"
+fi
+MIGRATION_PROVENANCE="released"
+MIGRATION_SET_SHA256="none"
+if [[ "${GIT_COMMIT}" == "${UNRELEASED_PROVENANCE}" ]]; then
+  [[ ! -e "${REPOSITORY_ROOT}/.atlas-release" ]] \
+    || fail "unreleased provenance requires that no release marker existed."
+  MIGRATION_SET_SHA256="${ATLAS_INITIAL_PROVENANCE_SHA256:-}"
+  [[ "${MIGRATION_SET_SHA256}" =~ ^[0-9a-f]{64}$ ]] \
+    || fail "unreleased provenance requires an immutable migration-set identity."
+  MIGRATION_PROVENANCE="zero"
+else
+  [[ "${GIT_COMMIT}" =~ ^[0-9a-f]{40}$ ]] \
+    || fail "ATLAS_GIT_COMMIT or .atlas-release must identify the deployed commit."
+fi
+
 docker compose config >/dev/null
 
 DB_CONTAINER="$(docker compose ps -q db)"
@@ -85,18 +141,18 @@ DB_CONTAINER="$(docker compose ps -q db)"
 docker volume inspect atlas-artifacts >/dev/null 2>&1 \
   || fail "the Atlas V2 artifact volume does not exist."
 
-GIT_COMMIT="${ATLAS_GIT_COMMIT:-}"
-if [[ -z "${GIT_COMMIT}" && -f .atlas-release ]]; then
-  GIT_COMMIT="$(tr -d '[:space:]' < .atlas-release)"
-fi
-if [[ -z "${GIT_COMMIT}" ]] && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-  GIT_COMMIT="$(git rev-parse --verify HEAD)"
-fi
-[[ "${GIT_COMMIT}" =~ ^[0-9a-f]{40}$ ]] \
-  || fail "ATLAS_GIT_COMMIT or .atlas-release must identify the deployed commit."
-
 DATABASE_IMAGE="$(docker inspect --format '{{.Config.Image}}' "${DB_CONTAINER}")"
 [[ -n "${DATABASE_IMAGE}" ]] || fail "could not resolve the database image."
+if [[ "${MIGRATION_PROVENANCE}" == "zero" ]]; then
+  INITIAL_DATABASE_STATE="$(
+    docker compose exec -T -e "PGAPPNAME=atlas-deploy-${ATLAS_DEPLOYMENT_TOKEN:-standalone-backup}" db \
+      psql --username=atlas --dbname=atlas --tuples-only --no-align \
+      --variable=ON_ERROR_STOP=1 \
+      --command="SELECT CASE WHEN to_regclass('public.schema_migrations') IS NULL AND NOT EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public' AND c.relname = ANY (ARRAY['organizations','users','actors','organization_memberships','audit_events','outbox_events','api_idempotency_keys'])) THEN 'atlas-initial-empty' ELSE 'atlas-initial-unknown' END AS atlas_initial_provenance;"
+  )" || fail "could not verify unreleased database provenance."
+  [[ "${INITIAL_DATABASE_STATE}" == "atlas-initial-empty" ]] \
+    || fail "unreleased provenance is allowed only for an exact zero-migration Atlas database."
+fi
 TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 
@@ -267,6 +323,8 @@ docker run --rm \
 {
   printf 'backup_format=%s\n' "${ATLAS_BACKUP_FORMAT}"
   printf 'git_commit=%s\n' "${GIT_COMMIT}"
+  printf 'migration_provenance=%s\n' "${MIGRATION_PROVENANCE}"
+  printf 'migration_set_sha256=%s\n' "${MIGRATION_SET_SHA256}"
   printf 'compose_project=%s\n' "${COMPOSE_PROJECT_NAME}"
   printf 'database_image=%s\n' "${DATABASE_IMAGE}"
   printf 'timestamp=%s\n' "${TIMESTAMP}"

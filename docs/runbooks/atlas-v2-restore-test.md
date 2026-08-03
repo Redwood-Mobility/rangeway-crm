@@ -44,7 +44,7 @@ ATLAS_RESTORE_TMP_ROOT=/var/tmp \
 ./deploy/restore-test.sh /var/backups/atlas-v2/20260802T210000Z-AbCd12
 ```
 
-The script creates unique temporary database and artifact volumes, extracts the artifact archive, starts a temporary PostgreSQL 17 container, restores the custom dump with `pg_restore`, verifies the expected migration row and the immutable Rangeway organization UUID `00000000-0000-4000-8000-000000000001`, and removes its temporary containers, volumes, and work directory. The mutable organization display name is deliberately not part of restore validity.
+The script validates release provenance in the checksummed metadata, creates unique temporary database and artifact volumes, extracts the artifact archive, starts a temporary PostgreSQL 17 container, restores the custom dump with `pg_restore`, and removes its temporary containers, volumes, and work directory. A normal released backup must carry an exact 40-character commit and proves the expected migration row plus immutable Rangeway organization UUID `00000000-0000-4000-8000-000000000001`; the mutable organization display name is deliberately not part of restore validity. The one special `unreleased-v2-foundation` form is accepted only with `migration_provenance=zero` and a 64-character immutable migration-set hash, and its restored database must prove that both `schema_migrations` and `organizations` are absent.
 
 ## Required evidence
 
@@ -54,11 +54,11 @@ A passing record includes all of the following:
 - The three successful checksum lines.
 - Exit status `0` from `deploy/restore-test.sh`.
 - `Restore test passed for <exact-directory>.`
-- `Verified schema migration row, immutable Rangeway organization ID, and artifact archive extraction.`
+- `Verified schema migration row, immutable Rangeway organization ID, and artifact archive extraction.`, or the exact zero-migration verification line for an authenticated `unreleased-v2-foundation` retry backup.
 - Confirmation that the live `atlas-db` and `atlas-artifacts` volumes were not mounted, changed, renamed, or deleted.
 - The operator, UTC date, and evidence location.
 
-Any checksum mismatch, restore error, missing migration row, missing immutable Rangeway organization ID, artifact extraction error, or cleanup error fails the test. A changed organization display name does not. Quarantine a failed backup; do not repair its manifest or relabel it trusted. Create a new backup after correcting the underlying issue, then test that new artifact.
+Any checksum mismatch, provenance mismatch, restore error, missing migration row, missing immutable Rangeway organization ID, non-empty unreleased database, artifact extraction error, or cleanup error fails the test. A changed organization display name does not. Quarantine a failed backup; do not repair its manifest or relabel it trusted. Create a new backup after correcting the underlying issue, then test that new artifact.
 
 ## Cadence and sign-off
 

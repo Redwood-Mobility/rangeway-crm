@@ -97,6 +97,7 @@ function createDeployFixture(): DeployFixture {
   const coordinatorInstallLock = path.join(root, "install.lock");
   mkdirSync(path.join(repository, "deploy/systemd"), { recursive: true });
   mkdirSync(path.join(repository, "openapi"), { recursive: true });
+  mkdirSync(path.join(repository, "db/migrations"), { recursive: true });
   mkdirSync(path.join(repository, "nested"), { recursive: true });
   mkdirSync(binDirectory, { recursive: true });
   mkdirSync(logDirectory, { recursive: true });
@@ -127,6 +128,7 @@ function createDeployFixture(): DeployFixture {
   copyFileSync(path.join(sourceRoot, "deploy/Caddyfile"), caddyConfig);
   writeFileSync(path.join(repository, "package.json"), "{}\n");
   writeFileSync(path.join(repository, "openapi/atlas-v2.yaml"), "openapi: 3.1.0\n");
+  writeFileSync(path.join(repository, "db/migrations/0001_platform.sql"), "SELECT 1;\n");
   const environmentFile = path.join(repository, ".env.production");
   writeFileSync(environmentFile, productionEnvironment());
   writeFileSync(path.join(repository, ".env.secret"), "DO_NOT_SYNC=one\n");
@@ -174,6 +176,11 @@ for argument in "$@"; do
       ;;
   esac
 done
+if [[ "\${FAKE_RSYNC_INTERRUPT:-0}" == "1" ]]; then
+  kill -TERM "$PPID"
+  /bin/sleep 0.1
+  exit 143
+fi
 [[ "\${FAKE_RSYNC_FAIL_ON:-}" == "\${counter}" ]] && exit 42
 exit 0`);
   fakeTool(binDirectory, "curl", `
@@ -199,12 +206,17 @@ if [[ "$*" == *"compose ps --all --format"* ]]; then
   exit 0
 fi
 if [[ "$*" == "volume inspect atlas-db" ]]; then
-  [[ "\${FAKE_HAS_DB:-0}" == "1" ]] && exit 0 || exit 1
+  [[ "\${FAKE_HAS_DB:-0}" == "1" || -f "\${FAKE_LOG_DIR}/atlas-db-exists" ]] && exit 0 || exit 1
 fi
 if [[ "$*" == "compose ps -q db" ]]; then printf '%s\\n' db-container; exit 0; fi
 if [[ "$*" == "compose ps -q web" ]]; then printf '%s\\n' web-container; exit 0; fi
 if [[ "$*" == "compose ps -q worker" ]]; then printf '%s\\n' worker-container; exit 0; fi
 if [[ "$*" == *"State.Health.Status"* ]]; then printf '%s\\n' healthy; exit 0; fi
+if [[ "$*" == "compose up -d db" ]]; then
+  : > "\${FAKE_LOG_DIR}/atlas-db-exists"
+  [[ "\${FAKE_BUILD_DB_FAIL_AFTER_VOLUME:-0}" == "1" ]] && exit 61
+  exit 0
+fi
 if [[ "$*" == *"pg_stat_activity"* ]]; then printf '0\\n'; exit 0; fi
 if [[ "$*" == *"--profile operations run"* && "$*" == *"migrator"* \
   && "$*" != *"verify-runtime-permissions"* && "\${FAKE_MIGRATION_FAIL:-0}" == "1" ]]; then exit 59; fi
@@ -227,7 +239,11 @@ case "$*" in
   "daemon-reload") exit 0 ;;
   "cat --no-pager --full atlas-v2-deployment-guardian.service")
     printf '%s\\n' '# /etc/systemd/system/atlas-v2-deployment-guardian.service'
-    /bin/cat "\${FAKE_GUARDIAN_UNIT_PATH}"
+    if [[ "\${FAKE_LOADED_UNIT_FAIL:-0}" == "1" ]]; then
+      printf '%s\\n' 'tampered loaded unit'
+    else
+      /bin/cat "\${FAKE_GUARDIAN_UNIT_PATH}"
+    fi
     ;;
   *) exit 0 ;;
 esac`);
@@ -303,6 +319,7 @@ function deploy(fixture: DeployFixture, overrides: NodeJS.ProcessEnv = {}) {
       ATLAS_CADDY_CONFIG_PATH: fixture.caddyConfig,
       ATLAS_COORDINATOR_TEST_MODE: "1",
       ATLAS_COORDINATOR_STATE_ROOT: fixture.coordinatorStateRoot,
+      ATLAS_COORDINATOR_STAGE_ROOT: fixture.coordinatorStage,
       ATLAS_COORDINATOR_CONFIG_FILE: fixture.coordinatorConfig,
       ATLAS_COORDINATOR_GLOBAL_LOCK: path.join(fixture.root, "coordinator.lock"),
       ATLAS_COORDINATOR_ACTION_CLEANUP_LOCK: path.join(fixture.root, "action-cleanup.lock"),
@@ -477,6 +494,21 @@ describe("deploy.sh behavior", () => {
     expect(deploySource).not.toMatch(/sudo -n|privileged\(\)/);
   });
 
+  it("requires Ubuntu 24.04 and systemd 255 with a disposable ExitType cgroup capability probe", () => {
+    const bootstrapSource = readFileSync(path.join(sourceRoot, "deploy/bootstrap-ubuntu.sh"), "utf8");
+    const deploySource = readFileSync(path.join(sourceRoot, "deploy/deploy.sh"), "utf8");
+    for (const source of [bootstrapSource, deploySource]) {
+      expect(source).toContain("/etc/os-release");
+      expect(source).toMatch(/VERSION_ID.*24\.04|24\.04.*VERSION_ID/s);
+      expect(source).toMatch(/systemd.*255|255.*systemd/s);
+      expect(source).toContain("ExitType=cgroup");
+      expect(source).toContain("systemd-run");
+      expect(source).toContain("--collect");
+      expect(source).toMatch(/reset-failed|LoadState/);
+    }
+    expect(bootstrapSource.indexOf("/etc/os-release")).toBeLessThan(bootstrapSource.indexOf("apt-get update"));
+  });
+
   it("promotes staged source and environment only through a guarded durable sync phase", () => {
     const deploySource = readFileSync(path.join(sourceRoot, "deploy/deploy.sh"), "utf8");
     const coordinatorSource = readFileSync(path.join(sourceRoot, "deploy/deployment-coordinator.sh"), "utf8");
@@ -509,7 +541,7 @@ describe("deploy.sh behavior", () => {
 
   it("fences every long mutation and writer start with the exact token and phase", () => {
     const deploySource = readFileSync(path.join(sourceRoot, "deploy/deploy.sh"), "utf8");
-    for (const action of ["build-db", "rotate-roles", "migrate", "start-writers", "verify-contract"]) {
+    for (const action of ["build-db", "rotate-roles", "migrate", "start-writers", "verify-contract", "verify-release"]) {
       expect(deploySource).toContain(`guard \"\${DEPLOYMENT_TOKEN}\"`);
       expect(deploySource).toContain(action);
     }
@@ -623,6 +655,17 @@ describe("deploy.sh behavior", () => {
     expect(result.status).not.toBe(0);
     expect(existsSync(path.join(fixture.coordinatorStateRoot, "active.state"))).toBe(false);
     expect(existsSync(path.join(fixture.logDirectory, "docker.log"))).toBe(false);
+    expect(readdirSync(fixture.coordinatorStage)).toEqual([]);
+  });
+
+  it("removes the exact remote token stage when installation fails before ownership acquisition", () => {
+    const fixture = createDeployFixture();
+    const result = deploy(fixture, { FAKE_LOADED_UNIT_FAIL: "1" });
+
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toMatch(/install|acquisition|loaded/i);
+    expect(existsSync(path.join(fixture.coordinatorStateRoot, "active.state"))).toBe(false);
+    expect(readdirSync(fixture.coordinatorStage)).toEqual([]);
   });
 
   it.each(["archive", "transfer"])(
@@ -640,8 +683,25 @@ describe("deploy.sh behavior", () => {
       expect(readdirSync(localTemporaryRoot).filter((entry) => entry.startsWith("atlas-v2-candidate.")))
         .toEqual([]);
       expect(existsSync(path.join(fixture.coordinatorStateRoot, "active.state"))).toBe(false);
+      expect(existsSync(fixture.coordinatorStage) ? readdirSync(fixture.coordinatorStage) : []).toEqual([]);
     },
   );
+
+  it("removes the exact remote token stage after an interrupted partial transfer without logging environment contents", () => {
+    const fixture = createDeployFixture();
+    const secretCanary = "stage-secret-must-never-appear";
+    writeFileSync(fixture.environmentFile, `${productionEnvironment()}PRIVATE_CANARY=${secretCanary}\n`);
+
+    const result = deploy(fixture, { FAKE_RSYNC_INTERRUPT: "1" });
+
+    expect(result.status).not.toBe(0);
+    expect(existsSync(path.join(fixture.coordinatorStateRoot, "active.state"))).toBe(false);
+    expect(existsSync(fixture.coordinatorStage) ? readdirSync(fixture.coordinatorStage) : []).toEqual([]);
+    const logs = readdirSync(fixture.logDirectory)
+      .map((entry) => readFileSync(path.join(fixture.logDirectory, entry), "utf8"))
+      .join("\n");
+    expect(`${result.stdout}${result.stderr}${logs}`).not.toContain(secretCanary);
+  });
 
   it("retires a recovered deployment under the install lock and retries without manual intervention", () => {
     const fixture = createDeployFixture();
@@ -658,6 +718,51 @@ describe("deploy.sh behavior", () => {
       .toBe(`${releaseCommit}\n`);
     expect(readdirSync(path.join(fixture.coordinatorStateRoot, "history")).some((entry) =>
       entry.endsWith(".recovered.state"))).toBe(true);
+    expect(readdirSync(fixture.coordinatorStage)).toEqual([]);
+  });
+
+  it("backs up and restore-proves an empty first-deploy volume on retry with explicit unreleased provenance", () => {
+    const fixture = createDeployFixture();
+    const exactBackup = path.join(fixture.backupRoot, "initial-provenance-proof");
+    executable(path.join(fixture.repository, "deploy/backup.sh"), `#!/usr/bin/env bash
+set -euo pipefail
+ATLAS_BACKUP_FORMAT="atlas-v2-postgres-artifacts-v1"
+[[ "\${ATLAS_REPOSITORY_ROOT:-}" == '${fixture.remoteDirectory}' ]]
+[[ "\${ATLAS_GIT_COMMIT:-}" == 'unreleased-v2-foundation' ]]
+[[ "\${ATLAS_INITIAL_PROVENANCE_SHA256:-}" =~ ^[0-9a-f]{64}$ ]]
+mkdir -p '${exactBackup}'
+printf dump > '${exactBackup}/atlas-postgres.dump'
+printf artifacts > '${exactBackup}/atlas-artifacts.tgz'
+printf 'git_commit=unreleased-v2-foundation\nmigration_provenance=zero\nmigration_set_sha256=%s\n' "\${ATLAS_INITIAL_PROVENANCE_SHA256}" > '${exactBackup}/metadata.txt'
+(cd '${exactBackup}' && sha256sum atlas-postgres.dump atlas-artifacts.tgz metadata.txt > manifest.sha256)
+printf 'unreleased-v2-foundation\n' > "\${FAKE_LOG_DIR}/backup-provenance.log"
+printf 'ATLAS_BACKUP_PATH=%s\n' '${exactBackup}'
+`);
+    executable(path.join(fixture.repository, "deploy/restore-test.sh"), `#!/usr/bin/env bash
+set -euo pipefail
+grep -Fxq 'git_commit=unreleased-v2-foundation' "$1/metadata.txt"
+grep -Fxq 'migration_provenance=zero' "$1/metadata.txt"
+printf '%s\n' "$1" > "\${FAKE_LOG_DIR}/restore-test.log"
+`);
+
+    const failed = deploy(fixture, {
+      FAKE_BUILD_DB_FAIL_AFTER_VOLUME: "1",
+      FAKE_WRITER_SNAPSHOT: "",
+    });
+    expect(failed.status).not.toBe(0);
+    expect(readFileSync(path.join(fixture.coordinatorStateRoot, "active.state"), "utf8"))
+      .toContain("status=recovered");
+    expect(existsSync(path.join(fixture.remoteDirectory, ".atlas-release"))).toBe(false);
+
+    const retried = deploy(fixture, { FAKE_WRITER_SNAPSHOT: "" });
+    expect(retried.status, `${retried.stdout}\n${retried.stderr}`).toBe(0);
+    expect(readFileSync(path.join(fixture.logDirectory, "backup-provenance.log"), "utf8").trim())
+      .toBe("unreleased-v2-foundation");
+    expect(readFileSync(path.join(fixture.logDirectory, "restore-test.log"), "utf8").trim())
+      .toBe(exactBackup);
+    expect(readFileSync(path.join(fixture.remoteDirectory, ".atlas-release"), "utf8").trim())
+      .toBe(releaseCommit);
+    expect(readdirSync(fixture.coordinatorStage)).toEqual([]);
   });
 
   it("never executes unauthenticated installed coordinator bytes to retire recovered state", () => {
@@ -727,6 +832,7 @@ describe("deploy.sh behavior", () => {
     expect(readFileSync(path.join(fixture.logDirectory, "curl.log"), "utf8")).toMatch(
       /--noproxy \* .*--resolve atlas\.rangeway\.app:443:127\.0\.0\.1/,
     );
+    expect(readdirSync(fixture.coordinatorStage)).toEqual([]);
   });
 
   it("rejects a remote release symlink before backup or synchronization", () => {
@@ -737,9 +843,10 @@ describe("deploy.sh behavior", () => {
 
     expect(result.status).not.toBe(0);
     expect(`${result.stdout}${result.stderr}`).toMatch(/canonical path/i);
-    expect(readFileSync(path.join(fixture.logDirectory, "ssh.log"), "utf8").trim().split("\n")).toHaveLength(3);
+    expect(readFileSync(path.join(fixture.logDirectory, "ssh.log"), "utf8").trim().split("\n")).toHaveLength(4);
     expect(existsSync(path.join(fixture.logDirectory, "docker.log"))).toBe(false);
     expect(readFileSync(path.join(fixture.logDirectory, "rsync-counter"), "utf8").trim()).toBe("1");
+    expect(readdirSync(fixture.coordinatorStage)).toEqual([]);
   });
 
   it("restarts the exact prior-active containers after a failure before migration begins", () => {
@@ -846,6 +953,7 @@ type BackupFixture = {
   backupRoot: string;
   binDirectory: string;
   logDirectory: string;
+  installedHelper: string;
 };
 
 function createBackupFixture(): BackupFixture {
@@ -854,11 +962,15 @@ function createBackupFixture(): BackupFixture {
   const backupRoot = path.join(root, "backups");
   const binDirectory = path.join(root, "bin");
   const logDirectory = path.join(root, "logs");
+  const installedHelper = path.join(root, "usr/local/libexec/atlas-v2/backup.sh");
   mkdirSync(path.join(repository, "deploy"), { recursive: true });
   mkdirSync(binDirectory, { recursive: true });
   mkdirSync(logDirectory, { recursive: true });
+  mkdirSync(path.dirname(installedHelper), { recursive: true });
   copyFileSync(path.join(sourceRoot, "deploy/backup.sh"), path.join(repository, "deploy/backup.sh"));
   chmodSync(path.join(repository, "deploy/backup.sh"), 0o755);
+  copyFileSync(path.join(sourceRoot, "deploy/backup.sh"), installedHelper);
+  chmodSync(installedHelper, 0o755);
   writeFileSync(path.join(repository, "docker-compose.yml"), "name: atlas-v2\nservices: {}\n");
 
   fakeTool(binDirectory, "git", `
@@ -881,7 +993,7 @@ printf '%s\\n' "$pending_directory"`);
 [[ "\${FAKE_FAIL_STAGE:-}" == "checksum" ]] && exit 51
 /usr/bin/shasum -a 256 "$@"`);
   fakeTool(binDirectory, "docker", `
-printf '%s\\n' "$*" >> "\${FAKE_LOG_DIR}/docker.log"
+printf '%s|%s\\n' "$PWD" "$*" >> "\${FAKE_LOG_DIR}/docker.log"
 last_argument=""
 for argument in "$@"; do last_argument="\${argument}"; done
 if [[ "$*" == "compose ps -q db" ]]; then printf '%s\\n' db-container; exit 0; fi
@@ -937,6 +1049,10 @@ if [[ "$*" == *"compose exec"* && "$*" == *"pg_dump"* ]]; then
   printf '%s' dump
   exit 0
 fi
+if [[ "$*" == *"atlas_initial_provenance"* ]]; then
+  printf '%s\\n' 'atlas-initial-empty'
+  exit 0
+fi
 if [[ "\${1:-}" == "run" ]]; then
   [[ "\${FAKE_FAIL_STAGE:-}" == "tar" ]] && exit 53
   backup_mount=""
@@ -946,11 +1062,15 @@ if [[ "\${1:-}" == "run" ]]; then
   exit 0
 fi
 exit 0`);
-  return { root, repository, backupRoot, binDirectory, logDirectory };
+  return { root, repository, backupRoot, binDirectory, logDirectory, installedHelper };
 }
 
-function backup(fixture: BackupFixture, overrides: NodeJS.ProcessEnv = {}) {
-  return spawnSync("/bin/bash", [path.join(fixture.repository, "deploy/backup.sh")], {
+function backup(
+  fixture: BackupFixture,
+  overrides: NodeJS.ProcessEnv = {},
+  helper = path.join(fixture.repository, "deploy/backup.sh"),
+) {
+  return spawnSync("/bin/bash", [helper, "--repository-root", fixture.repository], {
     cwd: fixture.repository,
     encoding: "utf8",
     env: {
@@ -959,12 +1079,50 @@ function backup(fixture: BackupFixture, overrides: NodeJS.ProcessEnv = {}) {
       FAKE_LOG_DIR: fixture.logDirectory,
       BACKUP_ROOT: fixture.backupRoot,
       ATLAS_GIT_COMMIT: releaseCommit,
+      ATLAS_BACKUP_TEST_MODE: "1",
       ...overrides,
     },
   });
 }
 
 describe("backup.sh behavior", () => {
+  it("runs the actual installed helper from a disjoint libexec path against the explicit repository root", () => {
+    const fixture = createBackupFixture();
+    const result = backup(fixture, {}, fixture.installedHelper);
+
+    expect(result.status, result.stderr).toBe(0);
+    const dockerLog = readFileSync(path.join(fixture.logDirectory, "docker.log"), "utf8");
+    expect(dockerLog).toContain(`${fixture.repository}|compose config`);
+    expect(dockerLog).not.toContain(`${path.dirname(path.dirname(fixture.installedHelper))}|compose config`);
+  });
+
+  it("records only validated zero-state provenance for an unreleased first-deploy database", () => {
+    const fixture = createBackupFixture();
+    const migrationSetHash = "b".repeat(64);
+    const result = backup(fixture, {
+      ATLAS_GIT_COMMIT: "unreleased-v2-foundation",
+      ATLAS_INITIAL_PROVENANCE_SHA256: migrationSetHash,
+    }, fixture.installedHelper);
+
+    expect(result.status, result.stderr).toBe(0);
+    const exactBackup = result.stdout.trim().slice("ATLAS_BACKUP_PATH=".length);
+    const metadata = readFileSync(path.join(exactBackup, "metadata.txt"), "utf8");
+    expect(metadata).toContain("git_commit=unreleased-v2-foundation\n");
+    expect(metadata).toContain("migration_provenance=zero\n");
+    expect(metadata).toContain(`migration_set_sha256=${migrationSetHash}\n`);
+  });
+
+  it("rejects unreleased provenance without its immutable migration-set identity", () => {
+    const fixture = createBackupFixture();
+    const result = backup(fixture, {
+      ATLAS_GIT_COMMIT: "unreleased-v2-foundation",
+      ATLAS_INITIAL_PROVENANCE_SHA256: "",
+    }, fixture.installedHelper);
+
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toMatch(/migration.*identity|provenance/i);
+    expect(existsSync(path.join(fixture.logDirectory, "docker.log"))).toBe(false);
+  });
   it("fences an active exact-label migrator before pg_dump without adding it to the restorable set", () => {
     const fixture = createBackupFixture();
     const result = backup(fixture, { FAKE_ACTIVE_MIGRATOR: "1" });

@@ -5,6 +5,7 @@ set -euo pipefail
 # state file is deliberately parsed as data; it is never sourced as shell code.
 UNIT_NAME="atlas-v2-deployment-guardian.service"
 STATE_ROOT="/var/lib/atlas-v2-deployment"
+STAGING_ROOT="/var/lib/atlas-v2-deployment/staging"
 CONFIG_FILE="/etc/atlas-v2-deployment-guardian.conf"
 GLOBAL_LOCK="/run/lock/atlas-v2-deployment.lock"
 INSTALL_LOCK="/run/lock/atlas-v2-deployment-install.lock"
@@ -16,9 +17,11 @@ BACKUP_TOOL_PATH="/usr/local/libexec/atlas-v2/backup.sh"
 RESTORE_TOOL_PATH="/usr/local/libexec/atlas-v2/restore-test.sh"
 ROLE_INITIALIZER_PATH="/usr/local/libexec/atlas-v2/init-roles.sh"
 CADDY_CONFIG_PATH="/usr/local/libexec/atlas-v2/Caddyfile"
+UNRELEASED_PROVENANCE="unreleased-v2-foundation"
 
 if [[ "${ATLAS_COORDINATOR_TEST_MODE:-0}" == "1" ]]; then
   STATE_ROOT="${ATLAS_COORDINATOR_STATE_ROOT:-${STATE_ROOT}}"
+  STAGING_ROOT="${ATLAS_COORDINATOR_STAGE_ROOT:-${STAGING_ROOT}}"
   CONFIG_FILE="${ATLAS_COORDINATOR_CONFIG_FILE:-${CONFIG_FILE}}"
   GLOBAL_LOCK="${ATLAS_COORDINATOR_GLOBAL_LOCK:-${GLOBAL_LOCK}}"
   INSTALL_LOCK="${ATLAS_COORDINATOR_INSTALL_LOCK:-${INSTALL_LOCK}}"
@@ -59,6 +62,10 @@ valid_token() {
 
 valid_commit() {
   [[ "$1" == "none" || "$1" =~ ^[0-9a-f]{40}$ ]]
+}
+
+valid_previous_provenance() {
+  [[ "$1" == "none" || "$1" == "${UNRELEASED_PROVENANCE}" || "$1" =~ ^[0-9a-f]{40}$ ]]
 }
 
 valid_path() {
@@ -228,6 +235,7 @@ reset_state_variables() {
   prior_release_path=""
   release_archive_hash=""
   environment_hash=""
+  migration_set_hash=""
   action_name=""
   action_pid=""
   action_phase=""
@@ -267,6 +275,7 @@ read_state() {
       prior_release_path) prior_release_path="${value}" ;;
       release_archive_hash) release_archive_hash="${value}" ;;
       environment_hash) environment_hash="${value}" ;;
+      migration_set_hash) migration_set_hash="${value}" ;;
       action_name) action_name="${value}" ;;
       action_pid) action_pid="${value}" ;;
       action_phase) action_phase="${value}" ;;
@@ -283,11 +292,15 @@ read_state() {
   valid_path "${remote_dir}" || return 1
   valid_path "${backup_root}" || return 1
   path_is_equal_or_descendant "${backup_root}" "${remote_dir}" && return 1
-  valid_commit "${previous_commit}" || return 1
+  valid_previous_provenance "${previous_commit}" || return 1
   [[ "${exact_backup}" == "none" ]] || valid_path "${exact_backup}" || return 1
   [[ "${web_container}" == "none" || "${web_container}" =~ ^[A-Za-z0-9_.-]+$ ]] || return 1
   [[ "${worker_container}" == "none" || "${worker_container}" =~ ^[A-Za-z0-9_.-]+$ ]] || return 1
-  [[ "${lease_seconds}" =~ ^[0-9]+$ && "${lease_seconds}" -ge 2 && "${lease_seconds}" -le 900 ]] || return 1
+  if [[ "${ATLAS_COORDINATOR_TEST_MODE:-0}" == "1" ]]; then
+    [[ "${lease_seconds}" =~ ^[0-9]+$ && "${lease_seconds}" -ge 2 && "${lease_seconds}" -le 900 ]] || return 1
+  else
+    [[ "${lease_seconds}" =~ ^[0-9]+$ && "${lease_seconds}" -ge 30 && "${lease_seconds}" -le 900 ]] || return 1
+  fi
   [[ "${deadline_epoch}" =~ ^[0-9]+$ ]] || return 1
   [[ "${guardian_ack_token}" == "none" || "${guardian_ack_token}" == "${token}" ]] || return 1
   valid_commit "${release_commit}" || return 1
@@ -300,11 +313,13 @@ read_state() {
   [[ "${role_initializer_hash}" =~ ^[0-9a-f]{64}$ ]] || return 1
   [[ "${caddy_config_hash}" =~ ^[0-9a-f]{64}$ ]] || return 1
   valid_path "${candidate_stage}" || return 1
+  [[ "${candidate_stage}" == "${STAGING_ROOT}/${token}" ]] || return 1
   valid_path "${prior_release_path}" || return 1
   [[ "${prior_release_path}" == "${candidate_stage}/previous-release" ]] || return 1
   [[ "${release_archive_hash}" =~ ^[0-9a-f]{64}$ ]] || return 1
   [[ "${environment_hash}" =~ ^[0-9a-f]{64}$ ]] || return 1
-  case "${action_name}" in none|backup|restore-backup|sync-release|build-db|rotate-roles|migrate|verify-contract|start-writers) ;; *) return 1 ;; esac
+  [[ "${migration_set_hash}" =~ ^[0-9a-f]{64}$ ]] || return 1
+  case "${action_name}" in none|backup|restore-backup|sync-release|build-db|rotate-roles|migrate|verify-contract|start-writers|verify-release) ;; *) return 1 ;; esac
   [[ "${action_pid}" == "none" || "${action_pid}" =~ ^[1-9][0-9]*$ ]] || return 1
   case "${action_phase}" in none|prepared|syncing|synced|boundary) ;; *) return 1 ;; esac
   if [[ "${action_unit}" != "none" ]]; then
@@ -349,6 +364,7 @@ write_state() {
     printf 'prior_release_path=%s\n' "${prior_release_path}"
     printf 'release_archive_hash=%s\n' "${release_archive_hash}"
     printf 'environment_hash=%s\n' "${environment_hash}"
+    printf 'migration_set_hash=%s\n' "${migration_set_hash}"
     printf 'action_name=%s\n' "${action_name}"
     printf 'action_pid=%s\n' "${action_pid}"
     printf 'action_phase=%s\n' "${action_phase}"
@@ -444,6 +460,8 @@ read_release_commit() {
     IFS= read -r extra < <(sed -n '2p' "${release_file}") || true
     valid_commit "${previous_commit}" && [[ "${previous_commit}" != "none" && -z "${extra}" ]] \
       || die "existing release marker is malformed."
+  elif docker volume inspect atlas-db >/dev/null 2>&1; then
+    previous_commit="${UNRELEASED_PROVENANCE}"
   fi
 }
 
@@ -451,7 +469,7 @@ release_marker_matches_previous() {
   local tree="$1"
   local marker="${tree}/.atlas-release"
   local value="" extra=""
-  if [[ "${previous_commit}" == "none" ]]; then
+  if [[ "${previous_commit}" == "none" || "${previous_commit}" == "${UNRELEASED_PROVENANCE}" ]]; then
     [[ ! -e "${marker}" ]]
     return
   fi
@@ -459,6 +477,17 @@ release_marker_matches_previous() {
   IFS= read -r value < "${marker}" || return 1
   IFS= read -r extra < <(sed -n '2p' "${marker}") || true
   [[ "${value}" == "${previous_commit}" && -z "${extra}" ]]
+}
+
+cleanup_candidate_stage() {
+  valid_token "${token}" || return 1
+  [[ "${candidate_stage}" == "${STAGING_ROOT}/${token}" ]] || return 1
+  if [[ ! -e "${candidate_stage}" ]]; then
+    return 0
+  fi
+  [[ -d "${candidate_stage}" && ! -L "${candidate_stage}" ]] || return 1
+  find -P "${candidate_stage}" -depth -delete
+  [[ ! -e "${candidate_stage}" ]]
 }
 
 tree_is_candidate() {
@@ -556,14 +585,20 @@ begin_deployment() {
   local requested_stage="${12}"
   local requested_archive_hash="${13}"
   local requested_environment_hash="${14}"
+  local requested_migration_set_hash="${15}"
   local current_now canonical_remote canonical_backup
   valid_token "${requested_token}" || die "deployment token is invalid."
   valid_path "${requested_remote}" || die "remote directory is invalid."
   valid_path "${requested_backup}" || die "backup root is invalid."
   path_is_equal_or_descendant "${requested_backup}" "${requested_remote}" \
     && die "backup root must remain outside the release directory."
-  [[ "${requested_lease}" =~ ^[0-9]+$ && "${requested_lease}" -ge 2 && "${requested_lease}" -le 900 ]] \
-    || die "lease must be between 2 and 900 seconds."
+  if [[ "${ATLAS_COORDINATOR_TEST_MODE:-0}" == "1" ]]; then
+    [[ "${requested_lease}" =~ ^[0-9]+$ && "${requested_lease}" -ge 2 && "${requested_lease}" -le 900 ]] \
+      || die "test lease must be between 2 and 900 seconds."
+  else
+    [[ "${requested_lease}" =~ ^[0-9]+$ && "${requested_lease}" -ge 30 && "${requested_lease}" -le 900 ]] \
+      || die "production lease must be between 30 and 900 seconds."
+  fi
   valid_commit "${requested_bundle_version}" && [[ "${requested_bundle_version}" != "none" ]] \
     || die "bundle version is invalid."
   for requested_hash in \
@@ -574,6 +609,10 @@ begin_deployment() {
     [[ "${requested_hash}" =~ ^[0-9a-f]{64}$ ]] || die "bundle hash is invalid."
   done
   valid_path "${requested_stage}" || die "candidate stage is invalid."
+  [[ "${requested_stage}" == "${STAGING_ROOT}/${requested_token}" ]] \
+    || die "candidate stage must be the exact token path under the staging root."
+  [[ "${requested_migration_set_hash}" =~ ^[0-9a-f]{64}$ ]] \
+    || die "migration-set hash is invalid."
   [[ -d "${requested_remote}" ]] || die "remote directory must already exist."
   [[ -d "${requested_backup}" ]] || die "backup root must already exist."
   [[ -d "${requested_stage}" && ! -L "${requested_stage}" ]] || die "candidate stage must already exist."
@@ -622,6 +661,7 @@ begin_deployment() {
   prior_release_path="${requested_stage}/previous-release"
   release_archive_hash="${requested_archive_hash}"
   environment_hash="${requested_environment_hash}"
+  migration_set_hash="${requested_migration_set_hash}"
   action_name="none"
   action_pid="none"
   action_phase="none"
@@ -690,7 +730,7 @@ mutate_state() {
       ;;
     annotate)
       [[ "${deadline_epoch}" -gt "${current_now}" ]] || die "deployment ownership lease expired."
-      valid_commit "${expected}" || die "previous release commit is invalid."
+      valid_previous_provenance "${expected}" || die "previous release provenance is invalid."
       valid_path "${replacement}" || die "exact backup path is invalid."
       path_is_equal_or_descendant "${replacement}" "${backup_root}" || die "exact backup is outside the backup root."
       previous_commit="${expected}"
@@ -762,7 +802,10 @@ wait
           || die "existing database backup tool has an unsupported format."
         backup_output="$(BACKUP_ROOT="${backup_root}" COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT}" \
           ATLAS_GIT_COMMIT="${previous_commit}" ATLAS_KEEP_QUIESCED=1 \
-          ATLAS_DEPLOYMENT_TOKEN="${token}" "${BACKUP_TOOL_PATH}")"
+          ATLAS_DEPLOYMENT_TOKEN="${token}" ATLAS_REPOSITORY_ROOT="${remote_dir}" \
+          ATLAS_INITIAL_PROVENANCE_SHA256="${migration_set_hash}" \
+          ATLAS_BACKUP_TEST_MODE="${ATLAS_COORDINATOR_TEST_MODE:-0}" \
+          "${BACKUP_TOOL_PATH}")"
         [[ "$(printf '%s\n' "${backup_output}" | wc -l | tr -d '[:space:]')" == "1" ]] \
           || die "backup script did not emit exactly one machine-readable path."
         case "${backup_output}" in
@@ -809,13 +852,16 @@ wait
       tar -xf "${archive}" -C "${candidate}"
       [[ ! -e "${candidate}/.atlas-release" && ! -e "${candidate}/.atlas-candidate" ]] \
         || die "candidate archive contains reserved release metadata."
+      printf '%s\n' "${bundle_version}" > "${candidate}/.atlas-candidate"
+      chmod 0600 "${candidate}/.atlas-candidate"
       if [[ "${ATLAS_COORDINATOR_TEST_MODE:-0}" == "1" ]]; then
         install -m 0600 "${environment}" "${candidate}/.env"
       else
         install -o root -g root -m 0600 "${environment}" "${candidate}/.env"
       fi
-      printf '%s\n' "${bundle_version}" > "${candidate}/.atlas-candidate"
-      chmod 0600 "${candidate}/.atlas-candidate"
+      [[ "$(hash_file "${candidate}/.env")" == "${environment_hash}" ]] \
+        || die "installed candidate environment hash mismatch."
+      durable_unlink "${environment}"
       atomic_exchange_directories "${candidate}" "${remote_dir}"
       if [[ "${ATLAS_COORDINATOR_SYNC_FAULT:-}" == "after-exchange" ]]; then
         return 88
@@ -898,6 +944,42 @@ SQL
       docker compose --profile operations run --rm --label "atlas.deployment-token=${token}" \
         -e "PGAPPNAME=atlas-deploy-${token}" migrator \
         node dist/server/platform/db/verify-runtime-permissions.js
+      ;;
+    verify-release)
+      local target_health public_health worker_container worker_health
+      valid_commit "${release_commit}" && [[ "${release_commit}" != "none" ]] \
+        || die "exact release verification requires a recorded candidate commit."
+      target_health="$(curl --fail --silent --show-error \
+        --retry 12 --retry-delay 5 --retry-all-errors --max-time 10 \
+        --noproxy '*' \
+        --resolve atlas.rangeway.app:443:127.0.0.1 \
+        https://atlas.rangeway.app/api/v2/ready)"
+      HEALTH_JSON="${target_health}" python3 -c '
+import json
+import os
+import sys
+health = json.loads(os.environ.get("HEALTH_JSON", "null"))
+expected = sys.argv[1]
+if health.get("apiVersion") != "v2" or health.get("contractVersion") != "atlas-v2-foundation-v1" or health.get("release") != expected:
+    raise SystemExit("target readiness did not match the exact Atlas V2 release")
+' "${release_commit}"
+      worker_container="$(docker compose ps -q worker)"
+      [[ -n "${worker_container}" ]] || die "worker container is unavailable for exact release verification."
+      worker_health="$(docker inspect --format '{{.State.Health.Status}}' "${worker_container}")"
+      [[ "${worker_health}" == "healthy" ]] || die "worker readiness is not healthy."
+      public_health="$(curl --fail --silent --show-error \
+        --retry 12 --retry-delay 5 --retry-all-errors --max-time 10 \
+        https://atlas.rangeway.app/api/v2/ready)"
+      HEALTH_JSON="${public_health}" python3 -c '
+import json
+import os
+import sys
+health = json.loads(os.environ.get("HEALTH_JSON", "null"))
+expected = sys.argv[1]
+if health.get("apiVersion") != "v2" or health.get("contractVersion") != "atlas-v2-foundation-v1" or health.get("release") != expected:
+    raise SystemExit("public readiness did not match the exact Atlas V2 release")
+' "${release_commit}"
+      printf 'VERIFIED_RELEASE=%s\n' "${release_commit}"
       ;;
     *) die "guarded deployment action is invalid." ;;
   esac
@@ -1119,7 +1201,7 @@ guard_deployment_action() {
     backup|restore-backup) required_status="prepared" ;;
     sync-release) required_status="syncing" ;;
     build-db) required_status="synced" ;;
-    rotate-roles|migrate|start-writers|verify-contract) required_status="boundary" ;;
+    rotate-roles|migrate|start-writers|verify-contract|verify-release) required_status="boundary" ;;
     *) die "guarded deployment action is invalid." ;;
   esac
   [[ "${expected_status}" == "${required_status}" ]] \
@@ -1438,6 +1520,7 @@ retire_recovered_deployment() {
     [[ ! -e "${recovered_candidate_archive}" ]] || die "recovered candidate archive already exists."
     durable_move "${prior_release_path}" "${recovered_candidate_archive}"
   fi
+  cleanup_candidate_stage || die "recovered deployment stage could not be retired safely."
   durable_move "${ACTIVE_STATE}" "${HISTORY_ROOT}/${token}.recovered.state"
   flock -u 8
 }
@@ -1464,9 +1547,10 @@ complete_deployment() {
   tree_is_candidate "${remote_dir}" || die "live release does not match the guarded candidate tree."
   release_marker_matches_previous "${prior_release_path}" \
     || die "retained previous release tree or marker is invalid."
+  archive_prior_release_tree || die "previous release tree could not be archived safely."
+  cleanup_candidate_stage || die "completed deployment stage could not be retired safely."
   durable_unlink "${remote_dir}/.atlas-candidate"
   printf '%s\n' "${requested_commit}" | durable_publish "${remote_dir}/.atlas-release" 0600
-  archive_prior_release_tree || die "previous release tree could not be archived safely."
 
   release_commit="${requested_commit}"
   status="complete"
@@ -1483,7 +1567,7 @@ usage() {
 
 command="${1:-}"
 case "${command}" in
-  begin) [[ "$#" -eq 15 ]] || usage; begin_deployment "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" "${10}" "${11}" "${12}" "${13}" "${14}" "${15}" ;;
+  begin) [[ "$#" -eq 16 ]] || usage; begin_deployment "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" "${10}" "${11}" "${12}" "${13}" "${14}" "${15}" "${16}" ;;
   transition) [[ "$#" -eq 4 ]] || usage; mutate_state "$2" transition "$3" "$4" ;;
   renew) [[ "$#" -eq 3 ]] || usage; mutate_state "$2" renew "$3" ;;
   assert) [[ "$#" -eq 3 ]] || usage; assert_deployment "$2" "$3" ;;

@@ -122,6 +122,7 @@ describe("deterministic deployment source contract", () => {
     scripts: Record<string, string>;
   };
   const productionEnvironment = readRepositoryFile("deploy/env.production.example");
+  const dockerIgnore = readRepositoryFile(".dockerignore");
 
   it("defines the exact V2 services, images, commands, mounts, and health dependencies", () => {
     expect(composeSource).toMatch(/^name: atlas-v2$/m);
@@ -249,11 +250,13 @@ describe("deterministic deployment source contract", () => {
     expect(deploymentCoordinator.indexOf("docker compose build web worker")).toBeLessThan(
       deploymentCoordinator.indexOf("import('./dist/server/config.js')"),
     );
-    expect(deployScript).toContain("https://atlas.rangeway.app/api/v2/ready");
-    expect(deployScript).toContain("contractVersion");
+    expect(deploymentCoordinator).toContain("https://atlas.rangeway.app/api/v2/ready");
+    expect(deploymentCoordinator).toContain("contractVersion");
     expect(deployScript).toContain("LOCAL_COMMIT");
-    expect(deployScript).toMatch(/worker.*healthy|healthy.*worker/s);
+    expect(deploymentCoordinator).toMatch(/worker.*healthy|healthy.*worker/s);
     expect(deployScript).toContain("verify-contract");
+    expect(deployScript).toContain('guard "${DEPLOYMENT_TOKEN}" boundary verify-release');
+    expect(deployScript).not.toMatch(/TARGET_HEALTH_RESPONSE|PUBLIC_HEALTH_RESPONSE|REMOTE_WORKER_HEALTH/);
     expect(deployScript).toContain("PREVIOUS_COMMIT");
     expect(deployScript).not.toMatch(/git reset|git checkout|docker volume rm|docker compose down -v/);
   });
@@ -293,6 +296,9 @@ describe("deterministic deployment source contract", () => {
     }
     expect(backupScript).toContain("pg_dump --format=custom");
     expect(backupScript).toContain('ATLAS_BACKUP_FORMAT="atlas-v2-postgres-artifacts-v1"');
+    expect(backupScript).toContain("ATLAS_REPOSITORY_ROOT");
+    expect(backupScript).toContain("--repository-root");
+    expect(backupScript).not.toMatch(/dirname -- "\$\{BASH_SOURCE\[0\]\}"/);
     expect(backupScript).toContain("atlas-artifacts:/artifacts:ro");
     expect(backupScript).toContain("sha256sum");
     expect(backupScript).toMatch(/-s .*atlas-postgres\.dump/);
@@ -309,6 +315,8 @@ describe("deterministic deployment source contract", () => {
     expect(restoreScript).toContain("pg_restore");
     expect(restoreScript).toContain("schema_migrations");
     expect(restoreScript).toContain("Rangeway");
+    expect(restoreScript).toContain("unreleased-v2-foundation");
+    expect(restoreScript).toContain("migration_set_sha256");
     expect(restoreScript).toContain("mktemp -d");
     expect(restoreScript).toContain("atlas_restore_");
     expect(restoreScript).toContain("docker volume create");
@@ -326,6 +334,23 @@ describe("deterministic deployment source contract", () => {
     const successPosition = restoreScript.indexOf("Restore test passed");
     expect(finalCleanupPosition).toBeGreaterThan(0);
     expect(successPosition).toBeGreaterThan(finalCleanupPosition);
+  });
+
+  it("excludes secrets and mutable state from the Docker build context", () => {
+    for (const excluded of [
+      ".env*",
+      "deploy/env.production*",
+      "/artifacts",
+      "/data",
+      "/uploads",
+      "/backups",
+      "/staging",
+      "/.worktrees",
+    ]) {
+      expect(dockerIgnore).toContain(excluded);
+    }
+    expect(dockerIgnore).toContain("!/.env.example");
+    expect(dockerIgnore).toContain("!deploy/env.production.example");
   });
 
   it.each(["deploy/deploy.sh", "deploy/backup.sh", "deploy/restore-test.sh"])(
