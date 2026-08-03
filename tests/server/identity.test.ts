@@ -50,34 +50,56 @@ function humanRecord(overrides: Partial<HumanActorRecord> = {}): HumanActorRecor
 }
 
 class MemoryIdentityRepository implements IdentityRepositoryPort {
-  human = humanRecord();
+  private humanRecords: HumanActorRecord[] = [];
   service: ServiceActorRecord | null = null;
   createHumanInput: CreateHumanUserInput | null = null;
   createServiceInput: CreateServiceActorInput | null = null;
   storedPrefix: string | null = null;
   storedHash: string | null = null;
-  duplicateHuman = false;
+
+  get human(): HumanActorRecord {
+    const human = this.humanRecords.at(-1);
+    if (!human) throw new Error("Expected human actor fixture");
+    return human;
+  }
+
+  set human(human: HumanActorRecord) {
+    this.humanRecords = [human];
+  }
+
+  get createHumanCount(): number {
+    return this.humanRecords.length;
+  }
 
   async createHumanUser(input: CreateHumanUserInput): Promise<HumanActorRecord> {
     this.createHumanInput = input;
-    if (this.duplicateHuman) {
+    if (this.humanRecords.some((human) => human.email === input.email)) {
       throw Object.assign(new Error("duplicate key value violates unique constraint"), {
         code: "23505",
         constraint: "users_email_key",
       });
     }
-    this.human = humanRecord({
+    const created = humanRecord({
       organizationId: input.organizationId,
       email: input.email,
       actorName: input.displayName,
       role: input.role,
       localPasswordHash: input.localPasswordHash ?? null,
     });
-    return this.human;
+    this.humanRecords.push(created);
+    return created;
   }
 
-  async findHumanActorByEmail(): Promise<HumanActorRecord | null> {
-    return this.human;
+  async findHumanActorByEmail(
+    scopedOrganizationId: string,
+    email: string,
+  ): Promise<HumanActorRecord | null> {
+    return (
+      this.humanRecords.find(
+        (human) =>
+          human.organizationId === scopedOrganizationId && human.email === email,
+      ) ?? null
+    );
   }
 
   async createServiceActor(
@@ -177,28 +199,23 @@ describe("IdentityService", () => {
 
   it("returns a stable conflict for the same human email twice", async () => {
     const repository = new MemoryIdentityRepository();
-    repository.duplicateHuman = true;
     const service = new IdentityService(fakePool(), repository);
     const input = {
       organizationId,
-      email: "zak@winnick.io",
+      email: "Zak@WINNICK.IO",
       displayName: "Zak Winnick",
       role: "owner" as const,
     };
 
-    const first = service.createHumanUser(input);
-    const second = service.createHumanUser(input);
-
-    await expect(first).rejects.toMatchObject({
+    await expect(service.createHumanUser(input)).resolves.toMatchObject({
+      email: "zak@winnick.io",
+    });
+    await expect(service.createHumanUser(input)).rejects.toMatchObject({
       status: 409,
       code: "CONFLICT",
       message: "A user with that email already exists.",
     });
-    await expect(second).rejects.toMatchObject({
-      status: 409,
-      code: "CONFLICT",
-      message: "A user with that email already exists.",
-    });
+    expect(repository.createHumanCount).toBe(1);
   });
 
   it("creates agent credentials with a lookup prefix and only a SHA-256 hash at rest", async () => {
@@ -275,6 +292,14 @@ describe("IdentityService", () => {
     await expect(
       service.authenticateServiceKey("atlas_abcdefghijkl.not-the-right-secret"),
     ).rejects.toMatchObject(expected);
+    const [credentialPrefix, credentialSecret] = created.serviceKey.split(".");
+    const wrongSecret = `${credentialSecret[0] === "A" ? "B" : "A"}${credentialSecret.slice(1)}`;
+    const samePrefixWrongSecret = `${credentialPrefix}.${wrongSecret}`;
+    expect(samePrefixWrongSecret.slice(0, 18)).toBe(created.serviceKey.slice(0, 18));
+    expect(samePrefixWrongSecret).not.toBe(created.serviceKey);
+    await expect(
+      service.authenticateServiceKey(samePrefixWrongSecret),
+    ).rejects.toMatchObject(expected);
 
     if (!repository.service) throw new Error("Expected service actor fixture");
     repository.service = { ...repository.service, disabledAt: new Date() };
@@ -299,6 +324,7 @@ describe("IdentityService", () => {
 
   it("authenticates a human with only actor context fields", async () => {
     const repository = new MemoryIdentityRepository();
+    repository.human = humanRecord();
     const service = new IdentityService(fakePool(), repository);
 
     await expect(
@@ -311,6 +337,27 @@ describe("IdentityService", () => {
       role: "owner",
       userId: repository.human.userId,
     });
+  });
+
+  it("requires both organization and email to match for human authentication", async () => {
+    const otherOrganizationId = randomUUID();
+    const repository = new MemoryIdentityRepository();
+    const service = new IdentityService(fakePool(), repository);
+    repository.human = humanRecord({ organizationId: otherOrganizationId });
+
+    const expected = {
+      status: 401,
+      code: "UNAUTHENTICATED",
+      message: "Authentication required.",
+    };
+    await expect(
+      service.authenticateHuman(organizationId, repository.human.email),
+    ).rejects.toMatchObject(expected);
+
+    repository.human = humanRecord({ email: "different@example.com" });
+    await expect(
+      service.authenticateHuman(organizationId, "zak@winnick.io"),
+    ).rejects.toMatchObject(expected);
   });
 });
 
