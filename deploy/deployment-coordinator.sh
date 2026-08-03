@@ -863,6 +863,10 @@ wait
         backup_output="$(BACKUP_ROOT="${backup_root}" COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT}" \
           ATLAS_GIT_COMMIT="${previous_commit}" ATLAS_KEEP_QUIESCED=1 \
           ATLAS_DEPLOYMENT_TOKEN="${token}" ATLAS_REPOSITORY_ROOT="${remote_dir}" \
+          ATLAS_BACKUP_ACTION_NAME="backup" ATLAS_BACKUP_ACTION_PHASE="prepared" \
+          ATLAS_BACKUP_ACTION_PID="${action_pid}" ATLAS_BACKUP_ACTION_UNIT="${action_unit}" \
+          ATLAS_BACKUP_STATE_ROOT="${STATE_ROOT}" ATLAS_BACKUP_GLOBAL_LOCK="${GLOBAL_LOCK}" \
+          ATLAS_BACKUP_NOW_EPOCH="$(now_epoch)" \
           ATLAS_INITIAL_PROVENANCE_SHA256="${migration_set_hash}" \
           ATLAS_BACKUP_TEST_MODE="${ATLAS_COORDINATOR_TEST_MODE:-0}" \
           "${BACKUP_TOOL_PATH}")"

@@ -10,6 +10,16 @@ ARTIFACT_VOLUME_NAME="${ATLAS_ARTIFACT_VOLUME_NAME:-atlas-artifacts}"
 KEEP_QUIESCED="${ATLAS_KEEP_QUIESCED:-0}"
 BACKUP_TEST_MODE="${ATLAS_BACKUP_TEST_MODE:-0}"
 REPOSITORY_ROOT_INPUT="${ATLAS_REPOSITORY_ROOT:-}"
+GLOBAL_LOCK="${ATLAS_BACKUP_GLOBAL_LOCK:-/run/lock/atlas-v2-deployment.lock}"
+STATE_ROOT="${ATLAS_BACKUP_STATE_ROOT:-/var/lib/atlas-v2-deployment}"
+STATE_LOCK="${STATE_ROOT}/state.lock"
+ACTIVE_STATE="${STATE_ROOT}/active.state"
+UNIT_NAME="atlas-v2-deployment-guardian.service"
+MANAGED_TOKEN="${ATLAS_DEPLOYMENT_TOKEN:-}"
+MANAGED_ACTION_NAME="${ATLAS_BACKUP_ACTION_NAME:-}"
+MANAGED_ACTION_PHASE="${ATLAS_BACKUP_ACTION_PHASE:-}"
+MANAGED_ACTION_PID="${ATLAS_BACKUP_ACTION_PID:-}"
+MANAGED_ACTION_UNIT="${ATLAS_BACKUP_ACTION_UNIT:-}"
 
 if [[ "${1:-}" == "--repository-root" ]]; then
   [[ "$#" -eq 2 ]] || { echo "Atlas V2 backup refused: --repository-root requires exactly one path." >&2; exit 1; }
@@ -72,7 +82,16 @@ if [[ "${BACKUP_TEST_MODE}" != "1" ]]; then
     || fail "production database volume must be exactly atlas-db."
   [[ "${ARTIFACT_VOLUME_NAME}" == "atlas-artifacts" ]] \
     || fail "production artifact volume must be exactly atlas-artifacts."
+  [[ "${GLOBAL_LOCK}" == "/run/lock/atlas-v2-deployment.lock" ]] \
+    || fail "production deployment lock must use the exact installed path."
+  [[ "${STATE_ROOT}" == "/var/lib/atlas-v2-deployment" ]] \
+    || fail "production deployment state must use the exact installed path."
 fi
+[[ "${GLOBAL_LOCK}" == /* && "${STATE_ROOT}" == /* ]] \
+  || fail "deployment lock and state paths must be absolute."
+[[ "${GLOBAL_LOCK}" != *'*'* && "${GLOBAL_LOCK}" != *'?'* && "${GLOBAL_LOCK}" != *'['* \
+  && "${STATE_ROOT}" != *'*'* && "${STATE_ROOT}" != *'?'* && "${STATE_ROOT}" != *'['* ]] \
+  || fail "deployment lock and state paths cannot contain a glob."
 [[ -n "${REPOSITORY_ROOT_INPUT}" ]] \
   || fail "ATLAS_REPOSITORY_ROOT or --repository-root is required."
 [[ "${REPOSITORY_ROOT_INPUT}" != *'*'* && "${REPOSITORY_ROOT_INPUT}" != *'?'* \
@@ -122,7 +141,7 @@ case "${BACKUP_ROOT}" in
 esac
 [[ "${BACKUP_ROOT}" =~ ^/[A-Za-z0-9._/-]+$ ]] || fail "BACKUP_ROOT contains unsupported characters."
 
-for command_name in docker sha256sum mktemp git rm; do
+for command_name in docker sha256sum mktemp git flock systemctl stat grep sed date rm; do
   command -v "${command_name}" >/dev/null 2>&1 || fail "required command is unavailable: ${command_name}"
 done
 
@@ -146,6 +165,120 @@ if [[ "${GIT_COMMIT}" == "${UNRELEASED_PROVENANCE}" ]]; then
 else
   [[ "${GIT_COMMIT}" =~ ^[0-9a-f]{40}$ ]] \
     || fail "ATLAS_GIT_COMMIT or .atlas-release must identify the deployed commit."
+fi
+
+managed_claim_count=0
+for managed_claim in \
+  "${MANAGED_TOKEN}" "${MANAGED_ACTION_NAME}" "${MANAGED_ACTION_PHASE}" \
+  "${MANAGED_ACTION_PID}" "${MANAGED_ACTION_UNIT}"; do
+  [[ -z "${managed_claim}" ]] || managed_claim_count=$((managed_claim_count + 1))
+done
+
+state_value() {
+  local key="$1"
+  local count value
+  count="$(grep -c "^${key}=" "${ACTIVE_STATE}" || true)"
+  [[ "${count}" == "1" ]] || fail "managed deployment state must contain ${key} exactly once."
+  value="$(sed -n "s/^${key}=//p" "${ACTIVE_STATE}")"
+  [[ -n "${value}" ]] || fail "managed deployment state contains an empty ${key}."
+  printf '%s\n' "${value}"
+}
+
+guardian_active_status() {
+  systemctl is-active --quiet "${UNIT_NAME}"
+}
+
+[[ -d "${STATE_ROOT}" && ! -L "${STATE_ROOT}" ]] \
+  || fail "deployment state root must be a real directory."
+[[ -f "${STATE_LOCK}" && ! -L "${STATE_LOCK}" ]] \
+  || fail "deployment state lock must be a real file."
+mkdir -p -- "$(dirname -- "${GLOBAL_LOCK}")"
+[[ ! -L "${GLOBAL_LOCK}" ]] \
+  || fail "deployment exclusion lock must not be a symlink."
+exec 9>"${GLOBAL_LOCK}"
+
+if [[ "${BACKUP_TEST_MODE}" != "1" ]]; then
+  [[ "$(stat -c '%U:%G:%a' "${STATE_ROOT}")" == "root:root:700" ]] \
+    || fail "deployment state root ownership or mode is invalid."
+  [[ "$(stat -c '%U:%G:%a' "${STATE_LOCK}")" == "root:root:600" ]] \
+    || fail "deployment state lock ownership or mode is invalid."
+  [[ "$(stat -c '%U:%G' "${GLOBAL_LOCK}")" == "root:root" ]] \
+    || fail "deployment exclusion lock ownership is invalid."
+fi
+
+if [[ "${managed_claim_count}" -eq 0 ]]; then
+  flock -n -x 9 || fail "an active deployment guardian owns the host-wide exclusion."
+  exec 8>"${STATE_LOCK}"
+  flock -s 8
+  [[ ! -e "${ACTIVE_STATE}" ]] \
+    || fail "durable deployment ownership is active; standalone backup is refused."
+  flock -u 8
+  set +e
+  guardian_active_status
+  guardian_status="$?"
+  set -e
+  [[ "${guardian_status}" -eq 3 ]] \
+    || fail "deployment guardian is active or its inactive state could not be proven."
+  BACKUP_APPLICATION_NAME="atlas-deploy-standalone-backup"
+elif [[ "${managed_claim_count}" -eq 5 ]]; then
+  [[ "${MANAGED_TOKEN}" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] \
+    || fail "managed backup token is invalid."
+  [[ "${MANAGED_ACTION_NAME}" == "backup" && "${MANAGED_ACTION_PHASE}" == "prepared" ]] \
+    || fail "managed backup action identity is invalid."
+  [[ "${MANAGED_ACTION_PID}" =~ ^[1-9][0-9]*$ ]] \
+    || fail "managed backup action PID is invalid."
+  if [[ "${BACKUP_TEST_MODE}" == "1" ]]; then
+    [[ "${MANAGED_ACTION_UNIT}" == "none" \
+      || "${MANAGED_ACTION_UNIT}" == "atlas-v2-deploy-${MANAGED_TOKEN}-backup.service" ]] \
+      || fail "managed backup action unit is invalid."
+  else
+    [[ "${MANAGED_ACTION_UNIT}" == "atlas-v2-deploy-${MANAGED_TOKEN}-backup.service" ]] \
+      || fail "managed backup action unit is invalid."
+  fi
+  exec 8>"${STATE_LOCK}"
+  flock -s 8
+  [[ -f "${ACTIVE_STATE}" && ! -L "${ACTIVE_STATE}" ]] \
+    || fail "managed backup requires exact durable deployment state."
+  if [[ "${BACKUP_TEST_MODE}" != "1" ]]; then
+    [[ "$(stat -c '%U:%G:%a' "${ACTIVE_STATE}")" == "root:root:600" ]] \
+      || fail "managed deployment state ownership or mode is invalid."
+  fi
+  state_token="$(state_value token)"
+  state_status="$(state_value status)"
+  state_deadline="$(state_value deadline_epoch)"
+  state_guardian_ack="$(state_value guardian_ack_token)"
+  state_action_name="$(state_value action_name)"
+  state_action_pid="$(state_value action_pid)"
+  state_action_phase="$(state_value action_phase)"
+  state_action_unit="$(state_value action_unit)"
+  [[ "${state_token}" == "${MANAGED_TOKEN}" && "${state_status}" == "prepared" \
+    && "${state_guardian_ack}" == "${MANAGED_TOKEN}" \
+    && "${state_action_name}" == "${MANAGED_ACTION_NAME}" \
+    && "${state_action_pid}" == "${MANAGED_ACTION_PID}" \
+    && "${state_action_phase}" == "${MANAGED_ACTION_PHASE}" \
+    && "${state_action_unit}" == "${MANAGED_ACTION_UNIT}" ]] \
+    || fail "managed backup identity does not match durable deployment ownership."
+  [[ "${state_deadline}" =~ ^[0-9]+$ ]] \
+    || fail "managed backup lease is malformed."
+  if [[ "${BACKUP_TEST_MODE}" == "1" && -n "${ATLAS_BACKUP_NOW_EPOCH:-}" ]]; then
+    current_epoch="${ATLAS_BACKUP_NOW_EPOCH}"
+  else
+    current_epoch="$(date +%s)"
+  fi
+  [[ "${current_epoch}" =~ ^[0-9]+$ && "${state_deadline}" -gt "${current_epoch}" ]] \
+    || fail "managed backup deployment lease is expired."
+  flock -u 8
+  guardian_active_status \
+    || fail "managed backup requires the active deployment guardian."
+  if [[ "${BACKUP_TEST_MODE}" != "1" ]]; then
+    if flock -n -x 9; then
+      flock -u 9
+      fail "managed backup could not prove guardian ownership of the host-wide exclusion."
+    fi
+  fi
+  BACKUP_APPLICATION_NAME="atlas-deploy-${MANAGED_TOKEN}"
+else
+  fail "managed backup identity must be complete; partial environment claims are refused."
 fi
 
 DISCOVERED_CONTAINER="none"
@@ -176,6 +309,43 @@ discover_single_running_service() {
   fi
 }
 
+inspect_execution_state() {
+  local container="$1"
+  local service="$2"
+  local policy="$3"
+  local state
+  state="$(docker inspect --format '{{.State.Running}}|{{.State.Paused}}|{{.State.Restarting}}' "${container}")" \
+    || fail "could not inspect the exact-label ${service} container state."
+  case "${policy}:${state}" in
+    database:true\|false\|false) ;;
+    writer:true\|false\|false|writer:true\|false\|true) ;;
+    writer:true\|true\|false|writer:true\|true\|true)
+      fail "the exact-label ${service} container is paused; backup leaves it untouched."
+      ;;
+    database:*) fail "the exact-label database container is not execution-ready." ;;
+    writer:*) fail "the exact-label ${service} container is not safely mutable." ;;
+    *) fail "internal container-state policy is invalid." ;;
+  esac
+}
+
+preflight_exact_service() {
+  local service="$1"
+  local snapshot container project_label service_label extra
+  snapshot="$(docker ps \
+    --filter "label=com.docker.compose.project=${COMPOSE_PROJECT_NAME}" \
+    --filter "label=com.docker.compose.service=${service}" \
+    --format '{{.ID}}|{{.Label "com.docker.compose.project"}}|{{.Label "com.docker.compose.service"}}')" \
+    || fail "could not preflight the exact-label ${service} service."
+  while IFS='|' read -r container project_label service_label extra; do
+    [[ -n "${container}" ]] || continue
+    [[ "${container}" =~ ^[A-Za-z0-9_.-]+$ && -z "${extra:-}" ]] \
+      || fail "exact-label ${service} preflight returned malformed output."
+    [[ "${project_label}" == "${COMPOSE_PROJECT_NAME}" && "${service_label}" == "${service}" ]] \
+      || fail "exact-label ${service} preflight returned mismatched labels."
+    inspect_execution_state "${container}" "${service}" writer
+  done <<< "${snapshot}"
+}
+
 docker volume inspect "${DB_VOLUME_NAME}" >/dev/null 2>&1 \
   || fail "the Atlas V2 database volume does not exist."
 docker volume inspect "${ARTIFACT_VOLUME_NAME}" >/dev/null 2>&1 \
@@ -183,23 +353,13 @@ docker volume inspect "${ARTIFACT_VOLUME_NAME}" >/dev/null 2>&1 \
 
 discover_single_running_service db required
 DB_CONTAINER="${DISCOVERED_CONTAINER}"
+inspect_execution_state "${DB_CONTAINER}" db database
 DB_MOUNT="$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "/var/lib/postgresql/data"}}{{.Type}}|{{.Name}}|{{.Destination}}{{"\n"}}{{end}}{{end}}' "${DB_CONTAINER}")"
 [[ "${DB_MOUNT}" == "volume|${DB_VOLUME_NAME}|/var/lib/postgresql/data" ]] \
   || fail "the exact-label database container is not attached to the expected database volume."
 
 DATABASE_IMAGE="$(docker inspect --format '{{.Config.Image}}' "${DB_CONTAINER}")"
 [[ -n "${DATABASE_IMAGE}" ]] || fail "could not resolve the database image."
-if [[ "${MIGRATION_PROVENANCE}" == "zero" ]]; then
-  INITIAL_DATABASE_STATE="$(
-    docker exec "${DB_CONTAINER}" env \
-      "PGAPPNAME=atlas-deploy-${ATLAS_DEPLOYMENT_TOKEN:-standalone-backup}" \
-      psql --username=atlas --dbname=atlas --tuples-only --no-align \
-      --variable=ON_ERROR_STOP=1 \
-      --command="SELECT CASE WHEN to_regclass('public.schema_migrations') IS NULL AND NOT EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public' AND c.relname = ANY (ARRAY['organizations','users','actors','organization_memberships','audit_events','outbox_events','api_idempotency_keys'])) THEN 'atlas-initial-empty' ELSE 'atlas-initial-unknown' END AS atlas_initial_provenance;"
-  )" || fail "could not verify unreleased database provenance."
-  [[ "${INITIAL_DATABASE_STATE}" == "atlas-initial-empty" ]] \
-    || fail "unreleased provenance is allowed only for an exact zero-migration Atlas database."
-fi
 TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 
@@ -209,10 +369,17 @@ WEB_CONTAINER="none"
 WORKER_CONTAINER="none"
 discover_single_running_service web optional
 WEB_CONTAINER="${DISCOVERED_CONTAINER}"
-[[ "${WEB_CONTAINER}" == "none" ]] || WEB_WAS_ACTIVE=1
+if [[ "${WEB_CONTAINER}" != "none" ]]; then
+  inspect_execution_state "${WEB_CONTAINER}" web writer
+  WEB_WAS_ACTIVE=1
+fi
 discover_single_running_service worker optional
 WORKER_CONTAINER="${DISCOVERED_CONTAINER}"
-[[ "${WORKER_CONTAINER}" == "none" ]] || WORKER_WAS_ACTIVE=1
+if [[ "${WORKER_CONTAINER}" != "none" ]]; then
+  inspect_execution_state "${WORKER_CONTAINER}" worker writer
+  WORKER_WAS_ACTIVE=1
+fi
+preflight_exact_service migrator
 
 PENDING_DIR=""
 RESTORE_SERVICES=0
@@ -289,6 +456,7 @@ fence_exact_service() {
       || fail "exact-label ${service} fence returned malformed output."
     [[ "${project_label}" == "${COMPOSE_PROJECT_NAME}" && "${service_label}" == "${service}" ]] \
       || fail "exact-label ${service} fence returned mismatched labels."
+    inspect_execution_state "${container}" "${service}" writer
     containers+=("${container}")
   done <<< "${snapshot}"
   if [[ "${#containers[@]}" -gt 0 ]]; then
@@ -304,8 +472,20 @@ for fenced_service in web worker migrator; do
   fence_exact_service "${fenced_service}"
 done
 
+if [[ "${MIGRATION_PROVENANCE}" == "zero" ]]; then
+  INITIAL_DATABASE_STATE="$(
+    docker exec "${DB_CONTAINER}" env \
+      "PGAPPNAME=${BACKUP_APPLICATION_NAME}" \
+      psql --username=atlas --dbname=atlas --tuples-only --no-align \
+      --variable=ON_ERROR_STOP=1 \
+      --command="SELECT CASE WHEN to_regclass('public.schema_migrations') IS NULL AND NOT EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public' AND c.relname = ANY (ARRAY['organizations','users','actors','organization_memberships','audit_events','outbox_events','api_idempotency_keys'])) THEN 'atlas-initial-empty' ELSE 'atlas-initial-unknown' END AS atlas_initial_provenance;"
+  )" || fail "could not verify unreleased database provenance."
+  [[ "${INITIAL_DATABASE_STATE}" == "atlas-initial-empty" ]] \
+    || fail "unreleased provenance is allowed only for an exact zero-migration Atlas database."
+fi
+
 docker exec "${DB_CONTAINER}" env \
-  "PGAPPNAME=atlas-deploy-${ATLAS_DEPLOYMENT_TOKEN:-standalone-backup}" \
+  "PGAPPNAME=${BACKUP_APPLICATION_NAME}" \
   pg_dump --format=custom --username=atlas --dbname=atlas \
   > "${PENDING_DIR}/atlas-postgres.dump"
 

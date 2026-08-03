@@ -1,4 +1,4 @@
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import {
   chmodSync,
   copyFileSync,
@@ -39,6 +39,42 @@ function executable(filename: string, source: string): void {
 
 function fakeTool(binDirectory: string, name: string, body: string): void {
   executable(path.join(binDirectory, name), `#!/usr/bin/env bash\nset -euo pipefail\n${body}\n`);
+}
+
+function installAdvisoryFlock(binDirectory: string): void {
+  fakeTool(binDirectory, "flock", `
+mode=exclusive
+operation=lock
+nonblocking=0
+while [[ "\${1:-}" == -* ]]; do
+  case "$1" in
+    -s) mode=shared ;;
+    -x) mode=exclusive ;;
+    -n) nonblocking=1 ;;
+    -u) operation=unlock ;;
+    *) exit 64 ;;
+  esac
+  shift
+done
+[[ "$#" -eq 1 && "$1" =~ ^[0-9]+$ ]] || exit 64
+python3 - "$1" "\${mode}" "\${operation}" "\${nonblocking}" <<'PY'
+import fcntl
+import sys
+
+descriptor = int(sys.argv[1])
+mode, operation, nonblocking = sys.argv[2:]
+if operation == "unlock":
+    flags = fcntl.LOCK_UN
+else:
+    flags = fcntl.LOCK_SH if mode == "shared" else fcntl.LOCK_EX
+    if nonblocking == "1":
+        flags |= fcntl.LOCK_NB
+try:
+    fcntl.flock(descriptor, flags)
+except BlockingIOError:
+    raise SystemExit(1)
+PY
+`);
 }
 
 function productionEnvironment(): string {
@@ -242,6 +278,24 @@ if [[ "$*" == "compose ps -q db" ]]; then printf '%s\\n' db-container; exit 0; f
 if [[ "$*" == "compose ps -q web" ]]; then printf '%s\\n' web-container; exit 0; fi
 if [[ "$*" == "compose ps -q worker" ]]; then printf '%s\\n' worker-container; exit 0; fi
 if [[ "$*" == *"State.Health.Status"* ]]; then printf '%s\\n' healthy; exit 0; fi
+if [[ "$*" == *".State.Running"* ]]; then
+  last_argument=""
+  for argument in "$@"; do last_argument="\${argument}"; done
+  case "\${last_argument}" in
+    db-container) state="\${FAKE_DB_STATE:-running}" ;;
+    web-container) state="\${FAKE_WEB_STATE:-running}" ;;
+    worker-container) state="\${FAKE_WORKER_STATE:-running}" ;;
+    migrator-container) state="\${FAKE_MIGRATOR_STATE:-running}" ;;
+    *) exit 97 ;;
+  esac
+  case "\${state}" in
+    running) printf '%s\\n' 'true|false|false' ;;
+    restarting) printf '%s\\n' 'true|false|true' ;;
+    paused) printf '%s\\n' 'true|true|false' ;;
+    *) printf '%s\\n' 'false|false|false' ;;
+  esac
+  exit 0
+fi
 if [[ "$*" == *".Mounts"* && "$*" == *"db-container"* ]]; then
   printf '%s\\n' 'volume|atlas-db|/var/lib/postgresql/data'
   exit 0
@@ -265,6 +319,10 @@ if [[ "\${1:-}" == "exec" && "\${2:-}" == "db-container" && "$*" == *"atlas_init
   exit 0
 fi
 if [[ "\${1:-}" == "exec" && "\${2:-}" == "db-container" && "$*" == *"pg_dump"* ]]; then
+  if [[ -n "\${FAKE_BLOCK_PG_DUMP_MARKER:-}" ]]; then
+    : > "\${FAKE_BLOCK_PG_DUMP_MARKER}"
+    while [[ ! -f "\${FAKE_RELEASE_PG_DUMP_MARKER}" ]]; do /bin/sleep 0.02; done
+  fi
   printf '%s' dump
   exit 0
 fi
@@ -290,7 +348,7 @@ case "$*" in
     [[ "\${FAKE_GUARDIAN_ACK_SKIP:-0}" == "1" ]] || '${coordinator}' guardian-once
     ;;
   "is-active --quiet atlas-v2-deployment-guardian.service")
-    [[ -f "\${FAKE_LOG_DIR}/guardian-active" ]]
+    [[ -f "\${FAKE_LOG_DIR}/guardian-active" ]] && exit 0 || exit 3
     ;;
   "disable --now atlas-v2-deployment-guardian.service")
     [[ "\${FAKE_GUARDIAN_DISABLE_FAIL:-0}" == "1" ]] && exit 97
@@ -850,6 +908,56 @@ printf '%s\n' "$1" > "\${FAKE_LOG_DIR}/restore-test.log"
     expect(readdirSync(fixture.coordinatorStage)).toEqual([]);
   });
 
+  it("rejects deployment admission while a standalone backup owns the real host exclusion", async () => {
+    const fixture = createDeployFixture();
+    installAdvisoryFlock(fixture.binDirectory);
+    mkdirSync(fixture.coordinatorStateRoot, { recursive: true });
+    writeFileSync(path.join(fixture.coordinatorStateRoot, "state.lock"), "");
+    const entered = path.join(fixture.logDirectory, "standalone-pg-dump-entered");
+    const release = path.join(fixture.logDirectory, "standalone-pg-dump-release");
+    const standalone = spawn(
+      "/bin/bash",
+      [fixture.backupTool, "--repository-root", fixture.remoteDirectory],
+      {
+        cwd: fixture.remoteDirectory,
+        env: {
+          ...process.env,
+          PATH: `${fixture.binDirectory}:${process.env.PATH}`,
+          FAKE_LOG_DIR: fixture.logDirectory,
+          FAKE_REMOTE_DIR: fixture.remoteDirectory,
+          FAKE_HAS_DB: "1",
+          FAKE_WEB_RUNNING: "0",
+          FAKE_WORKER_RUNNING: "0",
+          FAKE_BLOCK_PG_DUMP_MARKER: entered,
+          FAKE_RELEASE_PG_DUMP_MARKER: release,
+          BACKUP_ROOT: fixture.backupRoot,
+          ATLAS_GIT_COMMIT: releaseCommit,
+          ATLAS_BACKUP_TEST_MODE: "1",
+          ATLAS_BACKUP_STATE_ROOT: fixture.coordinatorStateRoot,
+          ATLAS_BACKUP_GLOBAL_LOCK: path.join(fixture.root, "coordinator.lock"),
+          ATLAS_BACKUP_NOW_EPOCH: "100",
+        },
+        stdio: "ignore",
+      },
+    );
+    await waitForFile(entered);
+    try {
+      const admission = deploy(fixture, {
+        FAKE_HAS_DB: "1",
+        FAKE_WEB_RUNNING: "0",
+        FAKE_WORKER_RUNNING: "0",
+      });
+      expect(admission.status).not.toBe(0);
+      expect(`${admission.stdout}\n${admission.stderr}`).toMatch(
+        /guardian|reconciliation lock|activation failed|ownership/i,
+      );
+      expect(existsSync(path.join(fixture.remoteDirectory, ".atlas-release"))).toBe(false);
+    } finally {
+      writeFileSync(release, "");
+      expect(await waitForChild(standalone)).toBe(0);
+    }
+  });
+
   it("never executes unauthenticated installed coordinator bytes to retire recovered state", () => {
     const fixture = createDeployFixture();
     writeFileSync(path.join(fixture.remoteDirectory, ".atlas-release"), `${releaseCommit}\n`);
@@ -1039,6 +1147,8 @@ type BackupFixture = {
   binDirectory: string;
   logDirectory: string;
   installedHelper: string;
+  stateRoot: string;
+  globalLock: string;
 };
 
 function createBackupFixture(): BackupFixture {
@@ -1048,9 +1158,13 @@ function createBackupFixture(): BackupFixture {
   const binDirectory = path.join(root, "bin");
   const logDirectory = path.join(root, "logs");
   const installedHelper = path.join(root, "usr/local/libexec/atlas-v2/backup.sh");
+  const stateRoot = path.join(root, "state");
+  const globalLock = path.join(root, "deployment.lock");
   mkdirSync(path.join(repository, "deploy"), { recursive: true });
   mkdirSync(binDirectory, { recursive: true });
   mkdirSync(logDirectory, { recursive: true });
+  mkdirSync(stateRoot, { recursive: true });
+  writeFileSync(path.join(stateRoot, "state.lock"), "");
   mkdirSync(path.dirname(installedHelper), { recursive: true });
   copyFileSync(path.join(sourceRoot, "deploy/backup.sh"), path.join(repository, "deploy/backup.sh"));
   chmodSync(path.join(repository, "deploy/backup.sh"), 0o755);
@@ -1077,6 +1191,12 @@ printf '%s\\n' "$pending_directory"`);
   fakeTool(binDirectory, "sha256sum", `
 [[ "\${FAKE_FAIL_STAGE:-}" == "checksum" ]] && exit 51
 /usr/bin/shasum -a 256 "$@"`);
+  installAdvisoryFlock(binDirectory);
+  fakeTool(binDirectory, "systemctl", `
+if [[ "$*" == "is-active --quiet atlas-v2-deployment-guardian.service" ]]; then
+  [[ "\${FAKE_GUARDIAN_ACTIVE:-0}" == "1" ]] && exit 0 || exit 3
+fi
+exit 1`);
   fakeTool(binDirectory, "docker", `
 printf '%s|%s\\n' "$PWD" "$*" >> "\${FAKE_LOG_DIR}/docker.log"
 last_argument=""
@@ -1108,16 +1228,21 @@ if [[ "\${FAKE_DIRECT_TOPOLOGY:-0}" == "1" ]]; then
     fi
     service_active=0
     case "\${service}" in
-      db) service_active=1 ;;
+      db) [[ "\${FAKE_DB_STATE:-running}" == "absent" ]] || service_active=1 ;;
       web)
-        [[ "\${FAKE_WEB_STATE:-running}" == "running" || "\${FAKE_WEB_STATE:-running}" == "restarting" ]] \
+        [[ "\${FAKE_WEB_STATE:-running}" == "running" || "\${FAKE_WEB_STATE:-running}" == "restarting" \
+          || "\${FAKE_WEB_STATE:-running}" == "paused" ]] \
           && service_active=1
         ;;
       worker)
-        [[ "\${FAKE_WORKER_STATE:-running}" == "running" || "\${FAKE_WORKER_STATE:-running}" == "restarting" ]] \
+        [[ "\${FAKE_WORKER_STATE:-running}" == "running" || "\${FAKE_WORKER_STATE:-running}" == "restarting" \
+          || "\${FAKE_WORKER_STATE:-running}" == "paused" ]] \
           && service_active=1
         ;;
-      migrator) [[ "\${FAKE_ACTIVE_MIGRATOR:-0}" == "1" ]] && service_active=1 ;;
+      migrator)
+        [[ "\${FAKE_ACTIVE_MIGRATOR:-0}" == "1" || "\${FAKE_MIGRATOR_STATE:-absent}" != "absent" ]] \
+          && service_active=1
+        ;;
     esac
     if [[ "\${service_active}" == "1" && ! -f "\${FAKE_LOG_DIR}/\${service}-stopped" ]]; then
       case "\${service}" in
@@ -1160,11 +1285,36 @@ if [[ "\${FAKE_DIRECT_TOPOLOGY:-0}" == "1" ]]; then
     printf '%s\\n' 'volume|atlas-db|/var/lib/postgresql/data'
     exit 0
   fi
+  if [[ "$*" == *".State.Running"* ]]; then
+    case "\${last_argument}" in
+      db-container) container_state="\${FAKE_DB_STATE:-running}" ;;
+      web-container) container_state="\${FAKE_WEB_STATE:-running}" ;;
+      worker-container) container_state="\${FAKE_WORKER_STATE:-running}" ;;
+      migrator-active) container_state="\${FAKE_MIGRATOR_STATE:-running}" ;;
+      *) exit 57 ;;
+    esac
+    case "\${container_state}" in
+      running) printf '%s\\n' 'true|false|false' ;;
+      restarting) printf '%s\\n' 'true|false|true' ;;
+      paused) printf '%s\\n' 'true|true|false' ;;
+      *) printf '%s\\n' 'false|false|false' ;;
+    esac
+    exit 0
+  fi
   if [[ "\${1:-}" == "exec" && "\${2:-}" == "db-container" && "$*" == *"atlas_initial_provenance"* ]]; then
+    if [[ "\${FAKE_PROVENANCE_REQUIRES_MIGRATOR_FENCED:-0}" == "1" \
+      && ! -f "\${FAKE_LOG_DIR}/migrator-stopped" ]]; then
+      printf '%s\\n' atlas-initial-unknown
+      exit 0
+    fi
     printf '%s\\n' atlas-initial-empty
     exit 0
   fi
   if [[ "\${1:-}" == "exec" && "\${2:-}" == "db-container" && "$*" == *"pg_dump"* ]]; then
+    if [[ -n "\${FAKE_BLOCK_PG_DUMP_MARKER:-}" ]]; then
+      : > "\${FAKE_BLOCK_PG_DUMP_MARKER}"
+      while [[ ! -f "\${FAKE_RELEASE_PG_DUMP_MARKER}" ]]; do /bin/sleep 0.02; done
+    fi
     [[ "\${FAKE_FAIL_STAGE:-}" == "pg_dump" ]] && exit 52
     printf '%s' dump
     exit 0
@@ -1244,7 +1394,16 @@ if [[ "\${1:-}" == "run" ]]; then
   exit 0
 fi
 exit 0`);
-  return { root, repository, backupRoot, binDirectory, logDirectory, installedHelper };
+  return {
+    root,
+    repository,
+    backupRoot,
+    binDirectory,
+    logDirectory,
+    installedHelper,
+    stateRoot,
+    globalLock,
+  };
 }
 
 function backup(
@@ -1262,13 +1421,141 @@ function backup(
       BACKUP_ROOT: fixture.backupRoot,
       ATLAS_GIT_COMMIT: releaseCommit,
       ATLAS_BACKUP_TEST_MODE: "1",
+      ATLAS_BACKUP_STATE_ROOT: fixture.stateRoot,
+      ATLAS_BACKUP_GLOBAL_LOCK: fixture.globalLock,
+      ATLAS_BACKUP_NOW_EPOCH: "100",
       FAKE_DIRECT_TOPOLOGY: "1",
       ...overrides,
     },
   });
 }
 
+async function waitForFile(filename: string): Promise<void> {
+  const deadline = Date.now() + 3_000;
+  while (Date.now() < deadline) {
+    if (existsSync(filename)) return;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  throw new Error(`Timed out waiting for ${filename}`);
+}
+
+async function waitForChild(child: ReturnType<typeof spawn>): Promise<number | null> {
+  if (child.exitCode !== null) return child.exitCode;
+  return await new Promise((resolve, reject) => {
+    child.once("error", reject);
+    child.once("exit", resolve);
+  });
+}
+
 describe("backup.sh behavior", () => {
+  it("holds the host-wide deployment exclusion for the complete standalone backup", async () => {
+    const fixture = createBackupFixture();
+    const entered = path.join(fixture.logDirectory, "pg-dump-entered");
+    const release = path.join(fixture.logDirectory, "pg-dump-release");
+    const child = spawn(
+      "/bin/bash",
+      [fixture.installedHelper, "--repository-root", fixture.repository],
+      {
+        cwd: fixture.repository,
+        env: {
+          ...process.env,
+          PATH: `${fixture.binDirectory}:${process.env.PATH}`,
+          FAKE_LOG_DIR: fixture.logDirectory,
+          BACKUP_ROOT: fixture.backupRoot,
+          ATLAS_GIT_COMMIT: releaseCommit,
+          ATLAS_BACKUP_TEST_MODE: "1",
+          ATLAS_BACKUP_STATE_ROOT: fixture.stateRoot,
+          ATLAS_BACKUP_GLOBAL_LOCK: fixture.globalLock,
+          ATLAS_BACKUP_NOW_EPOCH: "100",
+          FAKE_DIRECT_TOPOLOGY: "1",
+          FAKE_BLOCK_PG_DUMP_MARKER: entered,
+          FAKE_RELEASE_PG_DUMP_MARKER: release,
+        },
+        stdio: "ignore",
+      },
+    );
+    await waitForFile(entered);
+    const overlap = spawnSync(
+      "/bin/bash",
+      ["-c", 'exec 9>"$1"; flock -n -x 9', "_", fixture.globalLock],
+      {
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          PATH: `${fixture.binDirectory}:${process.env.PATH}`,
+        },
+      },
+    );
+    expect(overlap.status).not.toBe(0);
+    writeFileSync(release, "");
+    expect(await waitForChild(child)).toBe(0);
+  });
+
+  it.each([
+    ["managed backup action", "prepared", "backup"],
+    ["post-compatibility migration", "boundary", "migrate"],
+  ])("refuses a standalone backup during an active %s without Docker mutation", (_label, status, action) => {
+    const fixture = createBackupFixture();
+    writeFileSync(
+      path.join(fixture.stateRoot, "active.state"),
+      `token=10000000-0000-4000-8000-000000000001\nstatus=${status}\naction_name=${action}\n`,
+    );
+
+    const result = backup(fixture);
+
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toMatch(/deployment|ownership|state|guardian/i);
+    expect(existsSync(path.join(fixture.logDirectory, "docker.log"))).toBe(false);
+  });
+
+  it("does not accept managed-backup environment claims without matching durable state", () => {
+    const fixture = createBackupFixture();
+    const result = backup(fixture, {
+      ATLAS_DEPLOYMENT_TOKEN: "10000000-0000-4000-8000-000000000001",
+      ATLAS_BACKUP_ACTION_NAME: "backup",
+      ATLAS_BACKUP_ACTION_PHASE: "prepared",
+      ATLAS_BACKUP_ACTION_PID: "12345",
+      ATLAS_BACKUP_ACTION_UNIT: "none",
+      FAKE_GUARDIAN_ACTIVE: "1",
+    });
+
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toMatch(/state|ownership|managed/i);
+    expect(existsSync(path.join(fixture.logDirectory, "docker.log"))).toBe(false);
+  });
+
+  it.each([
+    ["database", { FAKE_DB_STATE: "paused" }],
+    ["web writer", { FAKE_WEB_STATE: "paused" }],
+    ["worker", { FAKE_WORKER_STATE: "paused" }],
+    ["migrator", { FAKE_MIGRATOR_STATE: "paused" }],
+  ])("fails closed before mutation when the exact-label %s is paused", (_label, overrides) => {
+    const fixture = createBackupFixture();
+    const result = backup(fixture, overrides);
+
+    expect(result.status).not.toBe(0);
+    const log = readFileSync(path.join(fixture.logDirectory, "docker.log"), "utf8");
+    expect(log).not.toMatch(/\|(?:stop|start) -- /);
+    expect(result.stdout).not.toContain("ATLAS_BACKUP_PATH=");
+  });
+
+  it("checks unreleased zero provenance only after the migrator is fenced", () => {
+    const fixture = createBackupFixture();
+    const result = backup(fixture, {
+      ATLAS_GIT_COMMIT: "unreleased-v2-foundation",
+      ATLAS_INITIAL_PROVENANCE_SHA256: "c".repeat(64),
+      FAKE_ACTIVE_MIGRATOR: "1",
+      FAKE_PROVENANCE_REQUIRES_MIGRATOR_FENCED: "1",
+    });
+
+    expect(result.status, result.stderr).toBe(0);
+    const log = readFileSync(path.join(fixture.logDirectory, "docker.log"), "utf8");
+    expect(log.indexOf("stop -- migrator-active")).toBeLessThan(
+      log.indexOf("atlas_initial_provenance"),
+    );
+    expect(log.indexOf("atlas_initial_provenance")).toBeLessThan(log.indexOf("pg_dump"));
+  });
+
   it("backs up an unreleased first-deploy database from installed operations while the live tree is empty", () => {
     const fixture = createBackupFixture();
     rmSync(fixture.repository, { recursive: true, force: true });
