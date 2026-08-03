@@ -329,6 +329,25 @@ describe("deterministic deployment source contract", () => {
     expect(restoreScript).not.toMatch(/name\s*=\s*'Rangeway'/);
   });
 
+  it("uses the same complete known relation set for zero-provenance backup and restore proof", () => {
+    const knownRelations = [
+      "organizations",
+      "users",
+      "actors",
+      "organization_memberships",
+      "audit_events",
+      "outbox_events",
+      "api_idempotency_keys",
+    ];
+
+    for (const relation of knownRelations) {
+      expect(backupScript, `backup relation ${relation}`).toContain(`'${relation}'`);
+      expect(restoreScript, `restore relation ${relation}`).toContain(`'${relation}'`);
+    }
+    expect(backupScript).toContain("to_regclass('public.schema_migrations') IS NULL");
+    expect(restoreScript).toContain("to_regclass('public.schema_migrations') IS NULL");
+  });
+
   it("reports restore success only after temporary resources are removed", () => {
     const finalCleanupPosition = restoreScript.lastIndexOf("cleanup_resources");
     const successPosition = restoreScript.indexOf("Restore test passed");

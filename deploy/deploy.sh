@@ -269,7 +269,56 @@ process.stdout.write(hash.digest("hex"));
 LOCAL_CANDIDATE_STAGE="$(mktemp -d "${TMPDIR:-/tmp}/atlas-v2-candidate.XXXXXX")"
 REMOTE_STAGE_PREPARED=0
 REMOTE_STAGE_OWNED=0
+REMOTE_BEGIN_ATTEMPTED=0
 DEPLOYMENT_FAILURE_HANDLER_ACTIVE=0
+inspect_remote_durable_ownership() {
+  ssh "${SSH_OPTS[@]}" "${REMOTE_TARGET}" bash -s -- \
+    "${COORDINATOR_STATE_FILE}" "${COORDINATOR_INSTALL_LOCK}" "${DEPLOYMENT_TOKEN}" \
+    "${ATLAS_COORDINATOR_TEST_MODE:-0}" <<'REMOTE_OWNERSHIP'
+set -euo pipefail
+state_file="$1"
+install_lock="$2"
+deployment_token="$3"
+test_mode="$4"
+[[ "${deployment_token}" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]
+state_root="$(dirname -- "${state_file}")"
+state_lock="${state_root}/state.lock"
+if [[ "${test_mode}" != "1" ]]; then
+  [[ "$(id -u)" -eq 0 ]]
+  [[ "${state_file}" == "/var/lib/atlas-v2-deployment/active.state" ]]
+  [[ "${install_lock}" == "/run/lock/atlas-v2-deployment-install.lock" ]]
+  [[ -d "${state_root}" && ! -L "${state_root}" ]]
+  [[ "$(stat -c '%U:%G:%a' "${state_root}")" == "root:root:700" ]]
+fi
+[[ -f "${install_lock}" && ! -L "${install_lock}" ]]
+exec 6>"${install_lock}"
+flock -x 6
+if [[ ! -e "${state_file}" ]]; then
+  printf 'OWNERSHIP=none\n'
+  exit 0
+fi
+[[ -f "${state_file}" && ! -L "${state_file}" ]]
+[[ -f "${state_lock}" && ! -L "${state_lock}" ]]
+if [[ "${test_mode}" != "1" ]]; then
+  [[ "$(stat -c '%U:%G:%a' "${state_file}")" == "root:root:600" ]]
+  [[ "$(stat -c '%U:%G:%a' "${state_lock}")" == "root:root:600" ]]
+fi
+exec 8>"${state_lock}"
+flock -s 8
+if [[ ! -e "${state_file}" ]]; then
+  printf 'OWNERSHIP=none\n'
+  exit 0
+fi
+[[ "$(grep -c '^token=' "${state_file}")" == "1" ]]
+recorded_token="$(sed -n 's/^token=//p' "${state_file}")"
+[[ "${recorded_token}" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]
+if [[ "${recorded_token}" == "${deployment_token}" ]]; then
+  printf 'OWNERSHIP=exact\n'
+else
+  printf 'OWNERSHIP=other\n'
+fi
+REMOTE_OWNERSHIP
+}
 cleanup_remote_candidate_stage() {
   ssh "${SSH_OPTS[@]}" "${REMOTE_TARGET}" bash -s -- \
     "${COORDINATOR_STAGE}" "${REMOTE_CANDIDATE_STAGE}" "${DEPLOYMENT_TOKEN}" \
@@ -297,9 +346,29 @@ REMOTE_STAGE_CLEANUP
 cleanup_local_candidate() {
   local cleanup_status="$?"
   local remote_cleanup_status=0
+  local ownership_output=""
   trap - EXIT INT TERM
   if [[ "${REMOTE_STAGE_PREPARED:-0}" -eq 1 && "${REMOTE_STAGE_OWNED:-0}" -eq 0 ]]; then
-    cleanup_remote_candidate_stage || remote_cleanup_status=1
+    if [[ "${REMOTE_BEGIN_ATTEMPTED:-0}" -eq 1 ]]; then
+      if ownership_output="$(inspect_remote_durable_ownership 2>/dev/null)"; then
+        case "${ownership_output}" in
+          OWNERSHIP=exact)
+            REMOTE_STAGE_OWNED=1
+            if [[ "${cleanup_status}" -ne 0 ]]; then
+              run_coordinator fail "${DEPLOYMENT_TOKEN}" >/dev/null 2>&1 || remote_cleanup_status=1
+            fi
+            ;;
+          OWNERSHIP=none|OWNERSHIP=other)
+            cleanup_remote_candidate_stage || remote_cleanup_status=1
+            ;;
+          *) remote_cleanup_status=1 ;;
+        esac
+      else
+        remote_cleanup_status=1
+      fi
+    else
+      cleanup_remote_candidate_stage || remote_cleanup_status=1
+    fi
   elif [[ "${cleanup_status}" -ne 0 && "${REMOTE_STAGE_OWNED:-0}" -eq 1 \
     && "${DEPLOYMENT_FAILURE_HANDLER_ACTIVE:-0}" -eq 0 ]]; then
     set +e
@@ -310,7 +379,7 @@ cleanup_local_candidate() {
     "${TMPDIR:-/tmp}"/atlas-v2-candidate.*) /bin/rm -rf -- "${LOCAL_CANDIDATE_STAGE}" ;;
   esac
   if [[ "${remote_cleanup_status}" -ne 0 ]]; then
-    echo "Atlas V2 deployment could not prove cleanup of its exact pre-acquisition stage." >&2
+    echo "Atlas V2 deployment could not prove exact durable ownership or safe stage cleanup." >&2
     [[ "${cleanup_status}" -ne 0 ]] || cleanup_status=1
   fi
   exit "${cleanup_status}"
@@ -358,6 +427,7 @@ REMOTE_STAGE
     "${REMOTE_TARGET}:${REMOTE_CANDIDATE_STAGE}/" \
     || fail "immutable deployment bundle staging failed."
 
+  REMOTE_BEGIN_ATTEMPTED=1
   ssh "${SSH_OPTS[@]}" "${REMOTE_TARGET}" bash -s -- \
     "${REMOTE_CANDIDATE_STAGE}" "${COORDINATOR_PATH}" "${GUARDIAN_UNIT_PATH}" \
     "${BACKUP_TOOL_PATH}" "${RESTORE_TOOL_PATH}" "${ROLE_INITIALIZER_PATH}" "${CADDY_CONFIG_PATH}" \

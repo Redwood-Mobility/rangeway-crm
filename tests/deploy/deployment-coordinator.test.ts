@@ -137,24 +137,35 @@ function fixture() {
 set -euo pipefail
 printf 'docker %s\n' "$*" >> "${log}"
 if [[ "$*" == *"compose ps --all --format"* ]]; then
+  [[ "\${FAKE_COMPOSE_PS_FAIL:-0}" == "1" ]] && exit 93
   printf '%b' "\${FAKE_WRITER_SNAPSHOT:-web|running|web-container\\nworker|running|worker-container\\n}"
   exit 0
 fi
 if [[ "$*" == *"label=com.docker.compose.project=atlas-v2"* && "$*" == *"label=com.docker.compose.service=web"* ]]; then
-  printf 'web-guarded|atlas-v2|web\n'
+  if [[ "\${FAKE_WEB_RUNNING:-1}" == "1" ]]; then
+    printf '%s|atlas-v2|web\n' "\${FAKE_WEB_CONTAINER:-web-guarded}"
+  fi
   exit 0
 fi
 if [[ "$*" == *"label=com.docker.compose.project=atlas-v2"* && "$*" == *"label=com.docker.compose.service=worker"* ]]; then
-  printf 'worker-guarded|atlas-v2|worker\n'
+  if [[ "\${FAKE_WORKER_RUNNING:-1}" == "1" ]]; then
+    printf '%s|atlas-v2|worker\n' "\${FAKE_WORKER_CONTAINER:-worker-guarded}"
+  fi
   exit 0
 fi
 if [[ "$*" == *"label=com.docker.compose.project=atlas-v2"* && "$*" == *"label=com.docker.compose.service=migrator"* ]]; then
-  if [[ ! -f "${root}/migrator-stopped" ]]; then
+  if [[ "\${FAKE_MIGRATOR_RUNNING:-0}" == "1" && ! -f "${root}/migrator-stopped" ]]; then
     if [[ "$*" == *".Label"* ]]; then
       printf 'migrator-one-off|atlas-v2|migrator\n'
     else
       printf 'migrator-one-off\n'
     fi
+  fi
+  exit 0
+fi
+if [[ "$*" == *"label=com.docker.compose.project=atlas-v2"* && "$*" == *"label=com.docker.compose.service=db"* ]]; then
+  if [[ "\${FAKE_DB_RUNNING:-1}" == "1" ]]; then
+    printf 'db-container|atlas-v2|db\n'
   fi
   exit 0
 fi
@@ -167,7 +178,11 @@ if [[ "$*" == *"compose --profile operations run --rm migrator"* \
   /bin/sleep "\${FAKE_GUARDED_ACTION_SECONDS}"
   exit 0
 fi
-if [[ "$*" == *"pg_stat_activity"* ]]; then printf '0\n'; exit 0; fi
+if [[ "$*" == *"pg_stat_activity"* ]]; then
+  [[ "\${FAKE_DB_SESSION_QUERY_FAIL:-0}" == "1" ]] && exit 94
+  printf '0\n'
+  exit 0
+fi
 if [[ "$*" == "compose ps -q worker" ]]; then printf 'worker-container\n'; exit 0; fi
 if [[ "$*" == *"State.Health.Status"* ]]; then printf 'healthy\n'; exit 0; fi
 if [[ "\${1:-}" == "start" && "\${FAKE_RESTART_FAIL:-0}" == "1" ]]; then exit 70; fi
@@ -187,11 +202,16 @@ set -euo pipefail
 printf 'systemctl %s\n' "$*" >> "${log}"
 case "$*" in
   "enable --now atlas-v2-deployment-guardian.service"|"restart atlas-v2-deployment-guardian.service")
+    [[ "\${FAKE_GUARDIAN_ENABLE_FAIL:-0}" == "1" && "$*" == enable* ]] && exit 95
+    [[ "\${FAKE_GUARDIAN_RESTART_FAIL:-0}" == "1" && "$*" == restart* ]] && exit 96
     : > "${root}/guardian-active"
-    "${coordinator}" guardian-once
+    [[ "\${FAKE_GUARDIAN_ACK_SKIP:-0}" == "1" ]] || "${coordinator}" guardian-once
     ;;
   "is-active --quiet atlas-v2-deployment-guardian.service") [[ -f "${root}/guardian-active" ]] ;;
-  "disable --now atlas-v2-deployment-guardian.service") /bin/unlink "${root}/guardian-active" 2>/dev/null || true ;;
+  "disable --now atlas-v2-deployment-guardian.service")
+    [[ "\${FAKE_GUARDIAN_DISABLE_FAIL:-0}" == "1" ]] && exit 97
+    [[ "\${FAKE_GUARDIAN_STAYS_ACTIVE:-0}" == "1" ]] || /bin/unlink "${root}/guardian-active" 2>/dev/null || true
+    ;;
   *) exit 0 ;;
 esac
 `);
@@ -306,12 +326,64 @@ describe("host-wide durable deployment coordinator", () => {
     expect(f.state()).toContain(`token=${tokenOne}`);
   });
 
+  it("snapshots the exact prior writer labels without a release-tree Compose file", () => {
+    const f = fixture();
+    const result = f.begin(tokenOne, {
+      FAKE_COMPOSE_PS_FAIL: "1",
+      FAKE_WEB_CONTAINER: "web-exact-prior",
+      FAKE_WORKER_RUNNING: "0",
+    });
+
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+    expect(f.state()).toContain("web_container=web-exact-prior");
+    expect(f.state()).toContain("worker_container=none");
+    expect(f.events()).toContain("label=com.docker.compose.project=atlas-v2");
+    expect(f.events()).toContain("label=com.docker.compose.service=web");
+    expect(f.events()).not.toContain("compose ps --all");
+  });
+
+  it("rejects an unexpected exact-project migrator before ownership is prepared", () => {
+    const f = fixture();
+    const result = f.begin(tokenOne, { FAKE_MIGRATOR_RUNNING: "1" });
+
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toMatch(/migrator/i);
+    expect(existsSync(path.join(f.stateRoot, "active.state"))).toBe(false);
+  });
+
+  it.each([
+    ["guardian activation", { FAKE_GUARDIAN_ENABLE_FAIL: "1" }],
+    ["guardian acknowledgment", { FAKE_GUARDIAN_ACK_SKIP: "1" }],
+  ])("never leaves prepared ownership after %s failure and remains retry-safe", (_failure, overrides) => {
+    const f = fixture();
+    const failed = f.begin(tokenOne, overrides);
+
+    expect(failed.status).not.toBe(0);
+    const activeState = path.join(f.stateRoot, "active.state");
+    const stateExists = existsSync(activeState);
+    const stageExists = existsSync(f.candidateStage);
+    expect(stateExists).toBe(stageExists);
+    if (stateExists) {
+      const state = readFileSync(activeState, "utf8");
+      expect(state).toContain(`token=${tokenOne}`);
+      expect(state).not.toContain("status=prepared");
+      expect(state).toMatch(/status=(activating|recovered)/);
+    }
+
+    if (stateExists) {
+      expect(f.run(["guardian-once"], { ATLAS_COORDINATOR_NOW_EPOCH: "111" }).status).toBe(0);
+      expect(f.run(["retire-recovered"]).status).toBe(0);
+    }
+    expect(f.begin(tokenTwo).status).toBe(0);
+  });
+
   it.each(["prepared", "quiesced"])(
     "restores the exact prior writer set when the owner disappears in %s",
     (status) => {
       const f = fixture();
       expect(f.begin(tokenOne, {
-        FAKE_WRITER_SNAPSHOT: "web|running|web-exact\nworker|exited|worker-exact\n",
+        FAKE_WEB_CONTAINER: "web-exact",
+        FAKE_WORKER_RUNNING: "0",
       }).status).toBe(0);
       if (status === "quiesced") {
         expect(f.run(["transition", tokenOne, "prepared", "quiesced"]).status).toBe(0);
@@ -334,14 +406,20 @@ describe("host-wide durable deployment coordinator", () => {
     expect(f.run(["transition", tokenOne, "syncing", "synced"]).status).toBe(0);
     expect(f.run(["candidate", tokenOne, release]).status).toBe(0);
     expect(f.run(["transition", tokenOne, "synced", "boundary"]).status).toBe(0);
-    expect(f.run(["guardian-once"], { ATLAS_COORDINATOR_NOW_EPOCH: "111" }).status).toBe(0);
+    expect(f.run(["guardian-once"], {
+      ATLAS_COORDINATOR_NOW_EPOCH: "111",
+      FAKE_MIGRATOR_RUNNING: "1",
+    }).status).toBe(0);
     expect(f.state()).toContain("status=failed_closed");
     expect(f.events()).toContain("label=com.docker.compose.project=atlas-v2");
     expect(f.events()).toContain("label=com.docker.compose.service=migrator");
     expect(f.events()).toMatch(/docker stop -- .*migrator-one-off/);
 
     const beforeBoot = f.events().match(/docker stop -- .*migrator-one-off/g)?.length ?? 0;
-    expect(f.run(["guardian-once"], { ATLAS_COORDINATOR_NOW_EPOCH: "200" }).status).toBe(0);
+    expect(f.run(["guardian-once"], {
+      ATLAS_COORDINATOR_NOW_EPOCH: "200",
+      FAKE_MIGRATOR_RUNNING: "1",
+    }).status).toBe(0);
     const afterBoot = f.events().match(/docker stop -- .*migrator-one-off/g)?.length ?? 0;
     expect(afterBoot).toBeGreaterThan(beforeBoot);
   });
@@ -351,11 +429,57 @@ describe("host-wide durable deployment coordinator", () => {
     expect(f.begin().status).toBe(0);
     writeFileSync(path.join(f.stateRoot, "active.state"), "not-valid-state\n", { mode: 0o600 });
 
-    const reconciliation = f.run(["guardian-once"]);
+    const reconciliation = f.run(["guardian-once"], { FAKE_MIGRATOR_RUNNING: "1" });
     expect(reconciliation.status).not.toBe(0);
     expect(f.events()).toMatch(/docker stop -- .*migrator-one-off/);
     expect(existsSync(f.remote)).toBe(true);
     expect(existsSync(f.backups)).toBe(true);
+  });
+
+  it("proves zero token sessions without Compose when no exact running database exists", () => {
+    const f = fixture();
+    expect(f.begin().status).toBe(0);
+    const activeState = path.join(f.stateRoot, "active.state");
+    const armed = f.state()
+      .replace("deadline_epoch=110", "deadline_epoch=99")
+      .replace("action_name=none", "action_name=backup")
+      .replace("action_pid=none", "action_pid=999999")
+      .replace("action_phase=none", "action_phase=prepared");
+    writeFileSync(activeState, armed, { mode: 0o600 });
+
+    const reconciliation = f.run(["guardian-once"], {
+      ATLAS_COORDINATOR_NOW_EPOCH: "111",
+      FAKE_DB_RUNNING: "0",
+      FAKE_COMPOSE_PS_FAIL: "1",
+    });
+
+    expect(reconciliation.status, reconciliation.stderr).toBe(0);
+    expect(f.state()).toContain("status=recovered");
+    expect(f.events()).toContain("label=com.docker.compose.service=db");
+    expect(f.events()).not.toContain("compose exec -T db");
+    expect(f.events()).not.toContain("pg_stat_activity");
+  });
+
+  it("fails recovery when direct exact-database session termination cannot be proved", () => {
+    const f = fixture();
+    expect(f.begin().status).toBe(0);
+    const activeState = path.join(f.stateRoot, "active.state");
+    const armed = f.state()
+      .replace("deadline_epoch=110", "deadline_epoch=99")
+      .replace("action_name=none", "action_name=backup")
+      .replace("action_pid=none", "action_pid=999999")
+      .replace("action_phase=none", "action_phase=prepared");
+    writeFileSync(activeState, armed, { mode: 0o600 });
+
+    const reconciliation = f.run(["guardian-once"], {
+      ATLAS_COORDINATOR_NOW_EPOCH: "111",
+      FAKE_DB_SESSION_QUERY_FAIL: "1",
+    });
+
+    expect(reconciliation.status).not.toBe(0);
+    expect(f.state()).toContain("status=recovery_failed");
+    expect(f.events()).toContain("docker exec db-container");
+    expect(f.events()).not.toContain("compose exec -T db");
   });
 
   it("atomically records a healthy release, completes the exact token, and retires its guardian state", () => {
@@ -382,17 +506,39 @@ describe("host-wide durable deployment coordinator", () => {
     expect(existsSync(f.candidateStage)).toBe(false);
   });
 
-  it("handles stale completed state and blocks stale recovery failures explicitly", () => {
+  it.each([
+    ["stop failure", { FAKE_GUARDIAN_DISABLE_FAIL: "1" }],
+    ["still-active guardian", { FAKE_GUARDIAN_STAYS_ACTIVE: "1" }],
+  ])("retains complete active ownership when guardian %s blocks archival", (_failure, overrides) => {
+    const f = fixture();
+    expect(f.begin().status).toBe(0);
+    expect(f.run(["transition", tokenOne, "prepared", "quiesced"]).status).toBe(0);
+    expect(f.run(["transition", tokenOne, "quiesced", "syncing"]).status).toBe(0);
+    expect(f.run(["guard", tokenOne, "syncing", "sync-release"]).status).toBe(0);
+    expect(f.run(["transition", tokenOne, "syncing", "synced"]).status).toBe(0);
+    expect(f.run(["candidate", tokenOne, release]).status).toBe(0);
+    expect(f.run(["transition", tokenOne, "synced", "boundary"]).status).toBe(0);
+
+    const result = f.run(["complete", tokenOne, release], overrides);
+
+    expect(result.status).not.toBe(0);
+    expect(f.state()).toContain("status=complete");
+    expect(existsSync(path.join(f.stateRoot, "history", `${tokenOne}.complete.state`))).toBe(false);
+    expect(f.begin(tokenTwo).status).not.toBe(0);
+  });
+
+  it("blocks unretired completed state and stale recovery failures explicitly", () => {
     const completed = fixture();
     expect(completed.begin().status).toBe(0);
     let state = completed.state().replace("status=prepared", "status=complete");
     writeFileSync(path.join(completed.stateRoot, "active.state"), state, { mode: 0o600 });
-    expect(completed.begin(tokenTwo).status).toBe(0);
-    expect(completed.state()).toContain(`token=${tokenTwo}`);
+    expect(completed.begin(tokenTwo).status).not.toBe(0);
+    expect(completed.state()).toContain(`token=${tokenOne}`);
 
     const failed = fixture();
     expect(failed.begin(tokenOne, {
-      FAKE_WRITER_SNAPSHOT: "web|running|web-exact\nworker|exited|worker-exact\n",
+      FAKE_WEB_CONTAINER: "web-exact",
+      FAKE_WORKER_RUNNING: "0",
     }).status).toBe(0);
     expect(failed.run(["guardian-once"], {
       ATLAS_COORDINATOR_NOW_EPOCH: "111",
@@ -536,8 +682,8 @@ describe("host-wide durable deployment coordinator", () => {
     expect(reconciliation.status, reconciliation.stderr).toBe(0);
     expect(f.state()).toContain("status=recovered");
     expect(f.state()).toContain("action_name=none");
-    expect(f.events()).toContain("docker start web-container");
-    expect(f.events()).toContain("docker start worker-container");
+    expect(f.events()).toContain("docker start web-guarded");
+    expect(f.events()).toContain("docker start worker-guarded");
     expect(f.events()).toContain(`application_name = 'atlas-deploy-${tokenOne}'`);
     await expectMutationStopped(mutationFile);
   });

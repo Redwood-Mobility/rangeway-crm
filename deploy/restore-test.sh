@@ -172,7 +172,7 @@ if [[ "${BACKUP_COMMIT}" == "${UNRELEASED_PROVENANCE}" ]]; then
     docker exec "${TEMP_DB_CONTAINER}" env "PGAPPNAME=${PGAPPNAME}" psql \
       --username=atlas_restore --dbname=atlas_restore --tuples-only --no-align \
       --variable=ON_ERROR_STOP=1 \
-      --command="SELECT CASE WHEN to_regclass('public.schema_migrations') IS NULL AND to_regclass('public.organizations') IS NULL THEN 'atlas-initial-empty' ELSE 'atlas-initial-unknown' END;"
+      --command="SELECT CASE WHEN to_regclass('public.schema_migrations') IS NULL AND NOT EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public' AND c.relname = ANY (ARRAY['organizations','users','actors','organization_memberships','audit_events','outbox_events','api_idempotency_keys'])) THEN 'atlas-initial-empty' ELSE 'atlas-initial-unknown' END;"
   )"
   [[ "${INITIAL_DATABASE_STATE}" == "atlas-initial-empty" ]] \
     || fail "restored unreleased backup was not the exact zero-migration state."

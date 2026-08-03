@@ -397,6 +397,19 @@ describe("Atlas V2 API contract", () => {
     expect(me.body).toEqual({ actor: { ...humanIdentity, requestId } });
   });
 
+  it("returns the documented plain-text media type when Google OAuth is not configured", async () => {
+    const response = await request(testApp({
+      authMode: "google",
+      googleClientId: undefined,
+      googleClientSecret: undefined,
+      googleRedirectUri: undefined,
+    })).get("/api/auth/google");
+
+    expect(response.status).toBe(503);
+    expect(response.headers["content-type"]).toBe("text/plain; charset=utf-8");
+    expect(response.text).toBe("Google SSO is not configured.");
+  });
+
   it("documents the public Google redirect and callback surfaces outside /api/v2", () => {
     expect(openApiContract).toMatch(/^  \/api\/auth\/google:$/m);
     expect(openApiContract).toMatch(/^  \/api\/auth\/google\/callback:$/m);

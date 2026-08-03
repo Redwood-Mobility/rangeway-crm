@@ -39,10 +39,10 @@ async function withTemporaryPostgreSql(
     await pool.query(`DO $roles$
       BEGIN
         IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'atlas_web') THEN
-          CREATE ROLE atlas_web NOLOGIN;
+          CREATE ROLE atlas_web LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS NOINHERIT;
         END IF;
         IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'atlas_worker') THEN
-          CREATE ROLE atlas_worker NOLOGIN;
+          CREATE ROLE atlas_worker LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS NOINHERIT;
         END IF;
       END
     $roles$`);
@@ -55,6 +55,29 @@ async function withTemporaryPostgreSql(
 }
 
 describe("least-privilege PostgreSQL roles", () => {
+  it("adds an exact database and schema privilege migration after immutable 0001-0005", async () => {
+    const migration = await source("db/migrations/0006_exact_database_schema_privileges.sql").catch(() => "");
+
+    expect(migration).toMatch(/REVOKE ALL PRIVILEGES ON DATABASE/);
+    expect(migration).toMatch(/GRANT CONNECT ON DATABASE/);
+    expect(migration).toMatch(/REVOKE ALL PRIVILEGES ON SCHEMA public FROM atlas_web, atlas_worker/);
+    expect(migration).toMatch(/GRANT USAGE ON SCHEMA public TO atlas_web, atlas_worker/);
+    expect(migration).toContain("REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA public FROM atlas_web");
+    expect(migration).toContain("REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA public FROM atlas_worker");
+  });
+
+  it("includes database, schema, role-attribute, and membership checks in the shared runtime contract", async () => {
+    const contract = await source("src/shared/database-permission-contract.ts");
+
+    expect(contract).toContain("has_database_privilege");
+    expect(contract).toContain("'CONNECT'");
+    expect(contract).toContain("'CREATE'");
+    expect(contract).toMatch(/'TEMP(?:ORARY)?'/);
+    expect(contract).toContain("has_schema_privilege");
+    expect(contract).toContain("pg_auth_members");
+    expect(contract).toContain("rolbypassrls");
+  });
+
   it("adds an exact runtime grant migration without changing prior migrations", async () => {
     const migration = await source("db/migrations/0005_exact_runtime_permissions.sql").catch(() => "");
 
@@ -150,6 +173,28 @@ describe("least-privilege PostgreSQL roles", () => {
         await expect(readiness("atlas_worker"), statement).resolves.toBe(false);
         await pool.query(statement.replace("GRANT", "REVOKE").replace(" TO ", " FROM "));
       }
+
+      const databaseName = (await pool.query<{ name: string }>("SELECT current_database() AS name"))
+        .rows[0]!.name;
+      for (const [role, statement, repair] of [
+        ["atlas_web", `REVOKE CONNECT ON DATABASE ${databaseName} FROM atlas_web`, `GRANT CONNECT ON DATABASE ${databaseName} TO atlas_web`],
+        ["atlas_worker", `REVOKE CONNECT ON DATABASE ${databaseName} FROM atlas_worker`, `GRANT CONNECT ON DATABASE ${databaseName} TO atlas_worker`],
+        ["atlas_web", `GRANT CREATE ON DATABASE ${databaseName} TO atlas_web`, `REVOKE CREATE ON DATABASE ${databaseName} FROM atlas_web`],
+        ["atlas_worker", `GRANT TEMPORARY ON DATABASE ${databaseName} TO atlas_worker`, `REVOKE TEMPORARY ON DATABASE ${databaseName} FROM atlas_worker`],
+        ["atlas_web", "REVOKE USAGE ON SCHEMA public FROM atlas_web", "GRANT USAGE ON SCHEMA public TO atlas_web"],
+        ["atlas_worker", "GRANT CREATE ON SCHEMA public TO atlas_worker", "REVOKE CREATE ON SCHEMA public FROM atlas_worker"],
+      ] as const) {
+        await pool.query(statement);
+        await expect(readiness(role), statement).resolves.toBe(false);
+        await pool.query(repair);
+      }
+
+      await pool.query("GRANT atlas_worker TO atlas_web");
+      await expect(readiness("atlas_web"), "runtime role membership").resolves.toBe(false);
+      await pool.query("REVOKE atlas_worker FROM atlas_web");
+      await pool.query("ALTER ROLE atlas_web CREATEDB");
+      await expect(readiness("atlas_web"), "runtime role CREATEDB attribute").resolves.toBe(false);
+      await pool.query("ALTER ROLE atlas_web NOCREATEDB");
       await expect(readiness("atlas_web")).resolves.toBe(true);
       await expect(readiness("atlas_worker")).resolves.toBe(true);
     });
@@ -190,6 +235,10 @@ describe("least-privilege PostgreSQL roles", () => {
     expect(bootstrap).toContain("ALTER FUNCTION public.atlas_reject_audit_mutation() OWNER TO atlas_migrator");
     expect(bootstrap).toContain("CREATE EXTENSION IF NOT EXISTS citext");
     expect(bootstrap).toContain("CREATE EXTENSION IF NOT EXISTS pgcrypto");
+    expect(bootstrap).toMatch(/REVOKE ALL PRIVILEGES ON DATABASE/);
+    expect(bootstrap).toMatch(/REVOKE ALL PRIVILEGES ON SCHEMA public FROM atlas_web, atlas_worker/);
+    expect(bootstrap).toContain("NOBYPASSRLS");
+    expect(bootstrap).toContain("pg_auth_members");
     expect(bootstrap).toMatch(/citext[\s\S]*pgcrypto[\s\S]*bootstrap-owned|bootstrap-owned[\s\S]*citext[\s\S]*pgcrypto/i);
     for (const variable of [
       "POSTGRES_BOOTSTRAP_PASSWORD",
@@ -227,6 +276,11 @@ describe("least-privilege PostgreSQL roles", () => {
     const pool = createPool(temporaryDatabase.databaseUrl);
     try {
       await runMigrations(pool);
+      const databaseName = databaseUrl.pathname.slice(1);
+      await pool.query(`GRANT CREATE, TEMPORARY ON DATABASE ${databaseName} TO atlas_web, atlas_worker`);
+      await pool.query("GRANT CREATE ON SCHEMA public TO atlas_web, atlas_worker");
+      await pool.query("GRANT atlas_worker TO atlas_web");
+      await pool.query("ALTER ROLE atlas_web CREATEDB BYPASSRLS INHERIT");
       const initialized = spawnSync("bash", ["deploy/postgres/init-roles.sh"], {
         cwd: new URL("../..", import.meta.url),
         encoding: "utf8",
@@ -278,6 +332,20 @@ describe("least-privilege PostgreSQL roles", () => {
         { extname: "citext", owner: "atlas" },
         { extname: "pgcrypto", owner: "atlas" },
       ]);
+
+      for (const role of ["atlas_web", "atlas_worker"] as const) {
+        const client = await pool.connect();
+        try {
+          await client.query(`SET ROLE ${role}`);
+          const permission = await client.query<{ permissions_ok: boolean }>(
+            buildPermissionContractSql(role),
+          );
+          expect(permission.rows[0]?.permissions_ok, role).toBe(true);
+        } finally {
+          await client.query("RESET ROLE").catch(() => undefined);
+          client.release();
+        }
+      }
 
       const client = await pool.connect();
       try {

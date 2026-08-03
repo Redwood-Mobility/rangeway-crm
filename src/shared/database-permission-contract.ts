@@ -124,6 +124,36 @@ export function buildPermissionContractSql(role: AtlasRuntimeRole): string {
       VALUES
         ${forbiddenRows(role)}
     ),
+    database_privilege_check AS (
+      SELECT has_database_privilege(${sqlLiteral(role)}, current_database(), 'CONNECT')
+        AND NOT has_database_privilege(${sqlLiteral(role)}, current_database(), 'CREATE')
+        AND NOT has_database_privilege(${sqlLiteral(role)}, current_database(), 'TEMPORARY') AS ok
+    ),
+    schema_check AS (
+      SELECT has_schema_privilege(${sqlLiteral(role)}, 'public', 'USAGE')
+        AND NOT has_schema_privilege(${sqlLiteral(role)}, 'public', 'CREATE') AS ok
+    ),
+    role_attribute_check AS (
+      SELECT COALESCE(bool_and(
+        rolcanlogin
+        AND NOT rolsuper
+        AND NOT rolinherit
+        AND NOT rolcreaterole
+        AND NOT rolcreatedb
+        AND NOT rolreplication
+        AND NOT rolbypassrls
+      ), false) AS ok
+      FROM pg_roles
+      WHERE rolname = ${sqlLiteral(role)}
+    ),
+    membership_check AS (
+      SELECT NOT EXISTS (
+        SELECT 1
+        FROM pg_auth_members membership
+        JOIN pg_roles member_role ON member_role.oid = membership.member
+        WHERE member_role.rolname = ${sqlLiteral(role)}
+      ) AS ok
+    ),
     relation_checks AS (
       SELECT bool_and(
         has_table_privilege(${sqlLiteral(role)}, format('public.%I', table_name), 'SELECT') = allow_select
@@ -161,7 +191,11 @@ export function buildPermissionContractSql(role: AtlasRuntimeRole): string {
     SELECT
       current_user = ${sqlLiteral(role)} AS role_ok,
       current_database() = 'atlas' AS database_ok,
-      COALESCE((SELECT ok FROM relation_checks), false)
+      COALESCE((SELECT ok FROM database_privilege_check), false)
+        AND COALESCE((SELECT ok FROM schema_check), false)
+        AND COALESCE((SELECT ok FROM role_attribute_check), false)
+        AND COALESCE((SELECT ok FROM membership_check), false)
+        AND COALESCE((SELECT ok FROM relation_checks), false)
         AND COALESCE((SELECT ok FROM column_checks), false)
         AND COALESCE((SELECT ok FROM forbidden_column_checks), false) AS permissions_ok`;
 }

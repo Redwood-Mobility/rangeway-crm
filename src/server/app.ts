@@ -408,7 +408,7 @@ app.get("/api/me", (req, res) => {
 
 app.get("/api/auth/google", (_req, res) => {
   if (!config.googleClientId || !config.googleClientSecret || !config.googleRedirectUri) {
-    res.status(503).send("Google SSO is not configured.");
+    res.status(503).type("text/plain").send("Google SSO is not configured.");
     return;
   }
 

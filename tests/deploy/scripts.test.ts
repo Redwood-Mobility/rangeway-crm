@@ -202,7 +202,28 @@ fi`);
   fakeTool(binDirectory, "docker", `
 printf '%s\\n' "$*" >> "\${FAKE_LOG_DIR}/docker.log"
 if [[ "$*" == *"compose ps --all --format"* ]]; then
+  [[ "\${FAKE_COMPOSE_PS_FAIL:-0}" == "1" ]] && exit 93
   printf '%b' "\${FAKE_WRITER_SNAPSHOT:-web|running|web-container\\nworker|running|worker-container\\n}"
+  exit 0
+fi
+if [[ "$*" == *"label=com.docker.compose.project=atlas-v2"* && "$*" == *"label=com.docker.compose.service=web"* ]]; then
+  [[ "\${FAKE_WEB_RUNNING:-1}" == "1" ]] && printf '%s|atlas-v2|web\n' "\${FAKE_WEB_CONTAINER:-web-container}"
+  exit 0
+fi
+if [[ "$*" == *"label=com.docker.compose.project=atlas-v2"* && "$*" == *"label=com.docker.compose.service=worker"* ]]; then
+  [[ "\${FAKE_WORKER_RUNNING:-1}" == "1" ]] && printf '%s|atlas-v2|worker\n' "\${FAKE_WORKER_CONTAINER:-worker-container}"
+  exit 0
+fi
+if [[ "$*" == *"label=com.docker.compose.project=atlas-v2"* && "$*" == *"label=com.docker.compose.service=migrator"* ]]; then
+  if [[ "\${FAKE_MIGRATOR_RUNNING:-0}" == "1" && ! -f "\${FAKE_LOG_DIR}/migrator-stopped" ]]; then
+    printf 'migrator-container|atlas-v2|migrator\n'
+  fi
+  exit 0
+fi
+if [[ "$*" == *"label=com.docker.compose.project=atlas-v2"* && "$*" == *"label=com.docker.compose.service=db"* ]]; then
+  if [[ "\${FAKE_HAS_DB:-0}" == "1" || -f "\${FAKE_LOG_DIR}/atlas-db-exists" ]]; then
+    printf 'db-container|atlas-v2|db\n'
+  fi
   exit 0
 fi
 if [[ "$*" == "volume inspect atlas-db" ]]; then
@@ -217,7 +238,11 @@ if [[ "$*" == "compose up -d db" ]]; then
   [[ "\${FAKE_BUILD_DB_FAIL_AFTER_VOLUME:-0}" == "1" ]] && exit 61
   exit 0
 fi
-if [[ "$*" == *"pg_stat_activity"* ]]; then printf '0\\n'; exit 0; fi
+if [[ "$*" == *"pg_stat_activity"* ]]; then
+  [[ "\${FAKE_DB_SESSION_QUERY_FAIL:-0}" == "1" ]] && exit 94
+  printf '0\\n'
+  exit 0
+fi
 if [[ "$*" == *"--profile operations run"* && "$*" == *"migrator"* \
   && "$*" != *"verify-runtime-permissions"* && "\${FAKE_MIGRATION_FAIL:-0}" == "1" ]]; then exit 59; fi
 if [[ "$*" == *"compose exec -T"* && "$*" == *"PGAPPNAME=atlas-deploy-"* && "$*" == *"db bash -s --"* && "\${FAKE_ROLE_ROTATION_FAIL:-0}" == "1" ]]; then exit 60; fi
@@ -227,13 +252,16 @@ exit 0`);
 printf '%s\\n' "$*" >> "\${FAKE_LOG_DIR}/systemctl.log"
 case "$*" in
   "enable --now atlas-v2-deployment-guardian.service"|"restart atlas-v2-deployment-guardian.service")
+    [[ "\${FAKE_GUARDIAN_ENABLE_FAIL:-0}" == "1" && "$*" == enable* ]] && exit 95
+    [[ "\${FAKE_GUARDIAN_RESTART_FAIL:-0}" == "1" && "$*" == restart* ]] && exit 96
     : > "\${FAKE_LOG_DIR}/guardian-active"
-    '${coordinator}' guardian-once
+    [[ "\${FAKE_GUARDIAN_ACK_SKIP:-0}" == "1" ]] || '${coordinator}' guardian-once
     ;;
   "is-active --quiet atlas-v2-deployment-guardian.service")
     [[ -f "\${FAKE_LOG_DIR}/guardian-active" ]]
     ;;
   "disable --now atlas-v2-deployment-guardian.service")
+    [[ "\${FAKE_GUARDIAN_DISABLE_FAIL:-0}" == "1" ]] && exit 97
     /bin/unlink "\${FAKE_LOG_DIR}/guardian-active" 2>/dev/null || true
     ;;
   "daemon-reload") exit 0 ;;
@@ -269,6 +297,10 @@ if [[ "\${1:-}" == "bash" && "\${2:-}" == "-s" && "\${3:-}" == "--" ]]; then
   /bin/bash "\${script_file}" "$@"
   status=$?
   set -e
+  if [[ "\${FAKE_SSH_LOSE_BEGIN_RESPONSE:-0}" == "1" && "\${status}" -eq 0 ]] \
+    && grep -Fq 'exec "\${coordinator}" begin' "\${script_file}"; then
+    status=255
+  fi
   /bin/unlink "\${script_file}"
   exit "\${status}"
 fi
@@ -668,6 +700,29 @@ describe("deploy.sh behavior", () => {
     expect(readdirSync(fixture.coordinatorStage)).toEqual([]);
   });
 
+  it("inspects exact durable ownership when SSH loses the successful begin response", () => {
+    const fixture = createDeployFixture();
+    const interrupted = deploy(fixture, { FAKE_SSH_LOSE_BEGIN_RESPONSE: "1" });
+
+    expect(interrupted.status).not.toBe(0);
+    const activeState = path.join(fixture.coordinatorStateRoot, "active.state");
+    const stateExists = existsSync(activeState);
+    const stagedTokens = existsSync(fixture.coordinatorStage)
+      ? readdirSync(fixture.coordinatorStage)
+      : [];
+    expect(stateExists).toBe(stagedTokens.length === 1);
+    if (stateExists) {
+      const state = readFileSync(activeState, "utf8");
+      const candidateStage = /^candidate_stage=(.+)$/m.exec(state)?.[1];
+      expect(candidateStage).toBeTruthy();
+      expect(existsSync(candidateStage!)).toBe(true);
+      expect(state).not.toContain("status=prepared");
+    }
+
+    const retried = deploy(fixture);
+    expect(retried.status, `${retried.stdout}\n${retried.stderr}`).toBe(0);
+  });
+
   it.each(["archive", "transfer"])(
     "removes the local secret-bearing candidate directory after a pre-acquisition %s failure",
     (failure) => {
@@ -747,14 +802,18 @@ printf '%s\n' "$1" > "\${FAKE_LOG_DIR}/restore-test.log"
 
     const failed = deploy(fixture, {
       FAKE_BUILD_DB_FAIL_AFTER_VOLUME: "1",
-      FAKE_WRITER_SNAPSHOT: "",
+      FAKE_WEB_RUNNING: "0",
+      FAKE_WORKER_RUNNING: "0",
     });
     expect(failed.status).not.toBe(0);
     expect(readFileSync(path.join(fixture.coordinatorStateRoot, "active.state"), "utf8"))
       .toContain("status=recovered");
     expect(existsSync(path.join(fixture.remoteDirectory, ".atlas-release"))).toBe(false);
 
-    const retried = deploy(fixture, { FAKE_WRITER_SNAPSHOT: "" });
+    const retried = deploy(fixture, {
+      FAKE_WEB_RUNNING: "0",
+      FAKE_WORKER_RUNNING: "0",
+    });
     expect(retried.status, `${retried.stdout}\n${retried.stderr}`).toBe(0);
     expect(readFileSync(path.join(fixture.logDirectory, "backup-provenance.log"), "utf8").trim())
       .toBe("unreleased-v2-foundation");
@@ -843,7 +902,7 @@ printf '%s\n' "$1" > "\${FAKE_LOG_DIR}/restore-test.log"
 
     expect(result.status).not.toBe(0);
     expect(`${result.stdout}${result.stderr}`).toMatch(/canonical path/i);
-    expect(readFileSync(path.join(fixture.logDirectory, "ssh.log"), "utf8").trim().split("\n")).toHaveLength(4);
+    expect(readFileSync(path.join(fixture.logDirectory, "ssh.log"), "utf8").trim().split("\n")).toHaveLength(5);
     expect(existsSync(path.join(fixture.logDirectory, "docker.log"))).toBe(false);
     expect(readFileSync(path.join(fixture.logDirectory, "rsync-counter"), "utf8").trim()).toBe("1");
     expect(readdirSync(fixture.coordinatorStage)).toEqual([]);

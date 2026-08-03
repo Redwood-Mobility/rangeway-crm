@@ -286,7 +286,7 @@ read_state() {
 
   valid_token "${token}" || return 1
   case "${status}" in
-    prepared|quiesced|syncing|synced|boundary|recovered|recovery_failed|failed_closed|complete) ;;
+    activating|prepared|quiesced|syncing|synced|boundary|recovered|recovery_failed|failed_closed|complete) ;;
     *) return 1 ;;
   esac
   valid_path "${remote_dir}" || return 1
@@ -425,29 +425,32 @@ restore_exact_writers() {
 }
 
 snapshot_writers() {
-  local snapshot line service state container extra
+  local snapshot line service candidate container project_label service_label extra
   web_container="none"
   worker_container="none"
-  snapshot="$(cd -- "${remote_dir}" && docker compose ps --all --format '{{.Service}}|{{.State}}|{{.ID}}')"
-  while IFS= read -r line; do
-    [[ -n "${line}" ]] || continue
-    IFS='|' read -r service state container extra <<< "${line}"
-    [[ -n "${service}" && -n "${state}" && -n "${container}" && -z "${extra:-}" \
-      && "${line}" == *"|"*"|"* ]] \
-      || die "writer snapshot was malformed."
-    [[ "${container}" =~ ^[A-Za-z0-9_.-]+$ ]] || die "writer snapshot contained an invalid container ID."
-    case "${state}" in
-      running|restarting)
-        case "${service}" in
-          web) [[ "${web_container}" == "none" ]] || die "writer snapshot contained duplicate web services."; web_container="${container}" ;;
-          worker) [[ "${worker_container}" == "none" ]] || die "writer snapshot contained duplicate worker services."; worker_container="${container}" ;;
-          *) ;;
-        esac
-        ;;
-      created|exited|paused|dead|removing) ;;
-      *) die "writer snapshot contained an unsupported state." ;;
+  for service in web worker migrator; do
+    snapshot="$(docker ps \
+      --filter "label=com.docker.compose.project=${COMPOSE_PROJECT}" \
+      --filter "label=com.docker.compose.service=${service}" \
+      --format '{{.ID}}|{{.Label "com.docker.compose.project"}}|{{.Label "com.docker.compose.service"}}')"
+    container="none"
+    while IFS= read -r line; do
+      [[ -n "${line}" ]] || continue
+      IFS='|' read -r candidate project_label service_label extra <<< "${line}"
+      [[ "${candidate}" =~ ^[A-Za-z0-9_.-]+$ ]] \
+        || die "writer snapshot contained an invalid container ID."
+      [[ "${project_label}" == "${COMPOSE_PROJECT}" && "${service_label}" == "${service}" \
+        && -z "${extra:-}" && "${line}" == *"|"*"|"* ]] \
+        || die "writer snapshot label identity was malformed."
+      [[ "${container}" == "none" ]] || die "writer snapshot contained duplicate ${service} services."
+      container="${candidate}"
+    done <<< "${snapshot}"
+    case "${service}" in
+      web) web_container="${container}" ;;
+      worker) worker_container="${container}" ;;
+      migrator) [[ "${container}" == "none" ]] || die "an unexpected Atlas migrator is running before deployment ownership." ;;
     esac
-  done <<< "${snapshot}"
+  done
 }
 
 read_release_commit() {
@@ -570,6 +573,34 @@ archive_stale_state() {
   durable_move "${ACTIVE_STATE}" "${HISTORY_ROOT}/${token}.${suffix}.state"
 }
 
+abandon_unacknowledged_begin() {
+  local requested_token="$1"
+  prepare_state_root
+  exec 8>"${STATE_LOCK}"
+  flock -x 8
+  read_state || { flock -u 8; return 1; }
+  [[ "${token}" == "${requested_token}" && "${status}" == "activating" \
+    && "${action_name}" == "none" ]] || { flock -u 8; return 1; }
+  deadline_epoch=0
+  write_state
+  flock -u 8
+
+  systemctl disable --now "${UNIT_NAME}" >/dev/null 2>&1 || return 1
+  if systemctl is-active --quiet "${UNIT_NAME}"; then
+    return 1
+  fi
+
+  exec 8>"${STATE_LOCK}"
+  flock -x 8
+  read_state || { flock -u 8; return 1; }
+  [[ "${token}" == "${requested_token}" && "${status}" == "activating" \
+    && "${action_name}" == "none" ]] || { flock -u 8; return 1; }
+  release_marker_matches_previous "${remote_dir}" || { flock -u 8; return 1; }
+  cleanup_candidate_stage || { flock -u 8; return 1; }
+  durable_move "${ACTIVE_STATE}" "${HISTORY_ROOT}/${token}.begin-failed.state"
+  flock -u 8
+}
+
 begin_deployment() {
   local requested_token="$1"
   local requested_remote="$2"
@@ -632,7 +663,7 @@ begin_deployment() {
       die "durable state is malformed; operator resolution is required."
     fi
     case "${status}" in
-      complete) archive_stale_state "stale-${status}" ;;
+      complete) die "completed ownership remains active until guardian shutdown and archival finish." ;;
       recovered) die "prior recovered ownership must be durably retired before a new deployment." ;;
       recovery_failed|failed_closed) die "prior recovery requires operator resolution before a new deployment." ;;
       *) die "a deployment already active under token ${token}." ;;
@@ -640,7 +671,7 @@ begin_deployment() {
   fi
 
   token="${requested_token}"
-  status="prepared"
+  status="activating"
   remote_dir="${requested_remote}"
   backup_root="${requested_backup}"
   previous_commit="none"
@@ -673,15 +704,23 @@ begin_deployment() {
   write_config
   flock -u 8
 
-  systemctl enable --now "${UNIT_NAME}" >/dev/null
-  systemctl restart "${UNIT_NAME}" >/dev/null
-  systemctl is-active --quiet "${UNIT_NAME}" || die "deployment guardian is not active."
+  if ! systemctl enable --now "${UNIT_NAME}" >/dev/null \
+    || ! systemctl restart "${UNIT_NAME}" >/dev/null \
+    || ! systemctl is-active --quiet "${UNIT_NAME}"; then
+    abandon_unacknowledged_begin "${requested_token}" || true
+    die "deployment guardian activation failed before ownership preparation."
+  fi
 
   local attempts=0
   while [[ "${attempts}" -lt 50 ]]; do
     exec 8>"${STATE_LOCK}"
-    flock -s 8
-    if read_state && [[ "${token}" == "${requested_token}" && "${guardian_ack_token}" == "${requested_token}" ]]; then
+    flock -x 8
+    if read_state && [[ "${token}" == "${requested_token}" && "${status}" == "activating" \
+      && "${guardian_ack_token}" == "${requested_token}" ]]; then
+      status="prepared"
+      current_now="$(now_epoch)"
+      deadline_epoch="$((current_now + lease_seconds))"
+      write_state
       printf 'TOKEN=%s\n' "${token}"
       printf 'REMOTE_DIR=%s\n' "${remote_dir}"
       printf 'REMOTE_BACKUP_ROOT=%s\n' "${backup_root}"
@@ -695,6 +734,7 @@ begin_deployment() {
     attempts=$((attempts + 1))
     sleep 0.1
   done
+  abandon_unacknowledged_begin "${requested_token}" || true
   die "deployment guardian did not acknowledge the exact ownership token."
 }
 
@@ -768,6 +808,26 @@ assert_deployment() {
     || die "expected deployment state ${expected_status}, found ${status}."
   current_now="$(now_epoch)"
   [[ "${deadline_epoch}" -gt "${current_now}" ]] || die "deployment ownership lease expired."
+  flock -u 8
+}
+
+inspect_ownership() {
+  local requested_token="$1"
+  valid_token "${requested_token}" || die "deployment token is invalid."
+  prepare_state_root
+  exec 8>"${STATE_LOCK}"
+  flock -s 8
+  if [[ ! -e "${ACTIVE_STATE}" ]]; then
+    printf 'OWNERSHIP=none\n'
+    flock -u 8
+    return 0
+  fi
+  read_state || die "active deployment state is malformed."
+  if [[ "${token}" == "${requested_token}" ]]; then
+    printf 'OWNERSHIP=exact\n'
+  else
+    printf 'OWNERSHIP=other\n'
+  fi
   flock -u 8
 }
 
@@ -1081,9 +1141,8 @@ terminate_recorded_action() {
 
 cancel_token_actions() {
   local requested_token="$1"
-  local snapshot container extra remaining sessions
+  local snapshot line container project_label service_label extra remaining sessions db_container
   local -a containers=()
-  cd -- "${remote_dir}"
   snapshot="$(docker ps -aq \
     --filter "label=com.docker.compose.project=${COMPOSE_PROJECT}" \
     --filter "label=atlas.deployment-token=${requested_token}" \
@@ -1118,7 +1177,23 @@ cancel_token_actions() {
     --format '{{.ID}}')"
   [[ -z "${remaining}" ]] || return 1
 
-  if ! sessions="$(docker compose exec -T db psql --username=atlas --dbname=atlas \
+  snapshot="$(docker ps -q \
+    --filter "label=com.docker.compose.project=${COMPOSE_PROJECT}" \
+    --filter "label=com.docker.compose.service=db" \
+    --format '{{.ID}}|{{.Label "com.docker.compose.project"}}|{{.Label "com.docker.compose.service"}}')"
+  db_container="none"
+  while IFS= read -r line; do
+    [[ -n "${line}" ]] || continue
+    IFS='|' read -r container project_label service_label extra <<< "${line}"
+    [[ "${container}" =~ ^[A-Za-z0-9_.-]+$ \
+      && "${project_label}" == "${COMPOSE_PROJECT}" && "${service_label}" == "db" \
+      && -z "${extra:-}" && "${line}" == *"|"*"|"* ]] || return 1
+    [[ "${db_container}" == "none" ]] || return 1
+    db_container="${container}"
+  done <<< "${snapshot}"
+  [[ "${db_container}" != "none" ]] || return 0
+
+  if ! sessions="$(docker exec "${db_container}" psql --username=atlas --dbname=atlas \
     --variable=ON_ERROR_STOP=1 --tuples-only --no-align \
     --command="SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE pid <> pg_backend_pid() AND application_name = 'atlas-deploy-${requested_token}'; SELECT count(*) FROM pg_stat_activity WHERE application_name = 'atlas-deploy-${requested_token}';" \
     2>/dev/null | tail -n 1)"; then
@@ -1442,7 +1517,7 @@ reconcile_once() {
   fi
 
   case "${status}" in
-    prepared|quiesced|syncing|synced|recovery_failed)
+    activating|prepared|quiesced|syncing|synced|recovery_failed)
       if restore_prior_release_tree && restore_exact_writers; then
         status="recovered"
         deadline_epoch=0
@@ -1531,6 +1606,7 @@ complete_deployment() {
   local current_now
   valid_commit "${requested_commit}" || die "release commit is invalid."
   [[ "${requested_commit}" != "none" ]] || die "release commit is required."
+  acquire_install_lock
   prepare_state_root
   exec 8>"${STATE_LOCK}"
   flock -x 8
@@ -1554,14 +1630,26 @@ complete_deployment() {
 
   release_commit="${requested_commit}"
   status="complete"
+  deadline_epoch=0
   write_state
-  durable_move "${ACTIVE_STATE}" "${HISTORY_ROOT}/${token}.complete.state"
   flock -u 8
   systemctl disable --now "${UNIT_NAME}" >/dev/null
+  if systemctl is-active --quiet "${UNIT_NAME}"; then
+    die "completed deployment guardian could not be stopped."
+  fi
+
+  exec 8>"${STATE_LOCK}"
+  flock -x 8
+  read_state || die "completed deployment state is missing or malformed."
+  [[ "${token}" == "${requested_token}" && "${status}" == "complete" \
+    && "${action_name}" == "none" ]] \
+    || die "completed deployment ownership changed before archival."
+  durable_move "${ACTIVE_STATE}" "${HISTORY_ROOT}/${token}.complete.state"
+  flock -u 8
 }
 
 usage() {
-  echo "usage: $0 begin|transition|renew|assert|annotate|candidate|guard|fail|complete|guardian|guardian-once|retire-recovered ..." >&2
+  echo "usage: $0 begin|transition|renew|assert|ownership|annotate|candidate|guard|fail|complete|guardian|guardian-once|retire-recovered ..." >&2
   exit 64
 }
 
@@ -1571,6 +1659,7 @@ case "${command}" in
   transition) [[ "$#" -eq 4 ]] || usage; mutate_state "$2" transition "$3" "$4" ;;
   renew) [[ "$#" -eq 3 ]] || usage; mutate_state "$2" renew "$3" ;;
   assert) [[ "$#" -eq 3 ]] || usage; assert_deployment "$2" "$3" ;;
+  ownership) [[ "$#" -eq 2 ]] || usage; inspect_ownership "$2" ;;
   annotate) [[ "$#" -eq 4 ]] || usage; mutate_state "$2" annotate "$3" "$4" ;;
   candidate) [[ "$#" -eq 3 ]] || usage; mutate_state "$2" candidate "$3" ;;
   guard) [[ "$#" -eq 4 ]] || usage; guard_deployment_action "$2" "$3" "$4" ;;

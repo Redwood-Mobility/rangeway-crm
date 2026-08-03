@@ -47,20 +47,36 @@ BEGIN;
 DO $roles$
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'atlas_migrator') THEN
-    CREATE ROLE atlas_migrator LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
+    CREATE ROLE atlas_migrator LOGIN NOSUPERUSER NOINHERIT NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
   END IF;
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'atlas_web') THEN
-    CREATE ROLE atlas_web LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
+    CREATE ROLE atlas_web LOGIN NOSUPERUSER NOINHERIT NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
   END IF;
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'atlas_worker') THEN
-    CREATE ROLE atlas_worker LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
+    CREATE ROLE atlas_worker LOGIN NOSUPERUSER NOINHERIT NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
   END IF;
 END
 $roles$;
 
-ALTER ROLE atlas_migrator NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
-ALTER ROLE atlas_web NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
-ALTER ROLE atlas_worker NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
+ALTER ROLE atlas_migrator LOGIN NOSUPERUSER NOINHERIT NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+ALTER ROLE atlas_web LOGIN NOSUPERUSER NOINHERIT NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+ALTER ROLE atlas_worker LOGIN NOSUPERUSER NOINHERIT NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+
+DO $memberships$
+DECLARE
+  membership record;
+BEGIN
+  FOR membership IN
+    SELECT granted.rolname AS granted_role, member.rolname AS member_role
+      FROM pg_auth_members role_membership
+      JOIN pg_roles granted ON granted.oid = role_membership.roleid
+      JOIN pg_roles member ON member.oid = role_membership.member
+     WHERE member.rolname IN ('atlas_migrator', 'atlas_web', 'atlas_worker')
+  LOOP
+    EXECUTE format('REVOKE %I FROM %I', membership.granted_role, membership.member_role);
+  END LOOP;
+END
+$memberships$;
 
 SELECT format('ALTER ROLE atlas PASSWORD %L', :'bootstrap_password') \gexec
 SELECT format('ALTER ROLE atlas_migrator PASSWORD %L', :'migrator_password') \gexec
@@ -72,6 +88,9 @@ SELECT format('ALTER ROLE atlas_worker PASSWORD %L', :'worker_password') \gexec
 -- production therefore keeps extension ownership outside application roles.
 CREATE EXTENSION IF NOT EXISTS citext;
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
+SELECT format('ALTER DATABASE %I OWNER TO atlas_migrator', current_database()) \gexec
+ALTER SCHEMA public OWNER TO atlas_migrator;
 
 -- The first foundation Compose topology ran migrations as atlas. Transfer only
 -- the known Atlas schema objects so an existing V2 database can cross into the
@@ -134,11 +153,13 @@ BEGIN
 END
 $ownership$;
 
-SELECT format('REVOKE CONNECT ON DATABASE %I FROM PUBLIC', current_database()) \gexec
-SELECT format('GRANT CONNECT, CREATE ON DATABASE %I TO atlas_migrator', current_database()) \gexec
+SELECT format('REVOKE ALL PRIVILEGES ON DATABASE %I FROM PUBLIC', current_database()) \gexec
+SELECT format('REVOKE ALL PRIVILEGES ON DATABASE %I FROM atlas_web, atlas_worker', current_database()) \gexec
+SELECT format('GRANT CONNECT, CREATE, TEMPORARY ON DATABASE %I TO atlas_migrator', current_database()) \gexec
 SELECT format('GRANT CONNECT ON DATABASE %I TO atlas_web, atlas_worker', current_database()) \gexec
 
-REVOKE CREATE ON SCHEMA public FROM PUBLIC;
+REVOKE ALL PRIVILEGES ON SCHEMA public FROM PUBLIC;
+REVOKE ALL PRIVILEGES ON SCHEMA public FROM atlas_web, atlas_worker;
 GRANT USAGE, CREATE ON SCHEMA public TO atlas_migrator;
 GRANT USAGE ON SCHEMA public TO atlas_web, atlas_worker;
 
