@@ -1,3 +1,4 @@
+import { ZodError } from "zod";
 import { describe, expect, it } from "vitest";
 import { parseConfig } from "../../src/server/config.js";
 
@@ -15,6 +16,16 @@ const productionEnv = {
   WORKER_POLL_MS: "2500"
 };
 
+function expectConfigIssue(env: NodeJS.ProcessEnv, path: string[], message: string) {
+  try {
+    parseConfig(env);
+    throw new Error("Expected configuration parsing to fail.");
+  } catch (error) {
+    expect(error).toBeInstanceOf(ZodError);
+    expect((error as ZodError).issues).toContainEqual(expect.objectContaining({ path, message }));
+  }
+}
+
 describe("parseConfig", () => {
   it("uses development defaults", () => {
     const config = parseConfig({ NODE_ENV: "development" });
@@ -25,7 +36,7 @@ describe("parseConfig", () => {
   });
 
   it("rejects local authentication in production", () => {
-    expect(() => parseConfig({ ...productionEnv, AUTH_MODE: "local" })).toThrow();
+    expectConfigIssue({ ...productionEnv, AUTH_MODE: "local" }, ["authMode"], "AUTH_MODE must be google in production.");
   });
 
   it.each(["DATABASE_URL", "SESSION_SECRET", "ATLAS_ORIGIN", "GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET", "GOOGLE_REDIRECT_URI"])(
@@ -39,10 +50,18 @@ describe("parseConfig", () => {
   );
 
   it("requires session secrets to be at least 32 characters", () => {
-    expect(() => parseConfig({ NODE_ENV: "development", SESSION_SECRET: "too-short" })).toThrow();
+    expectConfigIssue(
+      { NODE_ENV: "development", SESSION_SECRET: "too-short" },
+      ["sessionSecret"],
+      "Too small: expected string to have >=32 characters"
+    );
   });
 
   it("requires an HTTPS Atlas origin in production", () => {
-    expect(() => parseConfig({ ...productionEnv, ATLAS_ORIGIN: "http://atlas.rangeway.app" })).toThrow();
+    expectConfigIssue(
+      { ...productionEnv, ATLAS_ORIGIN: "http://atlas.rangeway.app" },
+      ["atlasOrigin"],
+      "ATLAS_ORIGIN must use HTTPS in production."
+    );
   });
 });

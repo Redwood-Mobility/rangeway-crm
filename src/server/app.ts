@@ -7,7 +7,7 @@ import express from "express";
 import multer from "multer";
 import { nanoid } from "nanoid";
 import { ZodError } from "zod";
-import { config } from "./config.js";
+import { config as defaultConfig } from "./config.js";
 import { clearSessionCookie, constantTimeEqual, currentUser, requireAuth, setSessionCookie } from "./auth.js";
 import { db, migrate, now, upsertUser } from "./db.js";
 import {
@@ -32,7 +32,8 @@ const allowedMimeTypes = new Set([
   "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 ]);
 
-export function createApp(): express.Express {
+export function createApp(options: { config?: typeof defaultConfig } = {}): express.Express {
+const config = options.config ?? defaultConfig;
 const app = express();
 const clientDir = path.join(process.cwd(), "dist", "client");
 const documentDir = path.join(config.uploadDir, "documents");
@@ -331,6 +332,11 @@ app.get("/api/auth/google/callback", async (req, res, next) => {
 });
 
 app.post("/api/login", (req, res) => {
+  if (config.authMode !== "local" || config.isProduction) {
+    res.status(404).json({ error: "Not found" });
+    return;
+  }
+
   const input = loginSchema.parse(req.body);
   if (!constantTimeEqual(input.email.toLowerCase(), config.adminEmail.toLowerCase()) || !constantTimeEqual(input.password, config.adminPassword)) {
     res.status(401).json({ error: "Invalid email or password" });
