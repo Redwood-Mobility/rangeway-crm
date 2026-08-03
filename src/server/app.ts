@@ -21,6 +21,11 @@ import { db, now, upsertUser } from "./db.js";
 import { IdentityService } from "./modules/identity/identity.service.js";
 import { createOrganizationRouter } from "./modules/organizations/organization.routes.js";
 import {
+  createOperatingCoreRouter,
+  type OperatingCorePort,
+} from "./modules/operating-core/operating-core.routes.js";
+import { OperatingCoreService } from "./modules/operating-core/operating-core.service.js";
+import {
   OrganizationService,
   type OrganizationMutationPort,
 } from "./modules/organizations/organization.service.js";
@@ -78,6 +83,7 @@ export interface CreateAppOptions {
   config?: typeof defaultConfig;
   v2Identity?: V2IdentityPort;
   v2Organizations?: OrganizationMutationPort;
+  v2OperatingCore?: OperatingCorePort;
   v2Pool?: Pool;
   googleOAuth?: GoogleOAuthGateway;
   logger?: ErrorLogger;
@@ -94,6 +100,8 @@ const v2Identity =
   options.v2Identity ?? new IdentityService(v2Pool);
 const v2Organizations =
   options.v2Organizations ?? new OrganizationService(v2Pool);
+const v2OperatingCore =
+  options.v2OperatingCore ?? new OperatingCoreService(v2Pool);
 const errorLogger: ErrorLogger = options.logger ?? {
   error(message, context) {
     console.error(message, context);
@@ -197,6 +205,7 @@ app.get("/api/v2/ready", async (_req, res, next) => {
   }
 });
 app.use("/api/v2", createOrganizationRouter(v2Organizations));
+app.use("/api/v2", createOperatingCoreRouter(v2OperatingCore));
 app.use("/api/v2", requireActor, (_req, _res, next) => {
   next(new ApiError(404, "NOT_FOUND", "Resource not found."));
 });

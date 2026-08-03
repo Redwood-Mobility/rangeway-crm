@@ -29,6 +29,22 @@ export function createProductionOutboxHandlers(): OutboxHandlerRegistry {
     [atlasEventTypes.identityGoogleProfileUpdated]: acknowledgeFoundationEvent,
     [atlasEventTypes.identityServiceActorCreated]: acknowledgeFoundationEvent,
     [atlasEventTypes.identityServiceActorDisabled]: acknowledgeFoundationEvent,
+    [atlasEventTypes.projectChanged]: acknowledgeFoundationEvent,
+    [atlasEventTypes.projectMembershipChanged]: acknowledgeFoundationEvent,
+    [atlasEventTypes.projectHealthChanged]: acknowledgeFoundationEvent,
+    [atlasEventTypes.workstreamChanged]: acknowledgeFoundationEvent,
+    [atlasEventTypes.workItemChanged]: acknowledgeFoundationEvent,
+    [atlasEventTypes.workItemDependencyChanged]: acknowledgeFoundationEvent,
+    [atlasEventTypes.labelChanged]: acknowledgeFoundationEvent,
+    [atlasEventTypes.decisionChanged]: acknowledgeFoundationEvent,
+    [atlasEventTypes.riskChanged]: acknowledgeFoundationEvent,
+    [atlasEventTypes.blockerChanged]: acknowledgeFoundationEvent,
+    [atlasEventTypes.milestoneChanged]: acknowledgeFoundationEvent,
+    [atlasEventTypes.activityRecorded]: acknowledgeFoundationEvent,
+    [atlasEventTypes.personChanged]: acknowledgeFoundationEvent,
+    [atlasEventTypes.counterpartyChanged]: acknowledgeFoundationEvent,
+    [atlasEventTypes.projectRelationshipChanged]: acknowledgeFoundationEvent,
+    [atlasEventTypes.savedViewChanged]: acknowledgeFoundationEvent,
   } satisfies Record<AtlasEventType, OutboxHandler>;
 }
 

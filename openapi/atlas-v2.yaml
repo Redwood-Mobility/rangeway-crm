@@ -19,6 +19,8 @@ tags:
     description: Actor authentication and session lifecycle.
   - name: Organizations
     description: Organization-scoped foundation operations.
+  - name: Operating Core
+    description: Project Rooms, universal work, operating context, and relationships.
 security:
   - sessionCookie: []
   - atlasBearer: []
@@ -356,6 +358,441 @@ paths:
           $ref: "#/components/responses/ApiError"
         "500":
           $ref: "#/components/responses/ApiError"
+  /projects:
+    get:
+      operationId: listProjects
+      summary: List authorized Project Rooms
+      tags: [Operating Core]
+      parameters:
+        - $ref: "#/components/parameters/RequestId"
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200": { $ref: "#/components/responses/OperatingCoreSuccess" }
+        4XX: { $ref: "#/components/responses/ApiError" }
+    post:
+      operationId: createProject
+      summary: Create a Project Room
+      tags: [Operating Core]
+      parameters:
+        - $ref: "#/components/parameters/RequestId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ProjectInput" }
+      responses:
+        "201": { $ref: "#/components/responses/OperatingCoreSuccess" }
+        "409": { $ref: "#/components/responses/IdempotencyConflict" }
+        4XX: { $ref: "#/components/responses/ApiError" }
+  /projects/{projectId}:
+    parameters:
+      - $ref: "#/components/parameters/ProjectId"
+    get:
+      operationId: getProject
+      summary: Get an authorized Project Room
+      tags: [Operating Core]
+      responses:
+        "200": { $ref: "#/components/responses/OperatingCoreSuccess" }
+        "404": { $ref: "#/components/responses/ApiError" }
+    patch:
+      operationId: updateProject
+      summary: Update a Project Room
+      tags: [Operating Core]
+      parameters: [{ $ref: "#/components/parameters/IdempotencyKey" }]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/ProjectPatch" } } }
+      responses:
+        "200": { $ref: "#/components/responses/OperatingCoreSuccess" }
+        "409": { $ref: "#/components/responses/IdempotencyConflict" }
+        4XX: { $ref: "#/components/responses/ApiError" }
+  /projects/{projectId}/archive:
+    post:
+      operationId: setProjectArchiveState
+      summary: Archive or recover a Project Room
+      tags: [Operating Core]
+      parameters:
+        - $ref: "#/components/parameters/ProjectId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        content: { application/json: { schema: { $ref: "#/components/schemas/ArchiveInput" } } }
+      responses:
+        "200": { $ref: "#/components/responses/OperatingCoreSuccess" }
+        "409": { $ref: "#/components/responses/IdempotencyConflict" }
+        4XX: { $ref: "#/components/responses/ApiError" }
+  /projects/{projectId}/members:
+    get:
+      operationId: listProjectMembers
+      summary: List Project Room members
+      tags: [Operating Core]
+      parameters:
+        - $ref: "#/components/parameters/ProjectId"
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200": { $ref: "#/components/responses/OperatingCoreSuccess" }
+        4XX: { $ref: "#/components/responses/ApiError" }
+    post:
+      operationId: addProjectMember
+      summary: Add or update a Project Room member
+      tags: [Operating Core]
+      parameters:
+        - $ref: "#/components/parameters/ProjectId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/ProjectMemberInput" } } }
+      responses:
+        "201": { $ref: "#/components/responses/OperatingCoreSuccess" }
+        "409": { $ref: "#/components/responses/IdempotencyConflict" }
+        4XX: { $ref: "#/components/responses/ApiError" }
+  /projects/{projectId}/members/{userId}:
+    delete:
+      operationId: removeProjectMember
+      summary: Remove a non-owner Project Room member
+      tags: [Operating Core]
+      parameters:
+        - $ref: "#/components/parameters/ProjectId"
+        - $ref: "#/components/parameters/UserId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      responses:
+        "200": { $ref: "#/components/responses/OperatingCoreSuccess" }
+        "409": { $ref: "#/components/responses/IdempotencyConflict" }
+        4XX: { $ref: "#/components/responses/ApiError" }
+  /projects/{projectId}/health-updates:
+    get:
+      operationId: listProjectHealthUpdates
+      summary: List immutable Project Room health history
+      tags: [Operating Core]
+      parameters:
+        - $ref: "#/components/parameters/ProjectId"
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200": { $ref: "#/components/responses/OperatingCoreSuccess" }
+        4XX: { $ref: "#/components/responses/ApiError" }
+    post:
+      operationId: recordProjectHealth
+      summary: Record and apply a Project Room health update
+      tags: [Operating Core]
+      parameters:
+        - $ref: "#/components/parameters/ProjectId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/HealthUpdateInput" } } }
+      responses:
+        "201": { $ref: "#/components/responses/OperatingCoreSuccess" }
+        "409": { $ref: "#/components/responses/IdempotencyConflict" }
+        4XX: { $ref: "#/components/responses/ApiError" }
+  /projects/{projectId}/context-bundle:
+    get:
+      operationId: getProjectContextBundle
+      summary: Get complete authorized Project Room context
+      tags: [Operating Core]
+      parameters: [{ $ref: "#/components/parameters/ProjectId" }]
+      responses:
+        "200": { $ref: "#/components/responses/OperatingCoreSuccess" }
+        "404": { $ref: "#/components/responses/ApiError" }
+  /portfolio:
+    get:
+      operationId: getPortfolio
+      summary: Get authorized portfolio operating state
+      tags: [Operating Core]
+      parameters:
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200": { $ref: "#/components/responses/OperatingCoreSuccess" }
+        4XX: { $ref: "#/components/responses/ApiError" }
+  /portfolio/health:
+    get:
+      operationId: getPortfolioHealth
+      summary: Get authorized portfolio health totals
+      tags: [Operating Core]
+      responses:
+        "200": { $ref: "#/components/responses/OperatingCoreSuccess" }
+        4XX: { $ref: "#/components/responses/ApiError" }
+  /projects/{projectId}/workstreams:
+    get:
+      operationId: listWorkstreams
+      summary: List Project Room workstreams
+      tags: [Operating Core]
+      parameters:
+        - $ref: "#/components/parameters/ProjectId"
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200": { $ref: "#/components/responses/OperatingCoreSuccess" }
+        4XX: { $ref: "#/components/responses/ApiError" }
+    post:
+      operationId: createWorkstream
+      summary: Create a Project Room workstream
+      tags: [Operating Core]
+      parameters:
+        - $ref: "#/components/parameters/ProjectId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/OperatingCoreMutation" } } }
+      responses:
+        "201": { $ref: "#/components/responses/OperatingCoreSuccess" }
+        "409": { $ref: "#/components/responses/IdempotencyConflict" }
+        4XX: { $ref: "#/components/responses/ApiError" }
+  /workstreams/{workstreamId}:
+    get:
+      operationId: getWorkstream
+      summary: Get an authorized workstream
+      tags: [Operating Core]
+      parameters: [{ $ref: "#/components/parameters/WorkstreamId" }]
+      responses:
+        "200": { $ref: "#/components/responses/OperatingCoreSuccess" }
+        "404": { $ref: "#/components/responses/ApiError" }
+    patch:
+      operationId: updateWorkstream
+      summary: Update an authorized workstream
+      tags: [Operating Core]
+      parameters:
+        - $ref: "#/components/parameters/WorkstreamId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/OperatingCoreMutation" } } }
+      responses:
+        "200": { $ref: "#/components/responses/OperatingCoreSuccess" }
+        "409": { $ref: "#/components/responses/IdempotencyConflict" }
+        4XX: { $ref: "#/components/responses/ApiError" }
+  /work-items:
+    get:
+      operationId: listWorkItems
+      summary: List authorized universal work items
+      tags: [Operating Core]
+      parameters:
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200": { $ref: "#/components/responses/OperatingCoreSuccess" }
+        4XX: { $ref: "#/components/responses/ApiError" }
+    post:
+      operationId: createWorkItem
+      summary: Create a universal work item
+      tags: [Operating Core]
+      parameters: [{ $ref: "#/components/parameters/IdempotencyKey" }]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/WorkItemInput" } } }
+      responses:
+        "201": { $ref: "#/components/responses/OperatingCoreSuccess" }
+        "409": { $ref: "#/components/responses/IdempotencyConflict" }
+        4XX: { $ref: "#/components/responses/ApiError" }
+  /work-items/{workItemId}:
+    get:
+      operationId: getWorkItem
+      summary: Get an authorized universal work item
+      tags: [Operating Core]
+      parameters: [{ $ref: "#/components/parameters/WorkItemId" }]
+      responses:
+        "200": { $ref: "#/components/responses/OperatingCoreSuccess" }
+        "404": { $ref: "#/components/responses/ApiError" }
+    patch:
+      operationId: updateWorkItem
+      summary: Update a universal work item
+      tags: [Operating Core]
+      parameters:
+        - $ref: "#/components/parameters/WorkItemId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/WorkItemPatch" } } }
+      responses:
+        "200": { $ref: "#/components/responses/OperatingCoreSuccess" }
+        "409": { $ref: "#/components/responses/IdempotencyConflict" }
+        4XX: { $ref: "#/components/responses/ApiError" }
+  /work-items/{workItemId}/move:
+    post:
+      operationId: moveWorkItem
+      summary: Move one work item in every canonical projection
+      tags: [Operating Core]
+      parameters:
+        - $ref: "#/components/parameters/WorkItemId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/WorkMoveInput" } } }
+      responses:
+        "200": { $ref: "#/components/responses/OperatingCoreSuccess" }
+        "409": { $ref: "#/components/responses/IdempotencyConflict" }
+        4XX: { $ref: "#/components/responses/ApiError" }
+  /work-items/{workItemId}/dependencies/{dependencyId}:
+    parameters:
+      - $ref: "#/components/parameters/WorkItemId"
+      - $ref: "#/components/parameters/DependencyId"
+    post:
+      operationId: addWorkItemDependency
+      summary: Add an acyclic same-project dependency
+      tags: [Operating Core]
+      parameters: [{ $ref: "#/components/parameters/IdempotencyKey" }]
+      responses:
+        "201": { $ref: "#/components/responses/OperatingCoreSuccess" }
+        "409": { $ref: "#/components/responses/IdempotencyConflict" }
+        4XX: { $ref: "#/components/responses/ApiError" }
+    delete:
+      operationId: removeWorkItemDependency
+      summary: Remove a work-item dependency
+      tags: [Operating Core]
+      parameters: [{ $ref: "#/components/parameters/IdempotencyKey" }]
+      responses:
+        "200": { $ref: "#/components/responses/OperatingCoreSuccess" }
+        "409": { $ref: "#/components/responses/IdempotencyConflict" }
+        4XX: { $ref: "#/components/responses/ApiError" }
+  /work-items/{workItemId}/archive:
+    post:
+      operationId: setWorkItemArchiveState
+      summary: Archive or recover a universal work item
+      tags: [Operating Core]
+      parameters:
+        - $ref: "#/components/parameters/WorkItemId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        content: { application/json: { schema: { $ref: "#/components/schemas/ArchiveInput" } } }
+      responses:
+        "200": { $ref: "#/components/responses/OperatingCoreSuccess" }
+        "409": { $ref: "#/components/responses/IdempotencyConflict" }
+        4XX: { $ref: "#/components/responses/ApiError" }
+  /labels:
+    get:
+      operationId: listLabels
+      summary: List organization work labels
+      tags: [Operating Core]
+      parameters:
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200": { $ref: "#/components/responses/OperatingCoreSuccess" }
+        4XX: { $ref: "#/components/responses/ApiError" }
+    post:
+      operationId: createLabel
+      summary: Create an organization work label
+      tags: [Operating Core]
+      parameters: [{ $ref: "#/components/parameters/IdempotencyKey" }]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/OperatingCoreMutation" } } }
+      responses:
+        "201": { $ref: "#/components/responses/OperatingCoreSuccess" }
+        "409": { $ref: "#/components/responses/IdempotencyConflict" }
+        4XX: { $ref: "#/components/responses/ApiError" }
+  /work-items/{workItemId}/labels/{labelId}:
+    parameters:
+      - $ref: "#/components/parameters/WorkItemId"
+      - name: labelId
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    post:
+      operationId: addWorkItemLabel
+      summary: Add a label to a work item
+      tags: [Operating Core]
+      parameters: [{ $ref: "#/components/parameters/IdempotencyKey" }]
+      responses:
+        "201": { $ref: "#/components/responses/OperatingCoreSuccess" }
+        "409": { $ref: "#/components/responses/IdempotencyConflict" }
+        4XX: { $ref: "#/components/responses/ApiError" }
+    delete:
+      operationId: removeWorkItemLabel
+      summary: Remove a label from a work item
+      tags: [Operating Core]
+      parameters: [{ $ref: "#/components/parameters/IdempotencyKey" }]
+      responses:
+        "200": { $ref: "#/components/responses/OperatingCoreSuccess" }
+        "409": { $ref: "#/components/responses/IdempotencyConflict" }
+        4XX: { $ref: "#/components/responses/ApiError" }
+  /today:
+    get:
+      operationId: getToday
+      summary: Get personal work, decisions, changes, agent activity, and milestones
+      tags: [Operating Core]
+      responses:
+        "200": { $ref: "#/components/responses/OperatingCoreSuccess" }
+        4XX: { $ref: "#/components/responses/ApiError" }
+  /work-views/{view}:
+    get:
+      operationId: getCanonicalWorkView
+      summary: Get board, list, or calendar projection of the canonical work rows
+      tags: [Operating Core]
+      parameters:
+        - name: view
+          in: path
+          required: true
+          schema: { type: string, enum: [board, list, calendar] }
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200": { $ref: "#/components/responses/OperatingCoreSuccess" }
+        4XX: { $ref: "#/components/responses/ApiError" }
+  /projects/{projectId}/decisions:
+    $ref: "#/components/pathItems/ProjectDecisionCollection"
+  /decisions/{decisionId}:
+    $ref: "#/components/pathItems/DecisionItem"
+  /projects/{projectId}/risks:
+    $ref: "#/components/pathItems/ProjectRiskCollection"
+  /risks/{riskId}:
+    $ref: "#/components/pathItems/RiskItem"
+  /projects/{projectId}/blockers:
+    $ref: "#/components/pathItems/ProjectBlockerCollection"
+  /blockers/{blockerId}:
+    $ref: "#/components/pathItems/BlockerItem"
+  /projects/{projectId}/milestones:
+    $ref: "#/components/pathItems/ProjectMilestoneCollection"
+  /milestones/{milestoneId}:
+    $ref: "#/components/pathItems/MilestoneItem"
+  /projects/{projectId}/activity:
+    $ref: "#/components/pathItems/ProjectActivityCollection"
+  /people:
+    $ref: "#/components/pathItems/PeopleCollection"
+  /people/{personId}:
+    $ref: "#/components/pathItems/PersonItem"
+  /people/{personId}/merge:
+    $ref: "#/components/pathItems/PersonMerge"
+  /people/{personId}/affiliations:
+    $ref: "#/components/pathItems/PersonAffiliations"
+  /counterparties:
+    $ref: "#/components/pathItems/CounterpartyCollection"
+  /counterparties/{counterpartyId}:
+    $ref: "#/components/pathItems/CounterpartyItem"
+  /counterparties/{counterpartyId}/merge:
+    $ref: "#/components/pathItems/CounterpartyMerge"
+  /projects/{projectId}/people:
+    $ref: "#/components/pathItems/ProjectPeopleCollection"
+  /projects/{projectId}/people/{personId}:
+    $ref: "#/components/pathItems/ProjectPersonItem"
+  /projects/{projectId}/counterparties:
+    $ref: "#/components/pathItems/ProjectCounterpartyCollection"
+  /projects/{projectId}/counterparties/{counterpartyId}:
+    $ref: "#/components/pathItems/ProjectCounterpartyItem"
+  /saved-views:
+    $ref: "#/components/pathItems/SavedViewCollection"
+  /saved-views/{savedViewId}:
+    $ref: "#/components/pathItems/SavedViewItem"
+  /saved-views/{savedViewId}/archive:
+    $ref: "#/components/pathItems/SavedViewArchive"
+  /search:
+    get:
+      operationId: searchAtlasNativeRecords
+      summary: Search authorized native Atlas records
+      tags: [Operating Core]
+      parameters:
+        - name: q
+          in: query
+          required: true
+          schema: { type: string, minLength: 2, maxLength: 200 }
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200": { $ref: "#/components/responses/OperatingCoreSuccess" }
+        4XX: { $ref: "#/components/responses/ApiError" }
 components:
   securitySchemes:
     sessionCookie:
@@ -370,6 +807,525 @@ components:
       description: >-
         Atlas agent or automation credential. The Bearer scheme is
         case-insensitive; the Atlas key shape remains strict.
+  pathItems:
+    ProjectDecisionCollection:
+      parameters: [{ $ref: "#/components/parameters/ProjectId" }]
+      get:
+        operationId: listProjectDecisions
+        summary: List project decisions
+        tags: [Operating Core]
+        parameters:
+          - $ref: "#/components/parameters/Cursor"
+          - $ref: "#/components/parameters/Limit"
+        responses:
+          "200": { $ref: "#/components/responses/OperatingCoreSuccess" }
+          4XX: { $ref: "#/components/responses/ApiError" }
+      post:
+        operationId: createProjectDecision
+        summary: Record or propose a project decision
+        tags: [Operating Core]
+        parameters: [{ $ref: "#/components/parameters/IdempotencyKey" }]
+        requestBody:
+          required: true
+          content: { application/json: { schema: { $ref: "#/components/schemas/OperatingCoreMutation" } } }
+        responses:
+          "201": { $ref: "#/components/responses/OperatingCoreSuccess" }
+          "409": { $ref: "#/components/responses/IdempotencyConflict" }
+          4XX: { $ref: "#/components/responses/ApiError" }
+    DecisionItem:
+      parameters:
+        - name: decisionId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      get:
+        operationId: getDecision
+        summary: Get an authorized decision
+        tags: [Operating Core]
+        responses:
+          "200": { $ref: "#/components/responses/OperatingCoreSuccess" }
+          "404": { $ref: "#/components/responses/ApiError" }
+      patch:
+        operationId: updateDecision
+        summary: Update an authorized decision
+        tags: [Operating Core]
+        parameters: [{ $ref: "#/components/parameters/IdempotencyKey" }]
+        requestBody:
+          required: true
+          content: { application/json: { schema: { $ref: "#/components/schemas/OperatingCoreMutation" } } }
+        responses:
+          "200": { $ref: "#/components/responses/OperatingCoreSuccess" }
+          "409": { $ref: "#/components/responses/IdempotencyConflict" }
+          4XX: { $ref: "#/components/responses/ApiError" }
+    ProjectRiskCollection:
+      parameters: [{ $ref: "#/components/parameters/ProjectId" }]
+      get:
+        operationId: listProjectRisks
+        summary: List project risks
+        tags: [Operating Core]
+        parameters:
+          - $ref: "#/components/parameters/Cursor"
+          - $ref: "#/components/parameters/Limit"
+        responses:
+          "200": { $ref: "#/components/responses/OperatingCoreSuccess" }
+          4XX: { $ref: "#/components/responses/ApiError" }
+      post:
+        operationId: createProjectRisk
+        summary: Create a project risk
+        tags: [Operating Core]
+        parameters: [{ $ref: "#/components/parameters/IdempotencyKey" }]
+        requestBody:
+          required: true
+          content: { application/json: { schema: { $ref: "#/components/schemas/OperatingCoreMutation" } } }
+        responses:
+          "201": { $ref: "#/components/responses/OperatingCoreSuccess" }
+          "409": { $ref: "#/components/responses/IdempotencyConflict" }
+          4XX: { $ref: "#/components/responses/ApiError" }
+    RiskItem:
+      parameters:
+        - name: riskId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      get:
+        operationId: getRisk
+        summary: Get an authorized risk
+        tags: [Operating Core]
+        responses:
+          "200": { $ref: "#/components/responses/OperatingCoreSuccess" }
+          "404": { $ref: "#/components/responses/ApiError" }
+      patch:
+        operationId: updateRisk
+        summary: Update an authorized risk
+        tags: [Operating Core]
+        parameters: [{ $ref: "#/components/parameters/IdempotencyKey" }]
+        requestBody:
+          required: true
+          content: { application/json: { schema: { $ref: "#/components/schemas/OperatingCoreMutation" } } }
+        responses:
+          "200": { $ref: "#/components/responses/OperatingCoreSuccess" }
+          "409": { $ref: "#/components/responses/IdempotencyConflict" }
+          4XX: { $ref: "#/components/responses/ApiError" }
+    ProjectBlockerCollection:
+      parameters: [{ $ref: "#/components/parameters/ProjectId" }]
+      get:
+        operationId: listProjectBlockers
+        summary: List project blockers
+        tags: [Operating Core]
+        parameters:
+          - $ref: "#/components/parameters/Cursor"
+          - $ref: "#/components/parameters/Limit"
+        responses:
+          "200": { $ref: "#/components/responses/OperatingCoreSuccess" }
+          4XX: { $ref: "#/components/responses/ApiError" }
+      post:
+        operationId: createProjectBlocker
+        summary: Create a validated project blocker
+        tags: [Operating Core]
+        parameters: [{ $ref: "#/components/parameters/IdempotencyKey" }]
+        requestBody:
+          required: true
+          content: { application/json: { schema: { $ref: "#/components/schemas/OperatingCoreMutation" } } }
+        responses:
+          "201": { $ref: "#/components/responses/OperatingCoreSuccess" }
+          "409": { $ref: "#/components/responses/IdempotencyConflict" }
+          4XX: { $ref: "#/components/responses/ApiError" }
+    BlockerItem:
+      parameters:
+        - name: blockerId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      get:
+        operationId: getBlocker
+        summary: Get an authorized blocker
+        tags: [Operating Core]
+        responses:
+          "200": { $ref: "#/components/responses/OperatingCoreSuccess" }
+          "404": { $ref: "#/components/responses/ApiError" }
+      patch:
+        operationId: updateBlocker
+        summary: Update an authorized blocker
+        tags: [Operating Core]
+        parameters: [{ $ref: "#/components/parameters/IdempotencyKey" }]
+        requestBody:
+          required: true
+          content: { application/json: { schema: { $ref: "#/components/schemas/OperatingCoreMutation" } } }
+        responses:
+          "200": { $ref: "#/components/responses/OperatingCoreSuccess" }
+          "409": { $ref: "#/components/responses/IdempotencyConflict" }
+          4XX: { $ref: "#/components/responses/ApiError" }
+    ProjectMilestoneCollection:
+      parameters: [{ $ref: "#/components/parameters/ProjectId" }]
+      get:
+        operationId: listProjectMilestones
+        summary: List project milestones
+        tags: [Operating Core]
+        parameters:
+          - $ref: "#/components/parameters/Cursor"
+          - $ref: "#/components/parameters/Limit"
+        responses:
+          "200": { $ref: "#/components/responses/OperatingCoreSuccess" }
+          4XX: { $ref: "#/components/responses/ApiError" }
+      post:
+        operationId: createProjectMilestone
+        summary: Create a dated project milestone
+        tags: [Operating Core]
+        parameters: [{ $ref: "#/components/parameters/IdempotencyKey" }]
+        requestBody:
+          required: true
+          content: { application/json: { schema: { $ref: "#/components/schemas/OperatingCoreMutation" } } }
+        responses:
+          "201": { $ref: "#/components/responses/OperatingCoreSuccess" }
+          "409": { $ref: "#/components/responses/IdempotencyConflict" }
+          4XX: { $ref: "#/components/responses/ApiError" }
+    MilestoneItem:
+      parameters:
+        - name: milestoneId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      get:
+        operationId: getMilestone
+        summary: Get an authorized milestone
+        tags: [Operating Core]
+        responses:
+          "200": { $ref: "#/components/responses/OperatingCoreSuccess" }
+          "404": { $ref: "#/components/responses/ApiError" }
+      patch:
+        operationId: updateMilestone
+        summary: Update an authorized milestone
+        tags: [Operating Core]
+        parameters: [{ $ref: "#/components/parameters/IdempotencyKey" }]
+        requestBody:
+          required: true
+          content: { application/json: { schema: { $ref: "#/components/schemas/OperatingCoreMutation" } } }
+        responses:
+          "200": { $ref: "#/components/responses/OperatingCoreSuccess" }
+          "409": { $ref: "#/components/responses/IdempotencyConflict" }
+          4XX: { $ref: "#/components/responses/ApiError" }
+    ProjectActivityCollection:
+      parameters: [{ $ref: "#/components/parameters/ProjectId" }]
+      get:
+        operationId: listProjectActivity
+        summary: List human-readable project activity
+        tags: [Operating Core]
+        parameters:
+          - $ref: "#/components/parameters/Cursor"
+          - $ref: "#/components/parameters/Limit"
+        responses:
+          "200": { $ref: "#/components/responses/OperatingCoreSuccess" }
+          4XX: { $ref: "#/components/responses/ApiError" }
+      post:
+        operationId: addProjectActivity
+        summary: Add human-readable project activity
+        tags: [Operating Core]
+        parameters: [{ $ref: "#/components/parameters/IdempotencyKey" }]
+        requestBody:
+          required: true
+          content: { application/json: { schema: { $ref: "#/components/schemas/OperatingCoreMutation" } } }
+        responses:
+          "201": { $ref: "#/components/responses/OperatingCoreSuccess" }
+          "409": { $ref: "#/components/responses/IdempotencyConflict" }
+          4XX: { $ref: "#/components/responses/ApiError" }
+    PeopleCollection:
+      get:
+        operationId: listPeople
+        summary: List people
+        tags: [Operating Core]
+        parameters:
+          - $ref: "#/components/parameters/Cursor"
+          - $ref: "#/components/parameters/Limit"
+        responses:
+          "200": { $ref: "#/components/responses/OperatingCoreSuccess" }
+          4XX: { $ref: "#/components/responses/ApiError" }
+      post:
+        operationId: createPerson
+        summary: Create a person
+        tags: [Operating Core]
+        parameters: [{ $ref: "#/components/parameters/IdempotencyKey" }]
+        requestBody:
+          required: true
+          content: { application/json: { schema: { $ref: "#/components/schemas/OperatingCoreMutation" } } }
+        responses:
+          "201": { $ref: "#/components/responses/OperatingCoreSuccess" }
+          "409": { $ref: "#/components/responses/IdempotencyConflict" }
+          4XX: { $ref: "#/components/responses/ApiError" }
+    PersonItem:
+      parameters:
+        - name: personId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      get:
+        operationId: getPerson
+        summary: Get a person
+        tags: [Operating Core]
+        responses:
+          "200": { $ref: "#/components/responses/OperatingCoreSuccess" }
+          "404": { $ref: "#/components/responses/ApiError" }
+      patch:
+        operationId: updatePerson
+        summary: Update a person
+        tags: [Operating Core]
+        parameters: [{ $ref: "#/components/parameters/IdempotencyKey" }]
+        requestBody:
+          required: true
+          content: { application/json: { schema: { $ref: "#/components/schemas/OperatingCoreMutation" } } }
+        responses:
+          "200": { $ref: "#/components/responses/OperatingCoreSuccess" }
+          "409": { $ref: "#/components/responses/IdempotencyConflict" }
+          4XX: { $ref: "#/components/responses/ApiError" }
+    PersonMerge:
+      parameters:
+        - name: personId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      post:
+        operationId: mergePerson
+        summary: Merge a person while preserving provenance
+        tags: [Operating Core]
+        parameters: [{ $ref: "#/components/parameters/IdempotencyKey" }]
+        requestBody:
+          required: true
+          content: { application/json: { schema: { $ref: "#/components/schemas/MergeInput" } } }
+        responses:
+          "200": { $ref: "#/components/responses/OperatingCoreSuccess" }
+          "409": { $ref: "#/components/responses/IdempotencyConflict" }
+          4XX: { $ref: "#/components/responses/ApiError" }
+    PersonAffiliations:
+      parameters:
+        - name: personId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      get:
+        operationId: listPersonAffiliations
+        summary: List person-counterparty affiliations
+        tags: [Operating Core]
+        parameters:
+          - $ref: "#/components/parameters/Cursor"
+          - $ref: "#/components/parameters/Limit"
+        responses:
+          "200": { $ref: "#/components/responses/OperatingCoreSuccess" }
+          4XX: { $ref: "#/components/responses/ApiError" }
+      post:
+        operationId: createPersonAffiliation
+        summary: Create a person-counterparty affiliation
+        tags: [Operating Core]
+        parameters: [{ $ref: "#/components/parameters/IdempotencyKey" }]
+        requestBody:
+          required: true
+          content: { application/json: { schema: { $ref: "#/components/schemas/OperatingCoreMutation" } } }
+        responses:
+          "201": { $ref: "#/components/responses/OperatingCoreSuccess" }
+          "409": { $ref: "#/components/responses/IdempotencyConflict" }
+          4XX: { $ref: "#/components/responses/ApiError" }
+    CounterpartyCollection:
+      get:
+        operationId: listCounterparties
+        summary: List counterparties distinct from Atlas tenant organizations
+        tags: [Operating Core]
+        parameters:
+          - $ref: "#/components/parameters/Cursor"
+          - $ref: "#/components/parameters/Limit"
+        responses:
+          "200": { $ref: "#/components/responses/OperatingCoreSuccess" }
+          4XX: { $ref: "#/components/responses/ApiError" }
+      post:
+        operationId: createCounterparty
+        summary: Create a counterparty
+        tags: [Operating Core]
+        parameters: [{ $ref: "#/components/parameters/IdempotencyKey" }]
+        requestBody:
+          required: true
+          content: { application/json: { schema: { $ref: "#/components/schemas/OperatingCoreMutation" } } }
+        responses:
+          "201": { $ref: "#/components/responses/OperatingCoreSuccess" }
+          "409": { $ref: "#/components/responses/IdempotencyConflict" }
+          4XX: { $ref: "#/components/responses/ApiError" }
+    CounterpartyItem:
+      parameters:
+        - name: counterpartyId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      get:
+        operationId: getCounterparty
+        summary: Get a counterparty
+        tags: [Operating Core]
+        responses:
+          "200": { $ref: "#/components/responses/OperatingCoreSuccess" }
+          "404": { $ref: "#/components/responses/ApiError" }
+      patch:
+        operationId: updateCounterparty
+        summary: Update a counterparty
+        tags: [Operating Core]
+        parameters: [{ $ref: "#/components/parameters/IdempotencyKey" }]
+        requestBody:
+          required: true
+          content: { application/json: { schema: { $ref: "#/components/schemas/OperatingCoreMutation" } } }
+        responses:
+          "200": { $ref: "#/components/responses/OperatingCoreSuccess" }
+          "409": { $ref: "#/components/responses/IdempotencyConflict" }
+          4XX: { $ref: "#/components/responses/ApiError" }
+    CounterpartyMerge:
+      parameters:
+        - name: counterpartyId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      post:
+        operationId: mergeCounterparty
+        summary: Merge a counterparty while preserving provenance
+        tags: [Operating Core]
+        parameters: [{ $ref: "#/components/parameters/IdempotencyKey" }]
+        requestBody:
+          required: true
+          content: { application/json: { schema: { $ref: "#/components/schemas/MergeInput" } } }
+        responses:
+          "200": { $ref: "#/components/responses/OperatingCoreSuccess" }
+          "409": { $ref: "#/components/responses/IdempotencyConflict" }
+          4XX: { $ref: "#/components/responses/ApiError" }
+    ProjectPeopleCollection:
+      parameters: [{ $ref: "#/components/parameters/ProjectId" }]
+      get:
+        operationId: listProjectPeople
+        summary: List project people and relationship metadata
+        tags: [Operating Core]
+        parameters:
+          - $ref: "#/components/parameters/Cursor"
+          - $ref: "#/components/parameters/Limit"
+        responses:
+          "200": { $ref: "#/components/responses/OperatingCoreSuccess" }
+          4XX: { $ref: "#/components/responses/ApiError" }
+      post:
+        operationId: linkProjectPerson
+        summary: Link a person to a project
+        tags: [Operating Core]
+        parameters: [{ $ref: "#/components/parameters/IdempotencyKey" }]
+        requestBody:
+          required: true
+          content: { application/json: { schema: { $ref: "#/components/schemas/OperatingCoreMutation" } } }
+        responses:
+          "201": { $ref: "#/components/responses/OperatingCoreSuccess" }
+          "409": { $ref: "#/components/responses/IdempotencyConflict" }
+          4XX: { $ref: "#/components/responses/ApiError" }
+    ProjectPersonItem:
+      parameters:
+        - $ref: "#/components/parameters/ProjectId"
+        - name: personId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      delete:
+        operationId: unlinkProjectPerson
+        summary: Archive a project-person relationship
+        tags: [Operating Core]
+        parameters: [{ $ref: "#/components/parameters/IdempotencyKey" }]
+        responses:
+          "200": { $ref: "#/components/responses/OperatingCoreSuccess" }
+          "409": { $ref: "#/components/responses/IdempotencyConflict" }
+          4XX: { $ref: "#/components/responses/ApiError" }
+    ProjectCounterpartyCollection:
+      parameters: [{ $ref: "#/components/parameters/ProjectId" }]
+      get:
+        operationId: listProjectCounterparties
+        summary: List project counterparties and relationship metadata
+        tags: [Operating Core]
+        parameters:
+          - $ref: "#/components/parameters/Cursor"
+          - $ref: "#/components/parameters/Limit"
+        responses:
+          "200": { $ref: "#/components/responses/OperatingCoreSuccess" }
+          4XX: { $ref: "#/components/responses/ApiError" }
+      post:
+        operationId: linkProjectCounterparty
+        summary: Link a counterparty to a project
+        tags: [Operating Core]
+        parameters: [{ $ref: "#/components/parameters/IdempotencyKey" }]
+        requestBody:
+          required: true
+          content: { application/json: { schema: { $ref: "#/components/schemas/OperatingCoreMutation" } } }
+        responses:
+          "201": { $ref: "#/components/responses/OperatingCoreSuccess" }
+          "409": { $ref: "#/components/responses/IdempotencyConflict" }
+          4XX: { $ref: "#/components/responses/ApiError" }
+    ProjectCounterpartyItem:
+      parameters:
+        - $ref: "#/components/parameters/ProjectId"
+        - name: counterpartyId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      delete:
+        operationId: unlinkProjectCounterparty
+        summary: Archive a project-counterparty relationship
+        tags: [Operating Core]
+        parameters: [{ $ref: "#/components/parameters/IdempotencyKey" }]
+        responses:
+          "200": { $ref: "#/components/responses/OperatingCoreSuccess" }
+          "409": { $ref: "#/components/responses/IdempotencyConflict" }
+          4XX: { $ref: "#/components/responses/ApiError" }
+    SavedViewCollection:
+      get:
+        operationId: listSavedViews
+        summary: List the actor's authorized saved filters
+        tags: [Operating Core]
+        parameters:
+          - $ref: "#/components/parameters/Cursor"
+          - $ref: "#/components/parameters/Limit"
+        responses:
+          "200": { $ref: "#/components/responses/OperatingCoreSuccess" }
+          4XX: { $ref: "#/components/responses/ApiError" }
+      post:
+        operationId: createSavedView
+        summary: Create a saved filter
+        tags: [Operating Core]
+        parameters: [{ $ref: "#/components/parameters/IdempotencyKey" }]
+        requestBody:
+          required: true
+          content: { application/json: { schema: { $ref: "#/components/schemas/OperatingCoreMutation" } } }
+        responses:
+          "201": { $ref: "#/components/responses/OperatingCoreSuccess" }
+          "409": { $ref: "#/components/responses/IdempotencyConflict" }
+          4XX: { $ref: "#/components/responses/ApiError" }
+    SavedViewItem:
+      parameters:
+        - name: savedViewId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      patch:
+        operationId: updateSavedView
+        summary: Update an actor-owned saved filter
+        tags: [Operating Core]
+        parameters: [{ $ref: "#/components/parameters/IdempotencyKey" }]
+        requestBody:
+          required: true
+          content: { application/json: { schema: { $ref: "#/components/schemas/OperatingCoreMutation" } } }
+        responses:
+          "200": { $ref: "#/components/responses/OperatingCoreSuccess" }
+          "409": { $ref: "#/components/responses/IdempotencyConflict" }
+          4XX: { $ref: "#/components/responses/ApiError" }
+    SavedViewArchive:
+      parameters:
+        - name: savedViewId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      post:
+        operationId: setSavedViewArchiveState
+        summary: Archive or recover an actor-owned saved filter
+        tags: [Operating Core]
+        parameters: [{ $ref: "#/components/parameters/IdempotencyKey" }]
+        requestBody:
+          content: { application/json: { schema: { $ref: "#/components/schemas/ArchiveInput" } } }
+        responses:
+          "200": { $ref: "#/components/responses/OperatingCoreSuccess" }
+          "409": { $ref: "#/components/responses/IdempotencyConflict" }
+          4XX: { $ref: "#/components/responses/ApiError" }
   parameters:
     RequestId:
       name: X-Request-Id
@@ -391,6 +1347,42 @@ components:
         minLength: 8
         maxLength: 128
         pattern: "^[A-Za-z0-9._:-]+$"
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      description: Opaque keyset cursor returned by the previous page.
+      schema: { type: string, minLength: 1 }
+    Limit:
+      name: limit
+      in: query
+      required: false
+      schema: { type: integer, minimum: 1, maximum: 100, default: 50 }
+    ProjectId:
+      name: projectId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    WorkstreamId:
+      name: workstreamId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    WorkItemId:
+      name: workItemId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    DependencyId:
+      name: dependencyId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    UserId:
+      name: userId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
   headers:
     RequestId:
       required: true
@@ -408,7 +1400,141 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/ApiErrorBody"
+    OperatingCoreSuccess:
+      description: Authorized Operating Core result with an optional cursor page.
+      headers:
+        X-Request-Id:
+          $ref: "#/components/headers/RequestId"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/OperatingCoreResponse"
+    IdempotencyConflict:
+      description: IdempotencyConflict - the key was already used with a different request.
+      headers:
+        X-Request-Id:
+          $ref: "#/components/headers/RequestId"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ApiErrorBody"
   schemas:
+    OperatingCoreResponse:
+      type: object
+      description: Domain-specific result. Collection responses include page.nextCursor.
+      additionalProperties: true
+    OperatingCoreMutation:
+      type: object
+      additionalProperties: true
+      minProperties: 1
+    ArchiveInput:
+      type: object
+      additionalProperties: false
+      properties:
+        archived: { type: boolean, default: true }
+    ProjectInput:
+      type: object
+      additionalProperties: false
+      required: [name, ownerUserId]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 200 }
+        objective: { type: string, maxLength: 10000, default: "" }
+        templateType: { type: string, minLength: 1, maxLength: 100, default: general }
+        status: { type: string, enum: [planned, active, on_hold, completed, canceled], default: planned }
+        health: { type: string, enum: [unknown, on_track, at_risk, off_track], default: unknown }
+        priority: { type: string, enum: [low, medium, high, urgent], default: medium }
+        strategicArea: { type: string, maxLength: 200, default: "" }
+        ownerUserId: { type: string, format: uuid }
+        currentFocus: { type: string, maxLength: 10000, default: "" }
+        blockerSummary: { type: string, maxLength: 10000, default: "" }
+        nextDecision: { type: string, maxLength: 10000, default: "" }
+        nextAction: { type: string, maxLength: 10000, default: "" }
+    ProjectPatch:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        name: { type: string, minLength: 1, maxLength: 200 }
+        objective: { type: string, maxLength: 10000 }
+        templateType: { type: string, minLength: 1, maxLength: 100 }
+        status: { type: string, enum: [planned, active, on_hold, completed, canceled] }
+        health: { type: string, enum: [unknown, on_track, at_risk, off_track] }
+        priority: { type: string, enum: [low, medium, high, urgent] }
+        strategicArea: { type: string, maxLength: 200 }
+        ownerUserId: { type: string, format: uuid }
+        currentFocus: { type: string, maxLength: 10000 }
+        blockerSummary: { type: string, maxLength: 10000 }
+        nextDecision: { type: string, maxLength: 10000 }
+        nextAction: { type: string, maxLength: 10000 }
+    ProjectMemberInput:
+      type: object
+      additionalProperties: false
+      required: [userId, role]
+      properties:
+        userId: { type: string, format: uuid }
+        role: { type: string, enum: [owner, editor, viewer] }
+    HealthUpdateInput:
+      type: object
+      additionalProperties: false
+      required: [health, rationale]
+      properties:
+        health: { type: string, enum: [unknown, on_track, at_risk, off_track] }
+        rationale: { type: string, minLength: 1, maxLength: 5000 }
+        reportingPeriodStart: { type: string, format: date }
+        reportingPeriodEnd: { type: string, format: date }
+        sourceCutoff: { type: string, format: date-time }
+    WorkItemInput:
+      type: object
+      additionalProperties: false
+      required: [projectId, type, title]
+      properties:
+        projectId: { type: string, format: uuid }
+        workstreamId: { type: [string, "null"], format: uuid }
+        parentId: { type: [string, "null"], format: uuid }
+        type: { type: string, enum: [action, deliverable, follow_up, approval, research] }
+        title: { type: string, minLength: 1, maxLength: 300 }
+        description: { type: string, maxLength: 10000, default: "" }
+        ownerUserId: { type: [string, "null"], format: uuid }
+        status: { type: string, enum: [inbox, next, in_progress, waiting, done, canceled], default: inbox }
+        priority: { type: string, enum: [low, medium, high, urgent], default: medium }
+        dueAt: { type: [string, "null"], format: date-time }
+        position: { type: number, default: 0 }
+        labelIds:
+          type: array
+          maxItems: 50
+          items: { type: string, format: uuid }
+    WorkItemPatch:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        workstreamId: { type: [string, "null"], format: uuid }
+        parentId: { type: [string, "null"], format: uuid }
+        type: { type: string, enum: [action, deliverable, follow_up, approval, research] }
+        title: { type: string, minLength: 1, maxLength: 300 }
+        description: { type: string, maxLength: 10000 }
+        ownerUserId: { type: [string, "null"], format: uuid }
+        status: { type: string, enum: [inbox, next, in_progress, waiting, done, canceled] }
+        priority: { type: string, enum: [low, medium, high, urgent] }
+        dueAt: { type: [string, "null"], format: date-time }
+        position: { type: number }
+        labelIds:
+          type: array
+          maxItems: 50
+          items: { type: string, format: uuid }
+    WorkMoveInput:
+      type: object
+      additionalProperties: false
+      required: [status, position]
+      properties:
+        status: { type: string, enum: [inbox, next, in_progress, waiting, done, canceled] }
+        position: { type: number }
+    MergeInput:
+      type: object
+      additionalProperties: false
+      required: [intoId]
+      properties:
+        intoId: { type: string, format: uuid }
     HealthResponse:
       type: object
       additionalProperties: false
