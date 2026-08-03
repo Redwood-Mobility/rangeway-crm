@@ -29,12 +29,16 @@ const composeProbe = spawnSync("docker", ["compose", "version"], {
   encoding: "utf8",
 });
 const hasDockerCompose = composeProbe.status === 0;
+// The migrator sits behind the `operations` profile so it never runs as part of
+// the default runtime. Resolving without that profile would correctly omit it,
+// and these cases assert the complete topology including it.
 const resolvedCompose = hasDockerCompose
   ? (JSON.parse(
-      execFileSync("docker", ["compose", "config", "--format", "json"], {
-        cwd: repositoryRoot,
-        encoding: "utf8",
-      }),
+      execFileSync(
+        "docker",
+        ["compose", "--profile", "operations", "config", "--format", "json"],
+        { cwd: repositoryRoot, encoding: "utf8" },
+      ),
     ) as {
       services: Record<string, Record<string, unknown>>;
       volumes?: Record<string, unknown>;

@@ -14,7 +14,7 @@ Against a live PostgreSQL 17 instance, with every migration applied in order:
 |---|---|
 | Migrations `0001`–`0014` apply idempotently | pass |
 | Migrations `0001`–`0013` byte-identical after later work | pass |
-| Full test suite | 34 files, 424 passed, 13 skipped, 0 failed |
+| Full test suite | 34 files, 432 passed, 5 skipped, 0 failed |
 | `npm run typecheck` | pass |
 | `npm run build` | pass |
 | Redocly OpenAPI lint | pass |
@@ -22,18 +22,24 @@ Against a live PostgreSQL 17 instance, with every migration applied in order:
 | Browser journeys | Today, Command Center, Projects, Project Room, Gates, Board, List, Calendar, Agents |
 | Responsive | no horizontal overflow at 320 px; lanes stack rather than shrink |
 
-The 13 skips are 8 Docker Compose cases and 5 Linux `flock`/systemd cases. They
-require Docker and a Linux host, neither of which exists on this macOS machine.
-**No PostgreSQL test is skipped.**
+Docker is now available through Colima (Docker 29.5.2, Ubuntu 24.04 guest), so
+the Compose topology cases run: 33 pass, including the full five-service
+topology once the `operations` profile is activated. The production image builds
+and runs non-root as uid 1000 on Node 22.
+
+The 5 remaining skips are all in `deploy/deployment-coordinator.test.ts` and
+need a Linux `flock` and real systemd transient cgroups **on the host running the
+tests**. Colima provides a Linux VM for containers, but the suite executes on
+macOS, so these stay skipped here and must run on the Ubuntu VPS.
+**No PostgreSQL test and no Compose test is skipped.**
 
 ## Blocked — cannot be completed from here
 
 These are not incomplete work; they are gates that require resources this
 machine does not have.
 
-1. **Docker and Compose.** Docker is not installed. The eight Compose cases, the
-   image build, and the container topology checks cannot run. Colima or Docker
-   Desktop on the target host resolves this.
+1. **Host-level systemd and `flock`.** Five deployment-coordinator cases need
+   them on the test host. They can only run on the Ubuntu VPS.
 2. **Google OAuth credentials.** `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` and
    `GOOGLE_REDIRECT_URI` for `atlas.rangeway.app` have not been issued. Google
    sign-in is therefore unverified end to end. The Workspace integration is built
@@ -48,8 +54,8 @@ machine does not have.
 
 Each step must pass before the next begins.
 
-1. Install a container runtime on the VPS and run the full suite there with zero
-   skips. Any remaining skip must be explained, not accepted.
+1. Run the full suite on the Ubuntu VPS, where the five coordinator cases can
+   execute. Any remaining skip must be explained, not accepted.
 2. Issue Google OAuth credentials for the production origin and verify sign-in
    against the deployed application.
 3. Back up the preserved V1 volumes — `rangeway-crm_crm-data` and
