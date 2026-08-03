@@ -241,6 +241,7 @@ describe("least-privilege PostgreSQL roles", () => {
           ATLAS_MIGRATOR_PASSWORD: "migrator-upgrade-password-02",
           ATLAS_WEB_PASSWORD: "web-upgrade-password-000003",
           ATLAS_WORKER_PASSWORD: "worker-upgrade-password-0004",
+          PGAPPNAME: "atlas-deploy-10000000-0000-4000-8000-000000000001",
         },
       });
       expect(initialized.status, `${initialized.stdout}\n${initialized.stderr}`).toBe(0);

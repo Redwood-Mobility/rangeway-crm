@@ -1112,7 +1112,7 @@ app.delete("/api/tasks/:id", (req, res) => {
 app.use((error: unknown, req: express.Request, res: express.Response, next: express.NextFunction) => {
   if (
     req.originalUrl.startsWith("/api/v2") ||
-    (req.path.startsWith("/api/") && isTrustedJsonParserError(error))
+    ((req.path === "/api" || req.path.startsWith("/api/")) && isTrustedJsonParserError(error))
   ) {
     v2ErrorHandler(error, req, res, next);
     return;

@@ -14,7 +14,7 @@ import { ApiError } from "../../platform/http/api-error.js";
 
 const rangewayOrganizationId = "00000000-0000-4000-8000-000000000001";
 
-const localLoginSchema = z.object({
+const localLoginSchema = z.strictObject({
   email: z.email().transform((email) => email.toLowerCase()),
   password: z.string().min(1),
 });

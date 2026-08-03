@@ -1,5 +1,5 @@
 import { spawn, spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   chmodSync,
   copyFileSync,
@@ -24,6 +24,10 @@ const tokenTwo = "20000000-0000-4000-8000-000000000001";
 const release = "a".repeat(40);
 const realFlockPath = spawnSync("/bin/sh", ["-c", "command -v flock"], { encoding: "utf8" })
   .stdout.trim();
+const hasSystemdManager = process.getuid?.() === 0 &&
+  spawnSync("/bin/sh", ["-c", "command -v systemd-run >/dev/null && systemctl show-environment >/dev/null"], {
+    encoding: "utf8",
+  }).status === 0;
 
 afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
@@ -78,6 +82,8 @@ function fixture() {
   const guardianUnit = path.join(root, "atlas-v2-deployment-guardian.service");
   const backupTool = path.join(root, "backup.sh");
   const restoreTool = path.join(root, "restore-test.sh");
+  const roleInitializer = path.join(root, "init-roles.sh");
+  const caddyConfig = path.join(root, "Caddyfile");
   const candidateStage = path.join(root, "candidate-stage");
   mkdirSync(bin, { recursive: true });
   mkdirSync(remote, { recursive: true });
@@ -88,7 +94,12 @@ function fixture() {
   writeFileSync(guardianUnit, "[Unit]\nDescription=Atlas test guardian\n");
   executable(backupTool, '#!/usr/bin/env bash\nATLAS_BACKUP_FORMAT="atlas-v2-postgres-artifacts-v1"\nexit 0\n');
   executable(restoreTool, "#!/usr/bin/env bash\nexit 0\n");
-  writeFileSync(path.join(candidateStage, "atlas-release.tar"), "release-archive\n");
+  executable(roleInitializer, "#!/usr/bin/env bash\nexit 0\n");
+  writeFileSync(caddyConfig, "atlas.rangeway.app { reverse_proxy web:8080 }\n");
+  const archiveInput = path.join(root, "archive-input");
+  mkdirSync(archiveInput);
+  writeFileSync(path.join(archiveInput, "candidate.txt"), "exact candidate bytes\n");
+  expect(spawnSync("tar", ["-cf", path.join(candidateStage, "atlas-release.tar"), "-C", archiveInput, "."]).status).toBe(0);
   writeFileSync(path.join(candidateStage, "atlas.env"), "NODE_ENV=production\n");
   const bundleArguments = [
     release,
@@ -96,6 +107,8 @@ function fixture() {
     sha256(guardianUnit),
     sha256(backupTool),
     sha256(restoreTool),
+    sha256(roleInitializer),
+    sha256(caddyConfig),
     candidateStage,
     sha256(path.join(candidateStage, "atlas-release.tar")),
     sha256(path.join(candidateStage, "atlas.env")),
@@ -117,7 +130,17 @@ if [[ "$*" == *"label=com.docker.compose.project=atlas-v2"* && "$*" == *"label=c
   exit 0
 fi
 if [[ "$*" == *"label=com.docker.compose.project=atlas-v2"* && "$*" == *"label=com.docker.compose.service=migrator"* ]]; then
-  printf 'migrator-one-off|atlas-v2|migrator\n'
+  if [[ ! -f "${root}/migrator-stopped" ]]; then
+    if [[ "$*" == *".Label"* ]]; then
+      printf 'migrator-one-off|atlas-v2|migrator\n'
+    else
+      printf 'migrator-one-off\n'
+    fi
+  fi
+  exit 0
+fi
+if [[ "$*" == "stop -- migrator-one-off" ]]; then
+  : > "${root}/migrator-stopped"
   exit 0
 fi
 if [[ "$*" == *"compose --profile operations run --rm migrator"* \
@@ -134,9 +157,11 @@ set -euo pipefail
 printf 'systemctl %s\n' "$*" >> "${log}"
 case "$*" in
   "enable --now atlas-v2-deployment-guardian.service"|"restart atlas-v2-deployment-guardian.service")
+    : > "${root}/guardian-active"
     "${coordinator}" guardian-once
     ;;
-  "is-active --quiet atlas-v2-deployment-guardian.service") exit 0 ;;
+  "is-active --quiet atlas-v2-deployment-guardian.service") [[ -f "${root}/guardian-active" ]] ;;
+  "disable --now atlas-v2-deployment-guardian.service") /bin/unlink "${root}/guardian-active" 2>/dev/null || true ;;
   *) exit 0 ;;
 esac
 `);
@@ -150,11 +175,14 @@ esac
     ATLAS_COORDINATOR_STATE_ROOT: stateRoot,
     ATLAS_COORDINATOR_CONFIG_FILE: config,
     ATLAS_COORDINATOR_GLOBAL_LOCK: path.join(root, "global.lock"),
-    ATLAS_COORDINATOR_INSTALL_LOCK: path.join(root, "install.lock"),
+      ATLAS_COORDINATOR_INSTALL_LOCK: path.join(root, "install.lock"),
+      ATLAS_COORDINATOR_ACTION_CLEANUP_LOCK: path.join(root, "action-cleanup.lock"),
     ATLAS_COORDINATOR_PATH: coordinator,
     ATLAS_GUARDIAN_UNIT_PATH: guardianUnit,
     ATLAS_BACKUP_TOOL_PATH: backupTool,
     ATLAS_RESTORE_TOOL_PATH: restoreTool,
+    ATLAS_ROLE_INITIALIZER_PATH: roleInitializer,
+    ATLAS_CADDY_CONFIG_PATH: caddyConfig,
     ATLAS_COORDINATOR_NOW_EPOCH: "100",
   };
   const run = (args: string[], overrides: NodeJS.ProcessEnv = {}) =>
@@ -177,6 +205,8 @@ esac
     guardianUnit,
     backupTool,
     restoreTool,
+    roleInitializer,
+    caddyConfig,
     candidateStage,
     bundleArguments,
     environment,
@@ -197,11 +227,15 @@ describe("host-wide durable deployment coordinator", () => {
       "guardian_unit_hash",
       "backup_tool_hash",
       "restore_tool_hash",
+      "role_initializer_hash",
+      "caddy_config_hash",
     ]) {
       expect(source).toContain(stateField);
     }
     expect(source).toContain("BACKUP_TOOL_PATH");
     expect(source).toContain("RESTORE_TOOL_PATH");
+    expect(source).toContain("ROLE_INITIALIZER_PATH");
+    expect(source).toContain("CADDY_CONFIG_PATH");
     expect(source).not.toMatch(/\.\/deploy\/(?:backup|restore-test)\.sh/);
   });
 
@@ -214,6 +248,19 @@ describe("host-wide durable deployment coordinator", () => {
     expect(source).toMatch(/kill -KILL -- "-\$\{[^}]+\}"/);
     expect(source).toMatch(/docker (?:rm -f|stop)[\s\S]*atlas\.deployment-token/);
     expect(source).toContain("pg_terminate_backend");
+    expect(source).toContain("ACTION_CLEANUP_LOCK");
+    expect(source).toMatch(/flock -x 6/);
+  });
+
+  it("uses a token-named systemd cgroup in production and a durable local reaper harness", () => {
+    const source = readFileSync(coordinatorSource, "utf8");
+
+    expect(source).toContain("systemd-run");
+    expect(source).toContain("ExitType=cgroup");
+    expect(source).toContain("KillMode=control-group");
+    expect(source).toContain("action_unit");
+    expect(source).toMatch(/systemctl stop[\s\S]*action_unit/);
+    expect(source).toContain("action-reaper");
   });
 
   it("rejects a concurrent deploy or recovery owner while one exact token is active", () => {
@@ -247,6 +294,7 @@ describe("host-wide durable deployment coordinator", () => {
     expect(f.begin().status).toBe(0);
     expect(f.run(["transition", tokenOne, "prepared", "quiesced"]).status).toBe(0);
     expect(f.run(["transition", tokenOne, "quiesced", "syncing"]).status).toBe(0);
+    expect(f.run(["guard", tokenOne, "syncing", "sync-release"]).status).toBe(0);
     expect(f.run(["transition", tokenOne, "syncing", "synced"]).status).toBe(0);
     expect(f.run(["candidate", tokenOne, release]).status).toBe(0);
     expect(f.run(["transition", tokenOne, "synced", "boundary"]).status).toBe(0);
@@ -279,6 +327,7 @@ describe("host-wide durable deployment coordinator", () => {
     expect(f.begin().status).toBe(0);
     expect(f.run(["transition", tokenOne, "prepared", "quiesced"]).status).toBe(0);
     expect(f.run(["transition", tokenOne, "quiesced", "syncing"]).status).toBe(0);
+    expect(f.run(["guard", tokenOne, "syncing", "sync-release"]).status).toBe(0);
     expect(f.run(["transition", tokenOne, "syncing", "synced"]).status).toBe(0);
     expect(f.run(["candidate", tokenOne, release]).status).toBe(0);
     expect(f.run(["transition", tokenOne, "synced", "boundary"]).status).toBe(0);
@@ -287,8 +336,11 @@ describe("host-wide durable deployment coordinator", () => {
     expect(readFileSync(path.join(f.remote, ".atlas-release"), "utf8")).toBe(`${release}\n`);
     expect(existsSync(path.join(f.stateRoot, "active.state"))).toBe(false);
     const completed = readdirSync(path.join(f.stateRoot, "history"));
-    expect(completed).toEqual([`${tokenOne}.complete.state`]);
-    expect(readFileSync(path.join(f.stateRoot, "history", completed[0]!), "utf8"))
+    expect(completed).toEqual(expect.arrayContaining([
+      `${tokenOne}.complete.state`,
+      `${tokenOne}.previous-release`,
+    ]));
+    expect(readFileSync(path.join(f.stateRoot, "history", `${tokenOne}.complete.state`), "utf8"))
       .toContain("status=complete");
     expect(f.events()).toContain("systemctl disable --now atlas-v2-deployment-guardian.service");
   });
@@ -311,6 +363,20 @@ describe("host-wide durable deployment coordinator", () => {
     }).status).not.toBe(0);
     expect(failed.state()).toContain("status=recovery_failed");
     expect(failed.begin(tokenTwo).stderr).toMatch(/operator resolution/i);
+  });
+
+  it("durably retires a trusted recovered state before admitting a replacement deployment", () => {
+    const f = fixture();
+    expect(f.begin().status).toBe(0);
+    expect(f.run(["guardian-once"], { ATLAS_COORDINATOR_NOW_EPOCH: "111" }).status).toBe(0);
+    expect(f.state()).toContain("status=recovered");
+
+    expect(f.run(["retire-recovered"]).status).toBe(0);
+    expect(existsSync(path.join(f.stateRoot, "active.state"))).toBe(false);
+    expect(readdirSync(path.join(f.stateRoot, "history")))
+      .toContain(`${tokenOne}.recovered.state`);
+    expect(f.begin(tokenTwo).status).toBe(0);
+    expect(f.state()).toContain(`token=${tokenTwo}`);
   });
 
   it("rejects expired ownership instead of resurrecting it through renew or assert", () => {
@@ -387,7 +453,70 @@ describe("host-wide durable deployment coordinator", () => {
     expect(f.state()).toContain("action_name=none");
     expect(f.events()).toContain("docker start web-container");
     expect(f.events()).toContain("docker start worker-container");
+    expect(f.events()).toContain(`application_name = 'atlas-deploy-${tokenOne}'`);
     await expectMutationStopped(mutationFile);
+  });
+
+  it("keeps a reaper leader alive and kills an orphan descendant after the direct action exits", async () => {
+    const f = fixture();
+    expect(f.begin().status).toBe(0);
+    expect(f.run(["transition", tokenOne, "prepared", "quiesced"]).status).toBe(0);
+    expect(f.run(["transition", tokenOne, "quiesced", "syncing"]).status).toBe(0);
+
+    const mutationFile = path.join(f.root, "orphan-mutations.log");
+    const guarded = spawn("/bin/bash", [f.coordinator, "guard", tokenOne, "syncing", "sync-release"], {
+      env: {
+        ...f.environment,
+        ATLAS_COORDINATOR_TEST_ACTION: "sync-release",
+        ATLAS_COORDINATOR_TEST_MUTATION_FILE: mutationFile,
+        ATLAS_COORDINATOR_TEST_ORPHAN: "1",
+      },
+      stdio: "ignore",
+    });
+    await waitForMutation(mutationFile);
+    const failed = f.run(["fail", tokenOne]);
+    expect(failed.status, failed.stderr).toBe(0);
+
+    expect(await waitForExit(guarded)).not.toBe(0);
+    await expectMutationStopped(mutationFile);
+  });
+
+  it("restores the exact prior release tree and marker after a post-exchange failure", () => {
+    const f = fixture();
+    writeFileSync(path.join(f.remote, ".atlas-release"), `${release}\n`);
+    writeFileSync(path.join(f.remote, "prior.txt"), "exact prior bytes\n");
+    expect(f.begin().status).toBe(0);
+    expect(f.run(["transition", tokenOne, "prepared", "quiesced"]).status).toBe(0);
+    expect(f.run(["transition", tokenOne, "quiesced", "syncing"]).status).toBe(0);
+
+    const promoted = f.run(["guard", tokenOne, "syncing", "sync-release"], {
+      ATLAS_COORDINATOR_SYNC_FAULT: "after-exchange",
+    });
+    expect(promoted.status).not.toBe(0);
+    expect(f.run(["guardian-once"], { ATLAS_COORDINATOR_NOW_EPOCH: "111" }).status).toBe(0);
+
+    expect(f.state()).toContain("status=recovered");
+    expect(readFileSync(path.join(f.remote, ".atlas-release"), "utf8")).toBe(`${release}\n`);
+    expect(readFileSync(path.join(f.remote, "prior.txt"), "utf8")).toBe("exact prior bytes\n");
+    expect(existsSync(path.join(f.remote, "candidate.txt"))).toBe(false);
+  });
+
+  it("archives the exact previous release tree only after successful completion", () => {
+    const f = fixture();
+    writeFileSync(path.join(f.remote, ".atlas-release"), `${release}\n`);
+    writeFileSync(path.join(f.remote, "prior.txt"), "exact prior bytes\n");
+    expect(f.begin().status).toBe(0);
+    expect(f.run(["transition", tokenOne, "prepared", "quiesced"]).status).toBe(0);
+    expect(f.run(["transition", tokenOne, "quiesced", "syncing"]).status).toBe(0);
+    expect(f.run(["guard", tokenOne, "syncing", "sync-release"]).status).toBe(0);
+    expect(f.run(["transition", tokenOne, "syncing", "synced"]).status).toBe(0);
+    expect(f.run(["candidate", tokenOne, release]).status).toBe(0);
+    expect(f.run(["transition", tokenOne, "synced", "boundary"]).status).toBe(0);
+    expect(f.run(["complete", tokenOne, release]).status).toBe(0);
+
+    const archivedTree = path.join(f.stateRoot, "history", `${tokenOne}.previous-release`);
+    expect(readFileSync(path.join(archivedTree, "prior.txt"), "utf8")).toBe("exact prior bytes\n");
+    expect(readFileSync(path.join(archivedTree, ".atlas-release"), "utf8")).toBe(`${release}\n`);
   });
 
   it("kills a TERM-resistant migration process tree when its durable phase changes", async () => {
@@ -409,11 +538,7 @@ describe("host-wide durable deployment coordinator", () => {
       stdio: "ignore",
     });
     await waitForMutation(mutationFile);
-    writeFileSync(
-      path.join(f.stateRoot, "active.state"),
-      f.state().replace("status=boundary", "status=failed_closed"),
-      { mode: 0o600 },
-    );
+    expect(f.run(["fail", tokenOne]).status).toBe(0);
 
     expect(await waitForExit(guarded)).not.toBe(0);
     expect(f.state()).toContain("status=failed_closed");
@@ -519,6 +644,40 @@ describe("host-wide durable deployment coordinator", () => {
       } finally {
         guardian.kill("SIGTERM");
         await new Promise((resolve) => guardian.once("exit", resolve));
+      }
+    },
+  );
+
+  it.skipIf(!hasSystemdManager)(
+    "uses a real transient systemd cgroup that survives direct-leader exit and kills its descendants",
+    async () => {
+      const root = realpathSync(mkdtempSync(path.join(os.tmpdir(), "atlas-systemd-action-test-")));
+      roots.push(root);
+      const mutationFile = path.join(root, "mutations.log");
+      const script = path.join(root, "orphan.sh");
+      executable(script, `#!/usr/bin/env bash
+(trap '' TERM; while true; do printf x >> '${mutationFile}'; /bin/sleep 0.02; done) &
+exit 0
+`);
+      const unit = `atlas-v2-deploy-test-${randomUUID()}.service`;
+      const started = spawnSync("systemd-run", [
+        `--unit=${unit}`,
+        "--service-type=exec",
+        "--property=ExitType=cgroup",
+        "--property=KillMode=control-group",
+        "--property=TimeoutStopSec=2s",
+        script,
+      ], { encoding: "utf8" });
+      expect(started.status, started.stderr).toBe(0);
+      try {
+        await waitForMutation(mutationFile);
+        expect(spawnSync("systemctl", ["is-active", "--quiet", unit]).status).toBe(0);
+        expect(spawnSync("systemctl", ["stop", unit]).status).toBe(0);
+        expect(spawnSync("systemctl", ["is-active", "--quiet", unit]).status).not.toBe(0);
+        await expectMutationStopped(mutationFile);
+      } finally {
+        spawnSync("systemctl", ["stop", unit]);
+        spawnSync("systemctl", ["reset-failed", unit]);
       }
     },
   );

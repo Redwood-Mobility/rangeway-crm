@@ -87,7 +87,6 @@ services:
       ATLAS_WORKER_PASSWORD: ${ATLAS_WORKER_PASSWORD:-}
     volumes:
       - atlas-db:/var/lib/postgresql/data
-      - ./deploy/postgres/init-roles.sh:/docker-entrypoint-initdb.d/001-atlas-roles.sh:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready --username=atlas --dbname=atlas"]
       interval: 10s
@@ -108,7 +107,7 @@ services:
       - "80:80"
       - "443:443"
     volumes:
-      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - /usr/local/libexec/atlas-v2/Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy-data:/data
       - caddy-config:/config
     mem_limit: 128m

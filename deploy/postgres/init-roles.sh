@@ -7,6 +7,9 @@ set -euo pipefail
 : "${ATLAS_MIGRATOR_PASSWORD:?ATLAS_MIGRATOR_PASSWORD is required}"
 : "${ATLAS_WEB_PASSWORD:?ATLAS_WEB_PASSWORD is required}"
 : "${ATLAS_WORKER_PASSWORD:?ATLAS_WORKER_PASSWORD is required}"
+: "${PGAPPNAME:?PGAPPNAME is required}"
+[[ "${PGAPPNAME}" =~ ^atlas-deploy-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] \
+  || { echo "PGAPPNAME must identify the exact Atlas deployment token." >&2; exit 1; }
 [[ "${POSTGRES_USER}" == "atlas" ]] \
   || { echo "Atlas bootstrap must run as the atlas database owner." >&2; exit 1; }
 password_names=(

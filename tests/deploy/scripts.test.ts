@@ -70,6 +70,8 @@ type DeployFixture = {
   guardianUnit: string;
   backupTool: string;
   restoreTool: string;
+  roleInitializer: string;
+  caddyConfig: string;
   coordinatorStage: string;
   coordinatorStateRoot: string;
   coordinatorConfig: string;
@@ -87,6 +89,8 @@ function createDeployFixture(): DeployFixture {
   const guardianUnit = path.join(root, "atlas-v2-deployment-guardian.service");
   const backupTool = path.join(root, "immutable-tools", "backup.sh");
   const restoreTool = path.join(root, "immutable-tools", "restore-test.sh");
+  const roleInitializer = path.join(root, "immutable-tools", "init-roles.sh");
+  const caddyConfig = path.join(root, "immutable-tools", "Caddyfile");
   const coordinatorStage = path.join(root, "coordinator-stage");
   const coordinatorStateRoot = path.join(root, "coordinator-state");
   const coordinatorConfig = path.join(root, "coordinator.conf");
@@ -108,6 +112,9 @@ function createDeployFixture(): DeployFixture {
   );
   copyFileSync(path.join(sourceRoot, "deploy/backup.sh"), path.join(repository, "deploy/backup.sh"));
   copyFileSync(path.join(sourceRoot, "deploy/restore-test.sh"), path.join(repository, "deploy/restore-test.sh"));
+  mkdirSync(path.join(repository, "deploy/postgres"), { recursive: true });
+  copyFileSync(path.join(sourceRoot, "deploy/postgres/init-roles.sh"), path.join(repository, "deploy/postgres/init-roles.sh"));
+  copyFileSync(path.join(sourceRoot, "deploy/Caddyfile"), path.join(repository, "deploy/Caddyfile"));
   copyFileSync(path.join(sourceRoot, "deploy/deployment-coordinator.sh"), coordinator);
   chmodSync(coordinator, 0o755);
   copyFileSync(path.join(sourceRoot, "deploy/systemd/atlas-v2-deployment-guardian.service"), guardianUnit);
@@ -115,6 +122,9 @@ function createDeployFixture(): DeployFixture {
   chmodSync(backupTool, 0o755);
   copyFileSync(path.join(sourceRoot, "deploy/restore-test.sh"), restoreTool);
   chmodSync(restoreTool, 0o755);
+  copyFileSync(path.join(sourceRoot, "deploy/postgres/init-roles.sh"), roleInitializer);
+  chmodSync(roleInitializer, 0o755);
+  copyFileSync(path.join(sourceRoot, "deploy/Caddyfile"), caddyConfig);
   writeFileSync(path.join(repository, "package.json"), "{}\n");
   writeFileSync(path.join(repository, "openapi/atlas-v2.yaml"), "openapi: 3.1.0\n");
   const environmentFile = path.join(repository, ".env.production");
@@ -129,6 +139,7 @@ case "$*" in
   "rev-parse --verify HEAD") printf '%s\\n' '${releaseCommit}'; exit 0 ;;
 esac
 if [[ "\${1:-}" == "archive" ]]; then
+  [[ "\${FAKE_GIT_ARCHIVE_FAIL:-0}" == "1" ]] && exit 41
   output=""
   for argument in "$@"; do
     case "\${argument}" in --output=*) output="\${argument#--output=}" ;; esac
@@ -158,7 +169,7 @@ destination="\${destination#*:}"
 mkdir -p -- "\${destination}"
 for argument in "$@"; do
   case "\${argument}" in
-    */deployment-coordinator.sh|*/atlas-v2-deployment-guardian.service|*/backup.sh|*/restore-test.sh|*/atlas-release.tar|*/atlas.env)
+    */deployment-coordinator.sh|*/atlas-v2-deployment-guardian.service|*/backup.sh|*/restore-test.sh|*/init-roles.sh|*/Caddyfile|*/atlas-release.tar|*/atlas.env)
       /bin/cp "\${argument}" "\${destination}/"
       ;;
   esac
@@ -194,9 +205,11 @@ if [[ "$*" == "compose ps -q db" ]]; then printf '%s\\n' db-container; exit 0; f
 if [[ "$*" == "compose ps -q web" ]]; then printf '%s\\n' web-container; exit 0; fi
 if [[ "$*" == "compose ps -q worker" ]]; then printf '%s\\n' worker-container; exit 0; fi
 if [[ "$*" == *"State.Health.Status"* ]]; then printf '%s\\n' healthy; exit 0; fi
+if [[ "$*" == *"pg_stat_activity"* ]]; then printf '0\\n'; exit 0; fi
 if [[ "$*" == *"--profile operations run"* && "$*" == *"migrator"* \
   && "$*" != *"verify-runtime-permissions"* && "\${FAKE_MIGRATION_FAIL:-0}" == "1" ]]; then exit 59; fi
-if [[ "$*" == *"compose exec -T db /docker-entrypoint-initdb.d/001-atlas-roles.sh"* && "\${FAKE_ROLE_ROTATION_FAIL:-0}" == "1" ]]; then exit 60; fi
+if [[ "$*" == *"compose exec -T"* && "$*" == *"PGAPPNAME=atlas-deploy-"* && "$*" == *"db bash -s --"* && "\${FAKE_ROLE_ROTATION_FAIL:-0}" == "1" ]]; then exit 60; fi
+if [[ "$*" == "compose build web worker" && "\${FAKE_BUILD_DB_FAIL:-0}" == "1" ]]; then exit 61; fi
 exit 0`);
   fakeTool(binDirectory, "systemctl", `
 printf '%s\\n' "$*" >> "\${FAKE_LOG_DIR}/systemctl.log"
@@ -257,6 +270,8 @@ exit 64`);
     guardianUnit,
     backupTool,
     restoreTool,
+    roleInitializer,
+    caddyConfig,
     coordinatorStage,
     coordinatorStateRoot,
     coordinatorConfig,
@@ -284,10 +299,13 @@ function deploy(fixture: DeployFixture, overrides: NodeJS.ProcessEnv = {}) {
       ATLAS_COORDINATOR_INSTALL_LOCK: fixture.coordinatorInstallLock,
       ATLAS_BACKUP_TOOL_PATH: fixture.backupTool,
       ATLAS_RESTORE_TOOL_PATH: fixture.restoreTool,
+      ATLAS_ROLE_INITIALIZER_PATH: fixture.roleInitializer,
+      ATLAS_CADDY_CONFIG_PATH: fixture.caddyConfig,
       ATLAS_COORDINATOR_TEST_MODE: "1",
       ATLAS_COORDINATOR_STATE_ROOT: fixture.coordinatorStateRoot,
       ATLAS_COORDINATOR_CONFIG_FILE: fixture.coordinatorConfig,
       ATLAS_COORDINATOR_GLOBAL_LOCK: path.join(fixture.root, "coordinator.lock"),
+      ATLAS_COORDINATOR_ACTION_CLEANUP_LOCK: path.join(fixture.root, "action-cleanup.lock"),
       ATLAS_COORDINATOR_NOW_EPOCH: "100",
       FAKE_GUARDIAN_UNIT_PATH: fixture.guardianUnit,
       ...overrides,
@@ -351,10 +369,14 @@ describe("deploy.sh behavior", () => {
     expect(deploySource).toContain("deploy/systemd/atlas-v2-deployment-guardian.service");
     expect(deploySource).toContain("deploy/backup.sh");
     expect(deploySource).toContain("deploy/restore-test.sh");
+    expect(deploySource).toContain("deploy/postgres/init-roles.sh");
+    expect(deploySource).toContain("deploy/Caddyfile");
     expect(deploySource).toContain("COORDINATOR_SHA256");
     expect(deploySource).toContain("GUARDIAN_UNIT_SHA256");
     expect(deploySource).toContain("BACKUP_SHA256");
     expect(deploySource).toContain("RESTORE_SHA256");
+    expect(deploySource).toContain("ROLE_INITIALIZER_SHA256");
+    expect(deploySource).toContain("CADDY_CONFIG_SHA256");
     expect(deploySource).toMatch(/createHash\("sha256"\)/);
     expect(deploySource).toContain("sha256sum --");
     expect(deploySource).toContain("systemctl cat --no-pager --full");
@@ -386,7 +408,7 @@ describe("deploy.sh behavior", () => {
     );
   });
 
-  it.each(["coordinator", "unit", "backup", "restore"])(
+  it.each(["coordinator", "unit", "backup", "restore", "roles", "caddy"])(
     "replaces and verifies a stale or tampered installed %s before begin",
     (target) => {
       const fixture = createDeployFixture();
@@ -396,13 +418,25 @@ describe("deploy.sh behavior", () => {
           ? fixture.guardianUnit
           : target === "backup"
             ? fixture.backupTool
-            : fixture.restoreTool;
+          : target === "restore"
+            ? fixture.restoreTool
+            : target === "roles"
+              ? fixture.roleInitializer
+              : fixture.caddyConfig;
       const reviewed = target === "coordinator"
         ? path.join(sourceRoot, "deploy/deployment-coordinator.sh")
         : target === "unit"
           ? path.join(sourceRoot, "deploy/systemd/atlas-v2-deployment-guardian.service")
-          : path.join(sourceRoot, `deploy/${target === "backup" ? "backup.sh" : "restore-test.sh"}`);
-      writeFileSync(installed, "tampered-installed-bytes\n", { mode: target === "unit" ? 0o644 : 0o755 });
+          : target === "backup"
+            ? path.join(sourceRoot, "deploy/backup.sh")
+          : target === "restore"
+            ? path.join(sourceRoot, "deploy/restore-test.sh")
+            : target === "roles"
+              ? path.join(sourceRoot, "deploy/postgres/init-roles.sh")
+              : path.join(sourceRoot, "deploy/Caddyfile");
+      writeFileSync(installed, "tampered-installed-bytes\n", {
+        mode: target === "unit" || target === "caddy" ? 0o644 : 0o755,
+      });
 
       const result = deploy(fixture);
 
@@ -435,6 +469,8 @@ describe("deploy.sh behavior", () => {
     expect(bootstrapSource).not.toMatch(/useradd|usermod|docker group|sudoers|NOPASSWD/i);
     expect(bootstrapSource).toMatch(/-o root -g root[\s\S]*\/opt\/atlas-v2/);
     expect(bootstrapSource).toMatch(/-o root -g root[\s\S]*\/var\/backups\/atlas-v2/);
+    expect(bootstrapSource).toContain("atlas-v2-deployment-install.lock");
+    expect(bootstrapSource).toContain("flock -x 9");
     expect(deploySource).toContain('REMOTE_USER="${ATLAS_USER:-root}"');
     expect(deploySource).toMatch(/REMOTE_USER.*root/);
     expect(deploySource).toMatch(/id -u/);
@@ -451,6 +487,24 @@ describe("deploy.sh behavior", () => {
     expect(deploySource).not.toMatch(/rsync[^\n]*REMOTE_DIR/);
     expect(coordinatorSource).toContain("sync-release");
     expect(coordinatorSource).toContain("RENAME_EXCHANGE");
+  });
+
+  it("installs the narrow local-stage cleanup trap before archive, copy, hashing, or transfer", () => {
+    const deploySource = readFileSync(path.join(sourceRoot, "deploy/deploy.sh"), "utf8");
+    const temporaryPosition = deploySource.indexOf('LOCAL_CANDIDATE_STAGE="$(mktemp');
+    const trapPosition = deploySource.indexOf("trap cleanup_local_candidate", temporaryPosition);
+    expect(temporaryPosition).toBeGreaterThan(0);
+    expect(trapPosition).toBeGreaterThan(temporaryPosition);
+    for (const fallibleOperation of ["git archive", 'install -m 0600 "${ENV_FILE}"', "RELEASE_ARCHIVE_SHA256", "rsync -az"]) {
+      expect(trapPosition).toBeLessThan(deploySource.indexOf(fallibleOperation, temporaryPosition));
+    }
+  });
+
+  it("documents no direct role, image, or migration maintenance bypass", () => {
+    const runbook = readFileSync(path.join(sourceRoot, "docs/runbooks/atlas-v2-operations.md"), "utf8");
+    const migrationSection = runbook.slice(runbook.indexOf("## Migrations"), runbook.indexOf("## One-time production owner"));
+    expect(migrationSection).not.toMatch(/docker compose (?:build|exec|run)/);
+    expect(migrationSection).toMatch(/deploy(?:ment)? coordinator|deploy\.sh/i);
   });
 
   it("fences every long mutation and writer start with the exact token and phase", () => {
@@ -514,6 +568,30 @@ describe("deploy.sh behavior", () => {
     expect(source).not.toMatch(/echo.*password_value/);
   });
 
+  it("executes the installed reviewed role initializer with the exact token application name", () => {
+    const fixture = createDeployFixture();
+    const result = deploy(fixture);
+
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+    const dockerLog = readFileSync(path.join(fixture.logDirectory, "docker.log"), "utf8");
+    expect(dockerLog).toContain(`PGAPPNAME=atlas-deploy-`);
+    expect(dockerLog).toContain("db bash -s --");
+    expect(dockerLog).not.toContain("/docker-entrypoint-initdb.d/001-atlas-roles.sh");
+  });
+
+  it("force-recreates Caddy so an upgraded immutable config bind uses the new inode", () => {
+    const fixture = createDeployFixture();
+    writeFileSync(fixture.caddyConfig, "stale-caddy-bytes\n", { mode: 0o644 });
+    const result = deploy(fixture);
+
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+    expect(readFileSync(fixture.caddyConfig, "utf8")).toBe(
+      readFileSync(path.join(sourceRoot, "deploy/Caddyfile"), "utf8"),
+    );
+    expect(readFileSync(path.join(fixture.logDirectory, "docker.log"), "utf8"))
+      .toContain("compose up -d --force-recreate caddy");
+  });
+
   it("allows a first deployment with no existing V2 database and no backup restore", () => {
     const fixture = createDeployFixture();
     const result = deploy(fixture);
@@ -545,6 +623,59 @@ describe("deploy.sh behavior", () => {
     expect(result.status).not.toBe(0);
     expect(existsSync(path.join(fixture.coordinatorStateRoot, "active.state"))).toBe(false);
     expect(existsSync(path.join(fixture.logDirectory, "docker.log"))).toBe(false);
+  });
+
+  it.each(["archive", "transfer"])(
+    "removes the local secret-bearing candidate directory after a pre-acquisition %s failure",
+    (failure) => {
+      const fixture = createDeployFixture();
+      const localTemporaryRoot = path.join(fixture.root, "local-tmp");
+      mkdirSync(localTemporaryRoot);
+      const result = deploy(fixture, {
+        TMPDIR: localTemporaryRoot,
+        ...(failure === "archive" ? { FAKE_GIT_ARCHIVE_FAIL: "1" } : { FAKE_RSYNC_FAIL_ON: "1" }),
+      });
+
+      expect(result.status).not.toBe(0);
+      expect(readdirSync(localTemporaryRoot).filter((entry) => entry.startsWith("atlas-v2-candidate.")))
+        .toEqual([]);
+      expect(existsSync(path.join(fixture.coordinatorStateRoot, "active.state"))).toBe(false);
+    },
+  );
+
+  it("retires a recovered deployment under the install lock and retries without manual intervention", () => {
+    const fixture = createDeployFixture();
+    writeFileSync(path.join(fixture.remoteDirectory, ".atlas-release"), `${releaseCommit}\n`);
+    writeFileSync(path.join(fixture.remoteDirectory, "prior.txt"), "prior release bytes\n");
+    const failed = deploy(fixture, { FAKE_BUILD_DB_FAIL: "1" });
+    expect(failed.status).not.toBe(0);
+    expect(readFileSync(path.join(fixture.coordinatorStateRoot, "active.state"), "utf8"))
+      .toContain("status=recovered");
+
+    const retried = deploy(fixture);
+    expect(retried.status, `${retried.stdout}\n${retried.stderr}`).toBe(0);
+    expect(readFileSync(path.join(fixture.remoteDirectory, ".atlas-release"), "utf8"))
+      .toBe(`${releaseCommit}\n`);
+    expect(readdirSync(path.join(fixture.coordinatorStateRoot, "history")).some((entry) =>
+      entry.endsWith(".recovered.state"))).toBe(true);
+  });
+
+  it("never executes unauthenticated installed coordinator bytes to retire recovered state", () => {
+    const fixture = createDeployFixture();
+    writeFileSync(path.join(fixture.remoteDirectory, ".atlas-release"), `${releaseCommit}\n`);
+    writeFileSync(path.join(fixture.remoteDirectory, "prior.txt"), "prior release bytes\n");
+    const failed = deploy(fixture, { FAKE_BUILD_DB_FAIL: "1" });
+    expect(failed.status).not.toBe(0);
+    expect(readFileSync(path.join(fixture.coordinatorStateRoot, "active.state"), "utf8"))
+      .toContain("status=recovered");
+
+    const executionMarker = path.join(fixture.logDirectory, "unauthenticated-coordinator-ran");
+    executable(fixture.coordinator, `#!/usr/bin/env bash\n: > '${executionMarker}'\nexit 1\n`);
+    const retried = deploy(fixture);
+
+    expect(retried.status).not.toBe(0);
+    expect(existsSync(executionMarker)).toBe(false);
+    expect(retried.stderr).toMatch(/unauthenticated coordinator bytes/i);
   });
 
   it("fails closed with recovery evidence before sync when the fresh backup restore test fails", () => {
@@ -650,7 +781,8 @@ describe("deploy.sh behavior", () => {
     expect(result.status).not.toBe(0);
     expect(result.stderr).toMatch(/compatibility boundary crossed|fail closed/i);
     const dockerLog = readFileSync(path.join(fixture.logDirectory, "docker.log"), "utf8");
-    expect(dockerLog).toContain("001-atlas-roles.sh");
+    expect(dockerLog).toContain("db bash -s --");
+    expect(dockerLog).toContain("PGAPPNAME=atlas-deploy-");
     expect(dockerLog).not.toContain("start worker-container");
     expect(dockerLog).not.toContain("start web-container");
   });
@@ -665,9 +797,9 @@ describe("deploy.sh behavior", () => {
 
     expect(result.status).not.toBe(0);
     const dockerLog = readFileSync(path.join(fixture.logDirectory, "docker.log"), "utf8");
-    expect(dockerLog.indexOf("001-atlas-roles.sh")).toBeGreaterThanOrEqual(0);
+    expect(dockerLog.indexOf("db bash -s --")).toBeGreaterThanOrEqual(0);
     expect(dockerLog.indexOf("--profile operations run --rm --label")).toBeGreaterThan(
-      dockerLog.indexOf("001-atlas-roles.sh"),
+      dockerLog.indexOf("db bash -s --"),
     );
     expect(dockerLog).not.toContain("start worker-container");
     expect(dockerLog).not.toContain("start web-container");

@@ -240,6 +240,24 @@ describe("Atlas V2 API contract", () => {
     });
   });
 
+  it("rejects unknown local-login fields to match the OpenAPI schema", async () => {
+    const response = await request(testApp()).post("/api/v2/auth/local/login").send({
+      email: "admin@rangeway.energy",
+      password: "correct-horse-battery-staple",
+      unexpected: "must-not-be-accepted",
+    });
+    const requestId = expectRequestId(response);
+
+    expect(response.status).toBe(400);
+    expect(response.body).toMatchObject({
+      error: {
+        code: "INVALID_INPUT",
+        message: "Invalid input.",
+        requestId,
+      },
+    });
+  });
+
   it("expires a signed session after exactly the configured 12-hour lifetime", async () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     vi.setSystemTime(new Date("2026-08-02T12:00:00.000Z"));

@@ -7,7 +7,7 @@ if [[ "${EUID}" -ne 0 ]]; then
 fi
 
 apt-get update
-apt-get install -y ca-certificates curl git gnupg python3 rsync ufw
+apt-get install -y ca-certificates curl git gnupg python3 rsync ufw util-linux
 
 install -m 0755 -d /etc/apt/keyrings
 if [[ ! -f /etc/apt/keyrings/docker.gpg ]]; then
@@ -30,6 +30,10 @@ ufw allow 80/tcp
 ufw allow 443/tcp
 ufw --force enable
 
+install -o root -g root -m 0755 -d /run/lock
+exec 9>/run/lock/atlas-v2-deployment-install.lock
+flock -x 9
+
 if systemctl is-active --quiet atlas-v2-deployment-guardian.service \
   || [[ -e /var/lib/atlas-v2-deployment/active.state ]]; then
   echo "Resolve the active Atlas deployment before replacing coordinator files." >&2
@@ -46,6 +50,8 @@ install -m 0644 deploy/systemd/atlas-v2-deployment-guardian.service \
   /etc/systemd/system/atlas-v2-deployment-guardian.service
 install -m 0755 deploy/backup.sh /usr/local/libexec/atlas-v2/backup.sh
 install -m 0755 deploy/restore-test.sh /usr/local/libexec/atlas-v2/restore-test.sh
+install -m 0755 deploy/postgres/init-roles.sh /usr/local/libexec/atlas-v2/init-roles.sh
+install -m 0644 deploy/Caddyfile /usr/local/libexec/atlas-v2/Caddyfile
 systemctl daemon-reload
 
 echo "Ubuntu is ready for Atlas V2 deployment by a root SSH administrator at /opt/atlas-v2."

@@ -66,6 +66,13 @@ describe.skipIf(!hasDockerCompose)("resolved Docker Compose topology", () => {
     expect(compose.services.db.ports ?? []).toEqual([]);
   });
 
+  it("uses no release-tree bind mount for privileged configuration", () => {
+    const dbMounts = mountedSources(compose.services.db);
+    const caddyMounts = mountedSources(compose.services.caddy);
+    expect([...dbMounts.keys()]).not.toContain("./deploy/postgres/init-roles.sh");
+    expect(caddyMounts.get("/usr/local/libexec/atlas-v2/Caddyfile")).toBe("/etc/caddy/Caddyfile");
+  });
+
   it("shares the artifact volume with web and worker", () => {
     expect(mountedSources(compose.services.web).get("atlas-artifacts")).toBe("/app/artifacts");
     expect(mountedSources(compose.services.worker).get("atlas-artifacts")).toBe("/app/artifacts");
@@ -234,9 +241,11 @@ describe("deterministic deployment source contract", () => {
     expect(deploymentCoordinator).toContain("RESTORE_TOOL_PATH");
     expect(deploymentCoordinator).not.toMatch(/\.\/deploy\/(?:backup|restore-test)\.sh/);
     expect(deploymentCoordinator).toContain("docker compose up -d db");
-    expect(deploymentCoordinator).toContain("docker compose exec -T db /docker-entrypoint-initdb.d/001-atlas-roles.sh");
+    expect(deploymentCoordinator).toContain("ROLE_INITIALIZER_PATH");
+    expect(deploymentCoordinator).toMatch(/PGAPPNAME=atlas-deploy-\$\{token\}[\s\S]*db bash -s --/);
+    expect(deploymentCoordinator).not.toContain("/docker-entrypoint-initdb.d/001-atlas-roles.sh");
     expect(deploymentCoordinator).toContain("docker compose --profile operations run --rm --label");
-    expect(deploymentCoordinator).toContain("docker compose up -d web worker caddy");
+    expect(deploymentCoordinator).toContain("docker compose up -d --force-recreate caddy");
     expect(deploymentCoordinator.indexOf("docker compose build web worker")).toBeLessThan(
       deploymentCoordinator.indexOf("import('./dist/server/config.js')"),
     );

@@ -17,6 +17,8 @@ COORDINATOR_STAGE="${ATLAS_COORDINATOR_STAGE:-/var/lib/atlas-v2-deployment/stagi
 COORDINATOR_INSTALL_LOCK="${ATLAS_COORDINATOR_INSTALL_LOCK:-/run/lock/atlas-v2-deployment-install.lock}"
 BACKUP_TOOL_PATH="${ATLAS_BACKUP_TOOL_PATH:-/usr/local/libexec/atlas-v2/backup.sh}"
 RESTORE_TOOL_PATH="${ATLAS_RESTORE_TOOL_PATH:-/usr/local/libexec/atlas-v2/restore-test.sh}"
+ROLE_INITIALIZER_PATH="${ATLAS_ROLE_INITIALIZER_PATH:-/usr/local/libexec/atlas-v2/init-roles.sh}"
+CADDY_CONFIG_PATH="${ATLAS_CADDY_CONFIG_PATH:-/usr/local/libexec/atlas-v2/Caddyfile}"
 LEASE_SECONDS="${ATLAS_DEPLOYMENT_LEASE_SECONDS:-900}"
 SSH_OPTS=(-o BatchMode=yes -o StrictHostKeyChecking=accept-new)
 RSYNC_RSH="ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new"
@@ -49,6 +51,8 @@ valid_path "${COORDINATOR_STAGE}" || fail "ATLAS_COORDINATOR_STAGE must be a can
 valid_path "${COORDINATOR_INSTALL_LOCK}" || fail "ATLAS_COORDINATOR_INSTALL_LOCK must be a canonical absolute path."
 valid_path "${BACKUP_TOOL_PATH}" || fail "ATLAS_BACKUP_TOOL_PATH must be a canonical absolute path."
 valid_path "${RESTORE_TOOL_PATH}" || fail "ATLAS_RESTORE_TOOL_PATH must be a canonical absolute path."
+valid_path "${ROLE_INITIALIZER_PATH}" || fail "ATLAS_ROLE_INITIALIZER_PATH must be a canonical absolute path."
+valid_path "${CADDY_CONFIG_PATH}" || fail "ATLAS_CADDY_CONFIG_PATH must be a canonical absolute path."
 path_is_equal_or_descendant "${REMOTE_BACKUP_ROOT}" "${REMOTE_DIR}" \
   && fail "ATLAS_BACKUP_ROOT must be outside the synchronized ATLAS_DIR tree."
 [[ "${LEASE_SECONDS}" =~ ^[0-9]+$ && "${LEASE_SECONDS}" -ge 2 && "${LEASE_SECONDS}" -le 900 ]] \
@@ -69,6 +73,10 @@ if [[ "${ATLAS_COORDINATOR_TEST_MODE:-0}" != "1" ]]; then
     || fail "ATLAS_BACKUP_TOOL_PATH must use the immutable root-owned tool path."
   [[ "${RESTORE_TOOL_PATH}" == "/usr/local/libexec/atlas-v2/restore-test.sh" ]] \
     || fail "ATLAS_RESTORE_TOOL_PATH must use the immutable root-owned tool path."
+  [[ "${ROLE_INITIALIZER_PATH}" == "/usr/local/libexec/atlas-v2/init-roles.sh" ]] \
+    || fail "ATLAS_ROLE_INITIALIZER_PATH must use the immutable root-owned tool path."
+  [[ "${CADDY_CONFIG_PATH}" == "/usr/local/libexec/atlas-v2/Caddyfile" ]] \
+    || fail "ATLAS_CADDY_CONFIG_PATH must use the immutable root-owned configuration path."
 fi
 
 [[ -n "${ENV_FILE_INPUT}" ]] || fail "set ATLAS_ENV_FILE to the production environment file."
@@ -175,6 +183,8 @@ COORDINATOR_SOURCE="${REPOSITORY_ROOT}/deploy/deployment-coordinator.sh"
 GUARDIAN_UNIT_SOURCE="${REPOSITORY_ROOT}/deploy/systemd/atlas-v2-deployment-guardian.service"
 BACKUP_SOURCE="${REPOSITORY_ROOT}/deploy/backup.sh"
 RESTORE_SOURCE="${REPOSITORY_ROOT}/deploy/restore-test.sh"
+ROLE_INITIALIZER_SOURCE="${REPOSITORY_ROOT}/deploy/postgres/init-roles.sh"
+CADDY_CONFIG_SOURCE="${REPOSITORY_ROOT}/deploy/Caddyfile"
 [[ -f "${COORDINATOR_SOURCE}" && ! -L "${COORDINATOR_SOURCE}" ]] \
   || fail "reviewed deployment coordinator source is unavailable."
 [[ -f "${GUARDIAN_UNIT_SOURCE}" && ! -L "${GUARDIAN_UNIT_SOURCE}" ]] \
@@ -183,6 +193,10 @@ RESTORE_SOURCE="${REPOSITORY_ROOT}/deploy/restore-test.sh"
   || fail "reviewed backup source is unavailable."
 [[ -f "${RESTORE_SOURCE}" && ! -L "${RESTORE_SOURCE}" ]] \
   || fail "reviewed restore-test source is unavailable."
+[[ -f "${ROLE_INITIALIZER_SOURCE}" && ! -L "${ROLE_INITIALIZER_SOURCE}" ]] \
+  || fail "reviewed database-role initializer source is unavailable."
+[[ -f "${CADDY_CONFIG_SOURCE}" && ! -L "${CADDY_CONFIG_SOURCE}" ]] \
+  || fail "reviewed Caddy configuration source is unavailable."
 COORDINATOR_SHA256="$(node --input-type=module -e \
   'import fs from "node:fs"; import crypto from "node:crypto"; process.stdout.write(crypto.createHash("sha256").update(fs.readFileSync(process.argv[1])).digest("hex"))' \
   "${COORDINATOR_SOURCE}")"
@@ -195,11 +209,27 @@ BACKUP_SHA256="$(node --input-type=module -e \
 RESTORE_SHA256="$(node --input-type=module -e \
   'import fs from "node:fs"; import crypto from "node:crypto"; process.stdout.write(crypto.createHash("sha256").update(fs.readFileSync(process.argv[1])).digest("hex"))' \
   "${RESTORE_SOURCE}")"
+ROLE_INITIALIZER_SHA256="$(node --input-type=module -e \
+  'import fs from "node:fs"; import crypto from "node:crypto"; process.stdout.write(crypto.createHash("sha256").update(fs.readFileSync(process.argv[1])).digest("hex"))' \
+  "${ROLE_INITIALIZER_SOURCE}")"
+CADDY_CONFIG_SHA256="$(node --input-type=module -e \
+  'import fs from "node:fs"; import crypto from "node:crypto"; process.stdout.write(crypto.createHash("sha256").update(fs.readFileSync(process.argv[1])).digest("hex"))' \
+  "${CADDY_CONFIG_SOURCE}")"
 [[ "${COORDINATOR_SHA256}" =~ ^[0-9a-f]{64}$ && "${GUARDIAN_UNIT_SHA256}" =~ ^[0-9a-f]{64}$ \
-  && "${BACKUP_SHA256}" =~ ^[0-9a-f]{64}$ && "${RESTORE_SHA256}" =~ ^[0-9a-f]{64}$ ]] \
+  && "${BACKUP_SHA256}" =~ ^[0-9a-f]{64}$ && "${RESTORE_SHA256}" =~ ^[0-9a-f]{64}$ \
+  && "${ROLE_INITIALIZER_SHA256}" =~ ^[0-9a-f]{64}$ && "${CADDY_CONFIG_SHA256}" =~ ^[0-9a-f]{64}$ ]] \
   || fail "could not hash reviewed coordinator assets."
 
 LOCAL_CANDIDATE_STAGE="$(mktemp -d "${TMPDIR:-/tmp}/atlas-v2-candidate.XXXXXX")"
+cleanup_local_candidate() {
+  local cleanup_status="$?"
+  trap - EXIT INT TERM
+  case "${LOCAL_CANDIDATE_STAGE:-}" in
+    "${TMPDIR:-/tmp}"/atlas-v2-candidate.*) /bin/rm -rf -- "${LOCAL_CANDIDATE_STAGE}" ;;
+  esac
+  exit "${cleanup_status}"
+}
+trap cleanup_local_candidate EXIT INT TERM
 git archive --format=tar --output="${LOCAL_CANDIDATE_STAGE}/atlas-release.tar" "${LOCAL_COMMIT}"
 install -m 0600 "${ENV_FILE}" "${LOCAL_CANDIDATE_STAGE}/atlas.env"
 RELEASE_ARCHIVE_SHA256="$(node --input-type=module -e \
@@ -233,15 +263,18 @@ REMOTE_STAGE
 
   rsync -az --chmod=F600 -e "${RSYNC_RSH}" \
     "${COORDINATOR_SOURCE}" "${GUARDIAN_UNIT_SOURCE}" "${BACKUP_SOURCE}" "${RESTORE_SOURCE}" \
+    "${ROLE_INITIALIZER_SOURCE}" "${CADDY_CONFIG_SOURCE}" \
     "${LOCAL_CANDIDATE_STAGE}/atlas-release.tar" "${LOCAL_CANDIDATE_STAGE}/atlas.env" \
     "${REMOTE_TARGET}:${REMOTE_CANDIDATE_STAGE}/" \
     || fail "immutable deployment bundle staging failed."
 
   ssh "${SSH_OPTS[@]}" "${REMOTE_TARGET}" bash -s -- \
     "${REMOTE_CANDIDATE_STAGE}" "${COORDINATOR_PATH}" "${GUARDIAN_UNIT_PATH}" \
-    "${BACKUP_TOOL_PATH}" "${RESTORE_TOOL_PATH}" "${COORDINATOR_STATE_FILE}" \
+    "${BACKUP_TOOL_PATH}" "${RESTORE_TOOL_PATH}" "${ROLE_INITIALIZER_PATH}" "${CADDY_CONFIG_PATH}" \
+    "${COORDINATOR_STATE_FILE}" \
     "${COORDINATOR_INSTALL_LOCK}" "${COORDINATOR_SHA256}" "${GUARDIAN_UNIT_SHA256}" \
-    "${BACKUP_SHA256}" "${RESTORE_SHA256}" "${RELEASE_ARCHIVE_SHA256}" \
+    "${BACKUP_SHA256}" "${RESTORE_SHA256}" "${ROLE_INITIALIZER_SHA256}" "${CADDY_CONFIG_SHA256}" \
+    "${RELEASE_ARCHIVE_SHA256}" \
     "${ENVIRONMENT_SHA256}" "${DEPLOYMENT_TOKEN}" "${REMOTE_DIR}" \
     "${REMOTE_BACKUP_ROOT}" "${LEASE_SECONDS}" "${LOCAL_COMMIT}" \
     "${ATLAS_COORDINATOR_TEST_MODE:-0}" \
@@ -252,30 +285,38 @@ coordinator="$2"
 unit="$3"
 backup_tool="$4"
 restore_tool="$5"
-state_file="$6"
-install_lock="$7"
-expected_coordinator_hash="$8"
-expected_unit_hash="$9"
-expected_backup_hash="${10}"
-expected_restore_hash="${11}"
-expected_archive_hash="${12}"
-expected_environment_hash="${13}"
-deployment_token="${14}"
-remote_dir="${15}"
-backup_root="${16}"
-lease_seconds="${17}"
-bundle_version="${18}"
-test_mode="${19}"
+role_initializer="$6"
+caddy_config="$7"
+state_file="$8"
+install_lock="$9"
+expected_coordinator_hash="${10}"
+expected_unit_hash="${11}"
+expected_backup_hash="${12}"
+expected_restore_hash="${13}"
+expected_role_initializer_hash="${14}"
+expected_caddy_config_hash="${15}"
+expected_archive_hash="${16}"
+expected_environment_hash="${17}"
+deployment_token="${18}"
+remote_dir="${19}"
+backup_root="${20}"
+lease_seconds="${21}"
+bundle_version="${22}"
+test_mode="${23}"
 staged_coordinator="${stage}/deployment-coordinator.sh"
 staged_unit="${stage}/atlas-v2-deployment-guardian.service"
 staged_backup="${stage}/backup.sh"
 staged_restore="${stage}/restore-test.sh"
+staged_role_initializer="${stage}/init-roles.sh"
+staged_caddy_config="${stage}/Caddyfile"
 staged_archive="${stage}/atlas-release.tar"
 staged_environment="${stage}/atlas.env"
 coordinator_next="${coordinator}.next"
 unit_next="${unit}.next"
 backup_next="${backup_tool}.next"
 restore_next="${restore_tool}.next"
+role_initializer_next="${role_initializer}.next"
+caddy_config_next="${caddy_config}.next"
 
 hash_file() {
   sha256sum -- "$1" | awk '{print $1}'
@@ -297,22 +338,49 @@ ${staged_coordinator}|${expected_coordinator_hash}
 ${staged_unit}|${expected_unit_hash}
 ${staged_backup}|${expected_backup_hash}
 ${staged_restore}|${expected_restore_hash}
+${staged_role_initializer}|${expected_role_initializer_hash}
+${staged_caddy_config}|${expected_caddy_config_hash}
 ${staged_archive}|${expected_archive_hash}
 ${staged_environment}|${expected_environment_hash}
 EOF
 
+if [[ -e "${state_file}" ]]; then
+  [[ -f "${state_file}" && ! -L "${state_file}" ]] \
+    || { echo "Refusing recovered-state retirement from an unsafe state path." >&2; exit 1; }
+  recorded_coordinator_hash="$(sed -n 's/^coordinator_hash=//p' "${state_file}")"
+  [[ "$(grep -c '^coordinator_hash=' "${state_file}")" == "1" \
+    && "${recorded_coordinator_hash}" =~ ^[0-9a-f]{64}$ ]] \
+    || { echo "Refusing active.state retirement without one recorded coordinator hash." >&2; exit 1; }
+  [[ -x "${coordinator}" && ! -L "${coordinator}" ]] \
+    || { echo "Refusing recovered-state retirement without the installed coordinator." >&2; exit 1; }
+  [[ "$(hash_file "${coordinator}")" == "${recorded_coordinator_hash}" ]] \
+    || { echo "Refusing recovered-state retirement through unauthenticated coordinator bytes." >&2; exit 1; }
+  if [[ "${test_mode}" != "1" ]]; then
+    [[ "$(stat -c '%U:%G:%a' "${coordinator}")" == "root:root:755" ]] \
+      || { echo "Refusing recovered-state retirement through unsafe coordinator ownership." >&2; exit 1; }
+  fi
+  ATLAS_COORDINATOR_INSTALL_LOCK_HELD=1 "${coordinator}" retire-recovered \
+    || { echo "Refusing to replace Atlas operations bytes while active.state requires resolution." >&2; exit 1; }
+fi
+
 installed_matches=0
 if [[ -f "${coordinator}" && ! -L "${coordinator}" && -f "${unit}" && ! -L "${unit}" \
-  && -f "${backup_tool}" && ! -L "${backup_tool}" && -f "${restore_tool}" && ! -L "${restore_tool}" ]] \
+  && -f "${backup_tool}" && ! -L "${backup_tool}" && -f "${restore_tool}" && ! -L "${restore_tool}" \
+  && -f "${role_initializer}" && ! -L "${role_initializer}" \
+  && -f "${caddy_config}" && ! -L "${caddy_config}" ]] \
   && [[ "$(hash_file "${coordinator}")" == "${expected_coordinator_hash}" ]] \
   && [[ "$(hash_file "${unit}")" == "${expected_unit_hash}" ]] \
   && [[ "$(hash_file "${backup_tool}")" == "${expected_backup_hash}" ]] \
-  && [[ "$(hash_file "${restore_tool}")" == "${expected_restore_hash}" ]]; then
+  && [[ "$(hash_file "${restore_tool}")" == "${expected_restore_hash}" ]] \
+  && [[ "$(hash_file "${role_initializer}")" == "${expected_role_initializer_hash}" ]] \
+  && [[ "$(hash_file "${caddy_config}")" == "${expected_caddy_config_hash}" ]]; then
   if [[ "${test_mode}" == "1" ]] \
     || [[ "$(stat -c '%U:%G:%a' "${coordinator}")" == "root:root:755" \
       && "$(stat -c '%U:%G:%a' "${unit}")" == "root:root:644" \
       && "$(stat -c '%U:%G:%a' "${backup_tool}")" == "root:root:755" \
-      && "$(stat -c '%U:%G:%a' "${restore_tool}")" == "root:root:755" ]]; then
+      && "$(stat -c '%U:%G:%a' "${restore_tool}")" == "root:root:755" \
+      && "$(stat -c '%U:%G:%a' "${role_initializer}")" == "root:root:755" \
+      && "$(stat -c '%U:%G:%a' "${caddy_config}")" == "root:root:644" ]]; then
     installed_matches=1
   fi
 fi
@@ -331,32 +399,44 @@ if [[ "${installed_matches}" -ne 1 ]]; then
     install -m 0644 "${staged_unit}" "${unit_next}"
     install -m 0755 "${staged_backup}" "${backup_next}"
     install -m 0755 "${staged_restore}" "${restore_next}"
+    install -m 0755 "${staged_role_initializer}" "${role_initializer_next}"
+    install -m 0644 "${staged_caddy_config}" "${caddy_config_next}"
   else
     install -o root -g root -m 0755 -d "$(dirname -- "${backup_tool}")"
     install -o root -g root -m 0755 "${staged_coordinator}" "${coordinator_next}"
     install -o root -g root -m 0644 "${staged_unit}" "${unit_next}"
     install -o root -g root -m 0755 "${staged_backup}" "${backup_next}"
     install -o root -g root -m 0755 "${staged_restore}" "${restore_next}"
+    install -o root -g root -m 0755 "${staged_role_initializer}" "${role_initializer_next}"
+    install -o root -g root -m 0644 "${staged_caddy_config}" "${caddy_config_next}"
   fi
   [[ "$(hash_file "${coordinator_next}")" == "${expected_coordinator_hash}" ]]
   [[ "$(hash_file "${unit_next}")" == "${expected_unit_hash}" ]]
   [[ "$(hash_file "${backup_next}")" == "${expected_backup_hash}" ]]
   [[ "$(hash_file "${restore_next}")" == "${expected_restore_hash}" ]]
+  [[ "$(hash_file "${role_initializer_next}")" == "${expected_role_initializer_hash}" ]]
+  [[ "$(hash_file "${caddy_config_next}")" == "${expected_caddy_config_hash}" ]]
   mv -f -- "${coordinator_next}" "${coordinator}"
   mv -f -- "${unit_next}" "${unit}"
   mv -f -- "${backup_next}" "${backup_tool}"
   mv -f -- "${restore_next}" "${restore_tool}"
+  mv -f -- "${role_initializer_next}" "${role_initializer}"
+  mv -f -- "${caddy_config_next}" "${caddy_config}"
 fi
 
 [[ "$(hash_file "${coordinator}")" == "${expected_coordinator_hash}" ]]
 [[ "$(hash_file "${unit}")" == "${expected_unit_hash}" ]]
 [[ "$(hash_file "${backup_tool}")" == "${expected_backup_hash}" ]]
 [[ "$(hash_file "${restore_tool}")" == "${expected_restore_hash}" ]]
+[[ "$(hash_file "${role_initializer}")" == "${expected_role_initializer_hash}" ]]
+[[ "$(hash_file "${caddy_config}")" == "${expected_caddy_config_hash}" ]]
 if [[ "${test_mode}" != "1" ]]; then
   [[ "$(stat -c '%U:%G:%a' "${coordinator}")" == "root:root:755" ]]
   [[ "$(stat -c '%U:%G:%a' "${unit}")" == "root:root:644" ]]
   [[ "$(stat -c '%U:%G:%a' "${backup_tool}")" == "root:root:755" ]]
   [[ "$(stat -c '%U:%G:%a' "${restore_tool}")" == "root:root:755" ]]
+  [[ "$(stat -c '%U:%G:%a' "${role_initializer}")" == "root:root:755" ]]
+  [[ "$(stat -c '%U:%G:%a' "${caddy_config}")" == "root:root:644" ]]
 fi
 systemctl daemon-reload
 loaded_unit="$(systemctl cat --no-pager --full atlas-v2-deployment-guardian.service)"
@@ -371,7 +451,8 @@ fi
 ATLAS_COORDINATOR_INSTALL_LOCK_HELD=1 exec "${coordinator}" begin \
   "${deployment_token}" "${remote_dir}" "${backup_root}" "${lease_seconds}" \
   "${bundle_version}" "${expected_coordinator_hash}" "${expected_unit_hash}" \
-  "${expected_backup_hash}" "${expected_restore_hash}" "${stage}" \
+  "${expected_backup_hash}" "${expected_restore_hash}" \
+  "${expected_role_initializer_hash}" "${expected_caddy_config_hash}" "${stage}" \
   "${expected_archive_hash}" "${expected_environment_hash}"
 REMOTE_INSTALL
 }

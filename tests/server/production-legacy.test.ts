@@ -69,8 +69,11 @@ function productionApp(databasePath: string, uploadDir: string) {
 
 describe("production legacy isolation", () => {
   it.each([
+    ["/api", '{"canary":"parser-secret",'],
+    ["/api/", '{"canary":"parser-secret",'],
     ["/api/v1/legacy", '{"canary":"parser-secret",'],
     ["/api/unknown", '{"canary":"parser-secret",'],
+    ["/api/v2/unknown", '{"canary":"parser-secret",'],
   ])("maps malformed JSON globally before production route-family handling for %s", async (route, body) => {
     const root = temporaryDirectory();
     const errors: Array<{ message: string; context: Record<string, unknown> }> = [];
@@ -107,7 +110,7 @@ describe("production legacy isolation", () => {
     expect(JSON.stringify({ response: response.body, errors })).not.toContain("parser-secret");
   });
 
-  it.each(["/api/v1/legacy", "/api/unknown"])(
+  it.each(["/api", "/api/", "/api/v1/legacy", "/api/unknown", "/api/v2/unknown"])(
     "maps oversized JSON globally before production route-family handling for %s",
     async (route) => {
       const root = temporaryDirectory();

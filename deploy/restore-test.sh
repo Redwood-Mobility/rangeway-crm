@@ -6,6 +6,16 @@ fail() {
   exit 1
 }
 
+DEPLOYMENT_TOKEN="${ATLAS_DEPLOYMENT_TOKEN:-}"
+if [[ -n "${DEPLOYMENT_TOKEN}" ]]; then
+  [[ "${DEPLOYMENT_TOKEN}" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] \
+    || fail "ATLAS_DEPLOYMENT_TOKEN is invalid."
+  [[ "${PGAPPNAME:-}" == "atlas-deploy-${DEPLOYMENT_TOKEN}" ]] \
+    || fail "PGAPPNAME must identify the exact Atlas deployment token."
+else
+  PGAPPNAME="atlas-restore-test"
+fi
+
 [[ "$#" -eq 1 ]] || fail "exactly one BACKUP_DIRECTORY is required."
 BACKUP_INPUT="$1"
 [[ -n "${BACKUP_INPUT}" ]] || fail "BACKUP_DIRECTORY cannot be empty."
@@ -123,11 +133,12 @@ docker exec "${TEMP_DB_CONTAINER}" \
   || fail "temporary PostgreSQL did not become ready."
 
 docker exec -i "${TEMP_DB_CONTAINER}" \
+  env "PGAPPNAME=${PGAPPNAME}" \
   pg_restore --username=atlas_restore --dbname=atlas_restore --no-owner --no-privileges \
   < "${BACKUP_DIR}/atlas-postgres.dump"
 
 MIGRATION_COUNT="$(
-  docker exec "${TEMP_DB_CONTAINER}" psql \
+  docker exec "${TEMP_DB_CONTAINER}" env "PGAPPNAME=${PGAPPNAME}" psql \
     --username=atlas_restore --dbname=atlas_restore --tuples-only --no-align \
     --command="SELECT count(*) FROM schema_migrations WHERE filename = '0001_platform.sql';"
 )"
@@ -135,7 +146,7 @@ MIGRATION_COUNT="$(
   || fail "restored database did not contain the expected schema_migrations row."
 
 ORGANIZATION_COUNT="$(
-  docker exec "${TEMP_DB_CONTAINER}" psql \
+  docker exec "${TEMP_DB_CONTAINER}" env "PGAPPNAME=${PGAPPNAME}" psql \
     --username=atlas_restore --dbname=atlas_restore --tuples-only --no-align \
     --command="SELECT count(*) FROM organizations WHERE id = '00000000-0000-4000-8000-000000000001';"
 )"
