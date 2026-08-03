@@ -16,8 +16,10 @@ export type TemporaryDatabase = {
   cleanup: () => Promise<void>;
 };
 
-function isUnreachable(error: unknown): boolean {
-  if (error instanceof AggregateError) return error.errors.some(isUnreachable);
+export function isPostgreSqlUnreachable(error: unknown): boolean {
+  if (error instanceof AggregateError) {
+    return error.errors.length > 0 && error.errors.every(isPostgreSqlUnreachable);
+  }
   if (!(error instanceof Error) || !("code" in error)) return false;
 
   return ["ECONNREFUSED", "EHOSTUNREACH", "ENETUNREACH", "ENOTFOUND", "ETIMEDOUT"].includes(
@@ -34,7 +36,7 @@ export async function createTemporaryDatabase(): Promise<TemporaryDatabase> {
     await pool.query(`CREATE DATABASE "${databaseName}"`);
   } catch (error) {
     await pool.end();
-    if (isUnreachable(error)) throw new PostgreSqlUnavailableError(administrationUrl, { cause: error });
+    if (isPostgreSqlUnreachable(error)) throw new PostgreSqlUnavailableError(administrationUrl, { cause: error });
     throw error;
   }
 

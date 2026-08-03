@@ -26,7 +26,7 @@ CREATE TABLE users (
 
 CREATE TABLE actors (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  organization_id UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+  organization_id UUID NOT NULL REFERENCES organizations(id) ON DELETE RESTRICT,
   type actor_type NOT NULL,
   user_id UUID REFERENCES users(id) ON DELETE RESTRICT,
   service_key_prefix TEXT UNIQUE,
@@ -47,7 +47,8 @@ CREATE TABLE actors (
       AND service_key_prefix IS NOT NULL
       AND service_key_hash IS NOT NULL
     )
-  )
+  ),
+  CONSTRAINT actors_organization_id_id_unique UNIQUE (organization_id, id)
 );
 
 CREATE UNIQUE INDEX actors_organization_user_unique
@@ -56,8 +57,8 @@ CREATE UNIQUE INDEX actors_organization_user_unique
 CREATE INDEX actors_organization_id_idx ON actors (organization_id);
 
 CREATE TABLE organization_memberships (
-  organization_id UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
-  user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  organization_id UUID NOT NULL REFERENCES organizations(id) ON DELETE RESTRICT,
+  user_id UUID NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
   role organization_role NOT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   PRIMARY KEY (organization_id, user_id)
@@ -69,7 +70,7 @@ CREATE INDEX organization_memberships_user_id_idx
 CREATE TABLE audit_events (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   organization_id UUID NOT NULL REFERENCES organizations(id) ON DELETE RESTRICT,
-  actor_id UUID NOT NULL REFERENCES actors(id) ON DELETE RESTRICT,
+  actor_id UUID NOT NULL,
   request_id UUID NOT NULL,
   action TEXT NOT NULL,
   resource_type TEXT NOT NULL,
@@ -86,7 +87,11 @@ CREATE TABLE audit_events (
   ),
   CONSTRAINT audit_events_metadata_object_check CHECK (
     jsonb_typeof(metadata) = 'object'
-  )
+  ),
+  CONSTRAINT audit_events_organization_actor_fk
+    FOREIGN KEY (organization_id, actor_id)
+    REFERENCES actors (organization_id, id)
+    ON DELETE RESTRICT
 );
 
 CREATE INDEX audit_events_organization_created_at_idx
@@ -97,7 +102,7 @@ CREATE INDEX audit_events_resource_idx
 CREATE TABLE outbox_events (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   organization_id UUID NOT NULL REFERENCES organizations(id) ON DELETE RESTRICT,
-  actor_id UUID NOT NULL REFERENCES actors(id) ON DELETE RESTRICT,
+  actor_id UUID NOT NULL,
   request_id UUID NOT NULL,
   event_type TEXT NOT NULL,
   aggregate_type TEXT NOT NULL,
@@ -119,7 +124,11 @@ CREATE TABLE outbox_events (
   CONSTRAINT outbox_events_processing_lease_check CHECK (
     (processing_started_at IS NULL AND processing_token IS NULL)
     OR (processing_started_at IS NOT NULL AND processing_token IS NOT NULL)
-  )
+  ),
+  CONSTRAINT outbox_events_organization_actor_fk
+    FOREIGN KEY (organization_id, actor_id)
+    REFERENCES actors (organization_id, id)
+    ON DELETE RESTRICT
 );
 
 CREATE INDEX outbox_events_organization_created_at_idx

@@ -13,6 +13,41 @@ type AppliedMigration = {
   checksum: string;
 };
 
+type Migration = AppliedMigration & {
+  sql: string;
+};
+
+function validateAppliedMigrationPrefix(
+  migrations: Migration[],
+  appliedMigrations: AppliedMigration[],
+): void {
+  const currentFilenames = new Set(migrations.map((migration) => migration.filename));
+
+  for (let index = 0; index < appliedMigrations.length; index += 1) {
+    const applied = appliedMigrations[index];
+    const current = migrations[index];
+
+    if (!currentFilenames.has(applied.filename)) {
+      throw new Error(
+        `Applied migration ${applied.filename} is missing from the current migration set.`,
+      );
+    }
+
+    if (!current || applied.filename !== current.filename) {
+      throw new Error(
+        `Migration history is not an immutable prefix: expected ${current?.filename ?? "no migration"} at position ${index + 1}, received ${applied.filename}.`,
+      );
+    }
+
+    const recordedChecksum = applied.checksum.trim();
+    if (recordedChecksum !== current.checksum) {
+      throw new Error(
+        `Migration checksum mismatch for ${current.filename}: expected ${recordedChecksum}, received ${current.checksum}.`,
+      );
+    }
+  }
+}
+
 export async function runMigrations(
   pool: Pool,
   migrationsDirectory = defaultMigrationsDirectory,
@@ -33,6 +68,7 @@ export async function runMigrations(
   );
 
   await withTransaction(pool, async (client) => {
+    await client.query("SELECT pg_advisory_xact_lock(hashtext('atlas_schema_migrations'))");
     await client.query(`
       CREATE TABLE IF NOT EXISTS schema_migrations (
         filename TEXT PRIMARY KEY,
@@ -40,26 +76,13 @@ export async function runMigrations(
         applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
       )
     `);
-    await client.query("SELECT pg_advisory_xact_lock(hashtext('atlas_schema_migrations'))");
 
     const applied = await client.query<AppliedMigration>(
-      "SELECT filename, checksum FROM schema_migrations",
+      "SELECT filename, checksum FROM schema_migrations ORDER BY applied_at, filename",
     );
-    const appliedByFilename = new Map(
-      applied.rows.map((migration) => [migration.filename, migration.checksum.trim()]),
-    );
+    validateAppliedMigrationPrefix(migrations, applied.rows);
 
-    for (const migration of migrations) {
-      const recordedChecksum = appliedByFilename.get(migration.filename);
-      if (recordedChecksum !== undefined) {
-        if (recordedChecksum !== migration.checksum) {
-          throw new Error(
-            `Migration checksum mismatch for ${migration.filename}: expected ${recordedChecksum}, received ${migration.checksum}.`,
-          );
-        }
-        continue;
-      }
-
+    for (const migration of migrations.slice(applied.rows.length)) {
       await client.query(migration.sql);
       await client.query(
         "INSERT INTO schema_migrations (filename, checksum) VALUES ($1, $2)",
