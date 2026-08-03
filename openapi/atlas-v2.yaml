@@ -158,10 +158,14 @@ paths:
         Updates the authenticated actor's organization name. Cross-organization
         targets use the same safe NOT_FOUND envelope as unknown resources. This
         narrow foundation operation exists to prove atomic mutation, audit, and
-        outbox behavior before Operating Core resources are introduced.
+        outbox behavior before Operating Core resources are introduced. Repeating
+        the same request with the same idempotency key returns the stored response
+        without duplicating the mutation, audit event, or outbox event. Reusing a
+        key for a different request returns CONFLICT.
       tags: [Organizations]
       parameters:
         - $ref: "#/components/parameters/RequestId"
+        - $ref: "#/components/parameters/IdempotencyKey"
         - name: organizationId
           in: path
           required: true
@@ -192,6 +196,8 @@ paths:
           $ref: "#/components/responses/ApiError"
         "404":
           $ref: "#/components/responses/ApiError"
+        "409":
+          $ref: "#/components/responses/ApiError"
         "500":
           $ref: "#/components/responses/ApiError"
 components:
@@ -217,6 +223,18 @@ components:
       schema:
         type: string
         format: uuid
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: >-
+        Caller-generated key scoped to the authenticated organization, actor,
+        and operation. Use the same key only when retrying the same request.
+      schema:
+        type: string
+        minLength: 8
+        maxLength: 128
+        pattern: "^[A-Za-z0-9._:-]+$"
   headers:
     RequestId:
       required: true

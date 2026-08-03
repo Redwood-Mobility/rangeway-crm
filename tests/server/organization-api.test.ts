@@ -54,7 +54,8 @@ describe("organization API", () => {
     const app = createApp({
       config,
       v2Identity: {
-        authenticateHuman: async () => serviceIdentity,
+        authenticateHumanSession: async () => serviceIdentity,
+        authenticateGoogle: async () => serviceIdentity,
         authenticateLocal: async () => serviceIdentity,
         authenticateServiceKey: async () => serviceIdentity,
       },
@@ -71,6 +72,7 @@ describe("organization API", () => {
       .patch(`/api/v2/organizations/${organizationId}`)
       .set("Authorization", `Bearer ${serviceKey}`)
       .set("X-Request-Id", "00000000-0000-4000-8000-000000000501")
+      .set("Idempotency-Key", "rename-rangeway-20260802")
       .send({ name: "Rangeway Energy" });
 
     expect(response.status).toBe(200);
@@ -82,7 +84,46 @@ describe("organization API", () => {
         { ...serviceIdentity, requestId: "00000000-0000-4000-8000-000000000501" },
         organizationId,
         "Rangeway Energy",
+        "rename-rangeway-20260802",
       ],
     ]);
+  });
+
+  it.each([
+    ["a missing key", undefined],
+    ["a key shorter than eight characters", "short"],
+    ["a key longer than 128 characters", "a".repeat(129)],
+    ["a key with whitespace", "rename rangeway"],
+  ])("rejects %s with the stable invalid-input envelope", async (_label, key) => {
+    let called = false;
+    let mutation = request(createApp({
+      config,
+      v2Identity: {
+        authenticateHumanSession: async () => serviceIdentity,
+        authenticateGoogle: async () => serviceIdentity,
+        authenticateLocal: async () => serviceIdentity,
+        authenticateServiceKey: async () => serviceIdentity,
+      },
+      v2Organizations: {
+        rename: async () => {
+          called = true;
+          return { id: organizationId, name: "Must not run" };
+        },
+      },
+      logger: { error: () => undefined },
+    }))
+      .patch(`/api/v2/organizations/${organizationId}`)
+      .set("Authorization", `Bearer ${serviceKey}`)
+      .send({ name: "Rangeway Energy" });
+    if (key !== undefined) mutation = mutation.set("Idempotency-Key", key);
+
+    const response = await mutation;
+
+    expect(response.status).toBe(400);
+    expect(response.body.error).toMatchObject({
+      code: "INVALID_INPUT",
+      message: "Invalid input.",
+    });
+    expect(called).toBe(false);
   });
 });

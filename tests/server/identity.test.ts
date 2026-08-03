@@ -43,6 +43,7 @@ function humanRecord(overrides: Partial<HumanActorRecord> = {}): HumanActorRecor
     role: "owner",
     userId: randomUUID(),
     email: "zak@winnick.io",
+    googleSubject: null,
     localPasswordHash: null,
     actorDisabledAt: null,
     userDisabledAt: null,
@@ -101,6 +102,56 @@ class MemoryIdentityRepository implements IdentityRepositoryPort {
           human.organizationId === scopedOrganizationId && human.email === email,
       ) ?? null
     );
+  }
+
+  async findHumanActorByGoogleSubject(
+    scopedOrganizationId: string,
+    googleSubject: string,
+  ): Promise<HumanActorRecord | null> {
+    return this.humanRecords.find(
+      (human) =>
+        human.organizationId === scopedOrganizationId &&
+        human.googleSubject === googleSubject,
+    ) ?? null;
+  }
+
+  async findHumanActorByUserId(
+    scopedOrganizationId: string,
+    userId: string,
+  ): Promise<HumanActorRecord | null> {
+    return this.humanRecords.find(
+      (human) =>
+        human.organizationId === scopedOrganizationId && human.userId === userId,
+    ) ?? null;
+  }
+
+  async linkHumanActorToGoogle(
+    scopedOrganizationId: string,
+    userId: string,
+    googleSubject: string,
+    email: string,
+    displayName: string,
+  ): Promise<HumanActorRecord | null> {
+    const human = await this.findHumanActorByUserId(scopedOrganizationId, userId);
+    if (!human || human.googleSubject !== null) return null;
+    human.googleSubject = googleSubject;
+    human.email = email;
+    human.actorName = displayName;
+    return human;
+  }
+
+  async updateHumanGoogleProfile(
+    scopedOrganizationId: string,
+    userId: string,
+    googleSubject: string,
+    email: string,
+    displayName: string,
+  ): Promise<HumanActorRecord | null> {
+    const human = await this.findHumanActorByUserId(scopedOrganizationId, userId);
+    if (!human || human.googleSubject !== googleSubject) return null;
+    human.email = email;
+    human.actorName = displayName;
+    return human;
   }
 
   async createServiceActor(
@@ -361,7 +412,7 @@ describe("IdentityService", () => {
     const service = new IdentityService(fakePool(), repository);
 
     await expect(
-      service.authenticateHuman(organizationId, "zak@winnick.io"),
+      service.authenticateHumanSession(organizationId, repository.human.userId),
     ).rejects.toMatchObject({
       status: 401,
       code: "UNAUTHENTICATED",
@@ -375,7 +426,7 @@ describe("IdentityService", () => {
     const service = new IdentityService(fakePool(), repository);
 
     await expect(
-      service.authenticateHuman(organizationId, "ZAK@WINNICK.IO"),
+      service.authenticateHumanSession(organizationId, repository.human.userId),
     ).resolves.toEqual({
       actorId: repository.human.actorId,
       actorType: "human",
@@ -386,7 +437,7 @@ describe("IdentityService", () => {
     });
   });
 
-  it("requires both organization and email to match for human authentication", async () => {
+  it("requires both organization and immutable user id to match for session authentication", async () => {
     const otherOrganizationId = randomUUID();
     const repository = new MemoryIdentityRepository();
     const service = new IdentityService(fakePool(), repository);
@@ -398,12 +449,12 @@ describe("IdentityService", () => {
       message: "Authentication required.",
     };
     await expect(
-      service.authenticateHuman(organizationId, repository.human.email),
+      service.authenticateHumanSession(organizationId, repository.human.userId),
     ).rejects.toMatchObject(expected);
 
-    repository.human = humanRecord({ email: "different@example.com" });
+    repository.human = humanRecord();
     await expect(
-      service.authenticateHuman(organizationId, "zak@winnick.io"),
+      service.authenticateHumanSession(organizationId, randomUUID()),
     ).rejects.toMatchObject(expected);
   });
 });

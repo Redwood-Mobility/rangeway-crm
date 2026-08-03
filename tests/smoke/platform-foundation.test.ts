@@ -140,6 +140,7 @@ describe("Atlas V2 platform foundation smoke", () => {
 
       const humanMutation = await humanClient
         .patch(`/api/v2/organizations/${rangewayOrganizationId}`)
+        .set("Idempotency-Key", "smoke-human-organization-rename")
         .send({ name: "Rangeway Energy" });
       expect(humanMutation.status).toBe(200);
       expect(humanMutation.body).toEqual({
@@ -149,6 +150,7 @@ describe("Atlas V2 platform foundation smoke", () => {
       const agentMutation = await request(app)
         .patch(`/api/v2/organizations/${rangewayOrganizationId}`)
         .set("Authorization", `Bearer ${agent.serviceKey}`)
+        .set("Idempotency-Key", "smoke-agent-organization-rename")
         .send({ name: "Rangeway" });
       expect(agentMutation.status).toBe(200);
       expect(agentMutation.body).toEqual({
@@ -168,6 +170,7 @@ describe("Atlas V2 platform foundation smoke", () => {
       const wrongOrganization = await request(app)
         .patch(`/api/v2/organizations/${rangewayOrganizationId}`)
         .set("Authorization", `Bearer ${otherAgent.serviceKey}`)
+        .set("Idempotency-Key", "smoke-cross-organization-rename")
         .send({ name: "Cross-organization mutation" });
       expectSafeError(
         wrongOrganization,

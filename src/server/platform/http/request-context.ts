@@ -26,7 +26,7 @@ const bearerPattern = /^Bearer[ \t]+(atlas_[A-Za-z0-9_-]{12}\.[A-Za-z0-9_-]+)$/i
 type ActorIdentity = Omit<ActorContext, "requestId">;
 
 export interface IdentityAuthenticationPort {
-  authenticateHuman(organizationId: string, email: string): Promise<ActorIdentity>;
+  authenticateHumanSession(organizationId: string, userId: string): Promise<ActorIdentity>;
   authenticateServiceKey(serviceKey?: string): Promise<ActorIdentity>;
 }
 
@@ -39,8 +39,9 @@ export function setHumanSessionCookie(
   sessionSecret: string,
   organizationId: string,
   user: SessionUser,
+  actorUserId: string,
 ): void {
-  setSessionCookie(res, { ...user, organizationId }, sessionSecret);
+  setSessionCookie(res, { ...user, organizationId, actorUserId }, sessionSecret);
 }
 
 export function clearHumanSessionCookie(res: Response): void {
@@ -81,9 +82,9 @@ export function authenticateRequest(
       if (hasSession) {
         const session = readHumanSession(req, sessionSecret);
         if (!session) throw unauthenticated();
-        identityContext = await identity.authenticateHuman(
+        identityContext = await identity.authenticateHumanSession(
           session.organizationId,
-          session.email,
+          session.actorUserId,
         );
       } else {
         const match = authorization ? bearerPattern.exec(authorization) : null;

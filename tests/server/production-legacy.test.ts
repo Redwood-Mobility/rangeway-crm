@@ -21,7 +21,17 @@ function temporaryDirectory(): string {
 }
 
 const identity = {
-  async authenticateHuman() {
+  async authenticateHumanSession() {
+    return {
+      actorId: "10000000-0000-4000-8000-000000000001",
+      actorType: "human" as const,
+      actorName: "Atlas Admin",
+      organizationId,
+      role: "owner" as const,
+      userId: "20000000-0000-4000-8000-000000000001",
+    };
+  },
+  async authenticateGoogle() {
     return {
       actorId: "10000000-0000-4000-8000-000000000001",
       actorType: "human" as const,
@@ -51,7 +61,6 @@ function productionApp(databasePath: string, uploadDir: string) {
       googleClientId: "google-client",
       googleClientSecret: "google-secret",
       googleRedirectUri: "https://atlas.rangeway.app/api/auth/google/callback",
-      publicUrl: "https://atlas.rangeway.app",
     },
     v2Identity: identity,
     logger: { error: () => undefined },
@@ -106,12 +115,12 @@ describe("production legacy isolation", () => {
         googleClientId: "google-client",
         googleClientSecret: "google-secret",
         googleRedirectUri: "https://atlas.rangeway.app/api/auth/google/callback",
-        publicUrl: "https://atlas.rangeway.app",
       },
       v2Identity: identity,
       googleOAuth: {
         exchangeCode: async () => "verified-token",
         verifyIdToken: async () => ({
+          subject: "google-subject-001",
           email: "ADMIN@RANGEWAY.ENERGY",
           name: "Atlas Admin",
           picture: "",

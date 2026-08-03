@@ -26,8 +26,23 @@ const disabledServiceKey = "atlas_disabledkey1.ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefg
 const internalFailureKey = "atlas_internalerr1.ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopq";
 
 class ContractIdentity {
-  async authenticateHuman(scopedOrganizationId: string, email: string) {
-    if (scopedOrganizationId !== organizationId || email !== "admin@rangeway.energy") {
+  async authenticateHumanSession(scopedOrganizationId: string, userId: string) {
+    if (scopedOrganizationId !== organizationId || userId !== humanIdentity.userId) {
+      throw new ApiError(401, "UNAUTHENTICATED", "Authentication required.");
+    }
+    return humanIdentity;
+  }
+
+  async authenticateGoogle(
+    scopedOrganizationId: string,
+    subject: string,
+    email: string,
+  ) {
+    if (
+      scopedOrganizationId !== organizationId ||
+      subject !== "google-subject-001" ||
+      email !== "admin@rangeway.energy"
+    ) {
       throw new ApiError(401, "UNAUTHENTICATED", "Authentication required.");
     }
     return humanIdentity;
@@ -255,7 +270,8 @@ describe("Atlas V2 API contract", () => {
           sessionSecret: "contract-test-session-secret-at-least-32-characters",
         },
         v2Identity: {
-          authenticateHuman: identity.authenticateHuman.bind(identity),
+          authenticateHumanSession: identity.authenticateHumanSession.bind(identity),
+          authenticateGoogle: identity.authenticateGoogle.bind(identity),
           authenticateServiceKey: identity.authenticateServiceKey.bind(identity),
           authenticateLocal: async () => serviceIdentity,
         },
@@ -298,10 +314,11 @@ describe("Atlas V2 API contract", () => {
 
   it("uses the canonical human session for Google callback and V2 actor resolution", async () => {
     const identity = new ContractIdentity();
-    const authenticateHuman = vi.spyOn(identity, "authenticateHuman");
+    const authenticateGoogle = vi.spyOn(identity, "authenticateGoogle");
     const googleOAuth = {
       exchangeCode: vi.fn(async () => "verified-google-id-token"),
       verifyIdToken: vi.fn(async () => ({
+        subject: "google-subject-001",
         email: "ADMIN@RANGEWAY.ENERGY",
         name: "Atlas Admin",
         picture: "https://example.test/avatar.png",
@@ -316,7 +333,8 @@ describe("Atlas V2 API contract", () => {
         sessionSecret: "contract-test-session-secret-at-least-32-characters",
         googleClientId: "google-client-id",
         googleClientSecret: "google-client-secret",
-        publicUrl: "http://localhost:5173",
+        googleRedirectUri: "https://atlas.rangeway.app/api/auth/google/callback",
+        atlasOrigin: "https://atlas.rangeway.app",
       },
       v2Identity: identity,
       googleOAuth,
@@ -335,11 +353,17 @@ describe("Atlas V2 API contract", () => {
     const sessionCookie = sessionCookieHeader.split(";")[0];
 
     expect(callback.status).toBe(302);
+    expect(new URL(begin.headers.location).searchParams.get("redirect_uri")).toBe(
+      "https://atlas.rangeway.app/api/auth/google/callback",
+    );
+    expect(callback.headers.location).toBe("https://atlas.rangeway.app");
     expect(googleOAuth.exchangeCode).toHaveBeenCalledWith("authorization-code");
     expect(googleOAuth.verifyIdToken).toHaveBeenCalledWith("verified-google-id-token");
-    expect(authenticateHuman).toHaveBeenCalledWith(
+    expect(authenticateGoogle).toHaveBeenCalledWith(
       organizationId,
+      "google-subject-001",
       "admin@rangeway.energy",
+      "Atlas Admin",
     );
 
     const me = await request(app).get("/api/v2/me").set("Cookie", sessionCookie);
@@ -350,7 +374,7 @@ describe("Atlas V2 API contract", () => {
 
   it("does not issue a Google session when V2 actor validation rejects the human", async () => {
     const identity = new ContractIdentity();
-    vi.spyOn(identity, "authenticateHuman").mockRejectedValue(
+    vi.spyOn(identity, "authenticateGoogle").mockRejectedValue(
       new ApiError(401, "UNAUTHENTICATED", "Authentication required."),
     );
     const app = createApp({
@@ -367,6 +391,7 @@ describe("Atlas V2 API contract", () => {
       googleOAuth: {
         exchangeCode: async () => "verified-google-id-token",
         verifyIdToken: async () => ({
+          subject: "google-subject-001",
           email: "admin@rangeway.energy",
           name: "Disabled Atlas Admin",
           picture: "",

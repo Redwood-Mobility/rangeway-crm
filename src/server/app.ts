@@ -52,6 +52,7 @@ type Row = Record<string, unknown>;
 const rangewayOrganizationId = "00000000-0000-4000-8000-000000000001";
 
 export interface GoogleProfile {
+  subject: string;
   email: string;
   name: string;
   picture: string;
@@ -197,7 +198,7 @@ function safeUnlink(filePath: string) {
 }
 
 function redirectUri() {
-  return `${config.publicUrl.replace(/\/$/, "")}/api/auth/google/callback`;
+  return config.googleRedirectUri;
 }
 
 function decodeJwtPayload(token: string) {
@@ -228,14 +229,17 @@ async function verifyGoogleIdToken(idToken: string) {
   const hostedDomain = String(tokenInfo.hd || "").toLowerCase();
   const allowedDomain = config.googleAllowedDomain.toLowerCase();
   const emailVerified = tokenInfo.email_verified === true || tokenInfo.email_verified === "true";
+  const subject = String(tokenInfo.sub || "");
 
   if (String(tokenInfo.aud) !== config.googleClientId) throw new Error("Google sign-in audience mismatch.");
   if (!emailVerified) throw new Error("Google account email is not verified.");
+  if (!subject) throw new Error("Google account identity is unavailable.");
   if (hostedDomain !== allowedDomain || !email.endsWith(`@${allowedDomain}`)) {
     throw new Error(`Atlas is limited to ${allowedDomain} accounts.`);
   }
 
   return {
+    subject,
     email,
     name: String(tokenPayload.name || tokenInfo.name || email),
     picture: String(tokenPayload.picture || tokenInfo.picture || "")
@@ -367,7 +371,7 @@ app.get("/api/me", (req, res) => {
 });
 
 app.get("/api/auth/google", (_req, res) => {
-  if (!config.googleClientId || !config.googleClientSecret) {
+  if (!config.googleClientId || !config.googleClientSecret || !config.googleRedirectUri) {
     res.status(503).send("Google SSO is not configured.");
     return;
   }
@@ -410,9 +414,11 @@ app.get("/api/auth/google/callback", async (req, res, next) => {
       ...verifiedGoogleUser,
       email: verifiedGoogleUser.email.toLowerCase(),
     };
-    const actor = await v2Identity.authenticateHuman(
+    const actor = await v2Identity.authenticateGoogle(
       rangewayOrganizationId,
+      googleUser.subject,
       googleUser.email,
+      googleUser.name,
     );
     if (actor.actorType !== "human" || !actor.userId) {
       throw new ApiError(401, "UNAUTHENTICATED", "Authentication required.");
@@ -430,10 +436,11 @@ app.get("/api/auth/google/callback", async (req, res, next) => {
       {
         ...session,
         organizationId: actor.organizationId,
+        actorUserId: actor.userId,
       },
       config.sessionSecret,
     );
-    res.redirect(config.publicUrl);
+    res.redirect(config.atlasOrigin);
   } catch (error) {
     next(error);
   }
@@ -467,7 +474,7 @@ app.post("/api/login", (req, res) => {
   const payload = sessionUser(user);
   setSessionCookie(
     res,
-    { ...payload, organizationId: rangewayOrganizationId },
+    { ...payload, organizationId: rangewayOrganizationId, actorUserId: payload.id },
     config.sessionSecret,
   );
   res.json({ user: payload });

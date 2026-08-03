@@ -4,6 +4,7 @@ set -euo pipefail
 ATLAS_BACKUP_FORMAT="atlas-v2-postgres-artifacts-v1"
 BACKUP_ROOT_INPUT="${BACKUP_ROOT:-/var/backups/atlas-v2}"
 COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-atlas-v2}"
+KEEP_QUIESCED="${ATLAS_KEEP_QUIESCED:-0}"
 REPOSITORY_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 
 fail() {
@@ -42,6 +43,8 @@ canonicalize_absolute_path() {
 
 [[ "${BACKUP_ROOT_INPUT}" != *'*'* && "${BACKUP_ROOT_INPUT}" != *'?'* && "${BACKUP_ROOT_INPUT}" != *'['* ]] \
   || fail "BACKUP_ROOT cannot contain a glob."
+[[ "${KEEP_QUIESCED}" == "0" || "${KEEP_QUIESCED}" == "1" ]] \
+  || fail "ATLAS_KEEP_QUIESCED must be 0 or 1."
 LEXICAL_BACKUP_ROOT="$(canonicalize_absolute_path "${BACKUP_ROOT_INPUT}")" \
   || fail "BACKUP_ROOT must be an absolute path."
 
@@ -238,6 +241,9 @@ docker run --rm \
   printf 'compose_project=%s\n' "${COMPOSE_PROJECT_NAME}"
   printf 'database_image=%s\n' "${DATABASE_IMAGE}"
   printf 'timestamp=%s\n' "${TIMESTAMP}"
+  printf 'writers_quiesced=%s\n' "${KEEP_QUIESCED}"
+  printf 'web_was_active=%s\n' "${WEB_WAS_ACTIVE}"
+  printf 'worker_was_active=%s\n' "${WORKER_WAS_ACTIVE}"
 } > "${PENDING_DIR}/metadata.txt"
 
 (
@@ -246,7 +252,9 @@ docker run --rm \
 )
 [[ -s "${PENDING_DIR}/manifest.sha256" ]] || fail "manifest.sha256 is empty."
 
-restart_app_services || fail "one or more app services could not be restarted after backup."
+if [[ "${KEEP_QUIESCED}" -eq 0 ]]; then
+  restart_app_services || fail "one or more app services could not be restarted after backup."
+fi
 RESTORE_SERVICES=0
 
 mv -- "${PENDING_DIR}" "${FINAL_DIR}"

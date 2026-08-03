@@ -5,7 +5,7 @@ import { parseConfig } from "../../src/server/config.js";
 const productionEnv = {
   NODE_ENV: "production",
   PORT: "8081",
-  DATABASE_URL: "postgresql://atlas:atlas@db:5432/atlas",
+  DATABASE_URL: "postgresql://atlas_web:web-password@db:5432/atlas",
   SESSION_SECRET: "a-secure-session-secret-that-is-at-least-32-characters",
   ATLAS_ORIGIN: "https://atlas.rangeway.app",
   ARTIFACT_DIR: "/var/lib/atlas/artifacts",
@@ -39,6 +39,17 @@ describe("parseConfig", () => {
     expectConfigIssue({ ...productionEnv, AUTH_MODE: "local" }, ["authMode"], "AUTH_MODE must be google in production.");
   });
 
+  it.each(["atlas", "atlas_migrator", "atlas_worker", "postgres"])(
+    "rejects the privileged %s database role for the production web process",
+    (username) => {
+      expectConfigIssue(
+        { ...productionEnv, DATABASE_URL: `postgresql://${username}:secret@db:5432/atlas` },
+        ["databaseUrl"],
+        "DATABASE_URL must use the least-privilege atlas_web role in production.",
+      );
+    },
+  );
+
   it.each(["DATABASE_URL", "SESSION_SECRET", "ATLAS_ORIGIN", "GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET", "GOOGLE_REDIRECT_URI"])(
     "rejects a production configuration missing %s",
     (name) => {
@@ -62,6 +73,37 @@ describe("parseConfig", () => {
       { ...productionEnv, ATLAS_ORIGIN: "http://atlas.rangeway.app" },
       ["atlasOrigin"],
       "ATLAS_ORIGIN must use HTTPS in production."
+    );
+  });
+
+  it("requires the production Google callback to use HTTPS on the Atlas browser origin", () => {
+    expectConfigIssue(
+      { ...productionEnv, GOOGLE_REDIRECT_URI: "http://atlas.rangeway.app/api/auth/google/callback" },
+      ["googleRedirectUri"],
+      "GOOGLE_REDIRECT_URI must use HTTPS in production.",
+    );
+    expectConfigIssue(
+      { ...productionEnv, GOOGLE_REDIRECT_URI: "https://oauth-proxy.example/api/auth/google/callback" },
+      ["googleRedirectUri"],
+      "GOOGLE_REDIRECT_URI must use the same origin as ATLAS_ORIGIN.",
+    );
+    expectConfigIssue(
+      { ...productionEnv, GOOGLE_REDIRECT_URI: "https://atlas.rangeway.app/oauth/callback" },
+      ["googleRedirectUri"],
+      "GOOGLE_REDIRECT_URI must use the Atlas Google callback path.",
+    );
+    expectConfigIssue(
+      { ...productionEnv, GOOGLE_REDIRECT_URI: "not-a-url" },
+      ["googleRedirectUri"],
+      "GOOGLE_REDIRECT_URI must be a valid URL.",
+    );
+  });
+
+  it("requires ATLAS_ORIGIN to be an origin without path, query, or fragment", () => {
+    expectConfigIssue(
+      { ...productionEnv, ATLAS_ORIGIN: "https://atlas.rangeway.app/app" },
+      ["atlasOrigin"],
+      "ATLAS_ORIGIN must contain only the browser origin.",
     );
   });
 });

@@ -1,10 +1,21 @@
-import { describe, expect, it } from "vitest";
+import { randomUUID } from "node:crypto";
+import type { Pool } from "pg";
+import { describe, expect, it, type TestContext } from "vitest";
+import { createPool } from "../../src/server/platform/db/client.js";
+import { runMigrations } from "../../src/server/platform/db/migrate.js";
 import {
+  createProductionOutboxHandlers,
   runWorkerRuntime,
   type OutboxRuntimeWorker,
   type WorkerLifecycle,
   type WorkerPool,
 } from "../../src/worker/index.js";
+import { OutboxWorker } from "../../src/worker/outbox-worker.js";
+import { parseWorkerConfig } from "../../src/worker/config.js";
+import {
+  createTemporaryDatabase,
+  PostgreSqlUnavailableError,
+} from "../helpers/database.js";
 
 type Signal = "SIGINT" | "SIGTERM";
 
@@ -92,6 +103,94 @@ function runtime(
 }
 
 describe("outbox worker entrypoint lifecycle", () => {
+  it("requires the production worker database credential to use atlas_worker", () => {
+    expect(parseWorkerConfig({
+      NODE_ENV: "production",
+      DATABASE_URL: "postgresql://atlas_worker:worker-password@db:5432/atlas",
+      WORKER_POLL_MS: "2500",
+    })).toEqual({
+      databaseUrl: "postgresql://atlas_worker:worker-password@db:5432/atlas",
+      workerPollMilliseconds: 2500,
+    });
+    expect(() => parseWorkerConfig({
+      NODE_ENV: "production",
+      DATABASE_URL: "postgresql://atlas_migrator:migrator-password@db:5432/atlas",
+    })).toThrow(/atlas_worker/);
+  });
+
+  it("registers an explicit production handler for every event the foundation emits", async () => {
+    const handlers = createProductionOutboxHandlers();
+    expect(Object.keys(handlers)).toEqual(["organization.updated.v1"]);
+    await expect(handlers["organization.updated.v1"]!(
+      {
+        id: "10000000-0000-4000-8000-000000000001",
+        organizationId: "00000000-0000-4000-8000-000000000001",
+        actorId: "20000000-0000-4000-8000-000000000001",
+        requestId: "30000000-0000-4000-8000-000000000001",
+        eventType: "organization.updated.v1",
+        aggregateType: "organization",
+        aggregateId: "00000000-0000-4000-8000-000000000001",
+        schemaVersion: 1,
+        payload: { name: "Rangeway" },
+        availableAt: new Date(),
+        attemptCount: 0,
+        processingStartedAt: new Date(),
+        processingToken: randomUUID(),
+        createdAt: new Date(),
+      },
+      { idempotencyKey: "10000000-0000-4000-8000-000000000001" },
+    )).resolves.toBeUndefined();
+  });
+
+  it("publishes a foundation event through the actual production registry", async (context: TestContext) => {
+    let temporaryDatabase;
+    try {
+      temporaryDatabase = await createTemporaryDatabase();
+    } catch (error) {
+      if (error instanceof PostgreSqlUnavailableError) {
+        context.skip(error.message);
+        return;
+      }
+      throw error;
+    }
+
+    const pool = createPool(temporaryDatabase.databaseUrl);
+    try {
+      await runMigrations(pool);
+      const actorId = randomUUID();
+      const eventId = randomUUID();
+      const organizationId = "00000000-0000-4000-8000-000000000001";
+      await pool.query(
+        `INSERT INTO actors
+           (id, organization_id, type, role, service_key_prefix, service_key_hash, display_name)
+         VALUES ($1, $2, 'automation', 'member', $3, $4, 'Registry test')`,
+        [actorId, organizationId, randomUUID().replaceAll("-", "").slice(0, 12), "a".repeat(64)],
+      );
+      await pool.query(
+        `INSERT INTO outbox_events
+           (id, organization_id, actor_id, request_id, event_type, aggregate_type,
+            aggregate_id, schema_version, payload)
+         VALUES ($1, $2, $3, $4, 'organization.updated.v1', 'organization', $2, 1, $5)`,
+        [eventId, organizationId, actorId, randomUUID(), { organizationId, name: "Rangeway" }],
+      );
+
+      await new OutboxWorker({
+        pool: pool as Pool,
+        handlers: createProductionOutboxHandlers(),
+      }).runOnce();
+
+      const event = await pool.query<{ published_at: Date | null; terminal_at: Date | null }>(
+        "SELECT published_at, terminal_at FROM outbox_events WHERE id = $1",
+        [eventId],
+      );
+      expect(event.rows[0].published_at).toBeInstanceOf(Date);
+      expect(event.rows[0].terminal_at).toBeNull();
+    } finally {
+      await pool.end();
+      await temporaryDatabase.cleanup();
+    }
+  });
+
   it("wires both signals and performs one clean shutdown for repeated signals", async () => {
     const lifecycle = new TestLifecycle();
     const pool = new TestPool();

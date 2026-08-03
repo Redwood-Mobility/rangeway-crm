@@ -1,12 +1,31 @@
 import process from "node:process";
 import { pathToFileURL } from "node:url";
 import type { Pool } from "pg";
-import { config } from "../server/config.js";
 import { createPool as createPostgreSqlPool } from "../server/platform/db/client.js";
-import { OutboxWorker } from "./outbox-worker.js";
+import {
+  atlasEventTypes,
+  type AtlasEventType,
+} from "../shared/events.js";
+import {
+  OutboxWorker,
+  type OutboxHandler,
+  type OutboxHandlerRegistry,
+} from "./outbox-worker.js";
+import { parseWorkerConfig } from "./config.js";
 
 const defaultShutdownTimeoutMilliseconds = 25_000;
 type WorkerSignal = "SIGINT" | "SIGTERM";
+
+// Foundation organization events have no external side effect yet. Explicitly
+// acknowledging them is intentional: the audit event and durable outbox row
+// remain the record, while later plans can replace this handler atomically.
+const acknowledgeFoundationEvent: OutboxHandler = async () => undefined;
+
+export function createProductionOutboxHandlers(): OutboxHandlerRegistry {
+  return {
+    [atlasEventTypes.organizationUpdated]: acknowledgeFoundationEvent,
+  } satisfies Record<AtlasEventType, OutboxHandler>;
+}
 
 export interface WorkerPool {
   end(): Promise<void>;
@@ -149,6 +168,7 @@ export async function runWorkerRuntime(options: WorkerRuntimeOptions): Promise<v
 }
 
 export function main(): Promise<void> {
+  const workerConfig = parseWorkerConfig(process.env);
   const lifecycle: WorkerLifecycle = {
     on: (signal, listener) => process.on(signal, listener),
     off: (signal, listener) => process.off(signal, listener),
@@ -156,14 +176,13 @@ export function main(): Promise<void> {
   };
 
   return runWorkerRuntime({
-    databaseUrl: config.databaseUrl,
-    workerPollMilliseconds: config.workerPollMs,
+    databaseUrl: workerConfig.databaseUrl,
+    workerPollMilliseconds: workerConfig.workerPollMilliseconds,
     createPool: createPostgreSqlPool,
     createWorker: (pool) =>
       new OutboxWorker({
         pool: pool as Pool,
-        // External integrations will register versioned handlers in a later task.
-        handlers: {},
+        handlers: createProductionOutboxHandlers(),
       }),
     lifecycle,
   });

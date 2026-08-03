@@ -23,6 +23,7 @@ const expectedRelations = [
   "organization_memberships",
   "audit_events",
   "outbox_events",
+  "api_idempotency_keys",
 ];
 
 type MigrationFile = {

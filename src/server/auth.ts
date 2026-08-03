@@ -14,6 +14,7 @@ export type SessionUser = {
 
 export type HumanSessionInput = SessionUser & {
   organizationId: string;
+  actorUserId: string;
 };
 
 export type HumanSession = HumanSessionInput & {
@@ -42,6 +43,7 @@ export function setSessionCookie(
   const payload = Buffer.from(
     JSON.stringify({
       organizationId: session.organizationId,
+      actorUserId: session.actorUserId,
       id: session.id,
       email: session.email.toLowerCase(),
       name: session.name || session.email,
@@ -93,6 +95,8 @@ export function readHumanSession(
       !parsed.organizationId ||
       typeof parsed.id !== "string" ||
       !parsed.id ||
+      typeof parsed.actorUserId !== "string" ||
+      !parsed.actorUserId ||
       typeof parsed.email !== "string" ||
       !parsed.email ||
       typeof parsed.expiresAt !== "number" ||
@@ -102,6 +106,7 @@ export function readHumanSession(
     }
     return {
       organizationId: parsed.organizationId,
+      actorUserId: parsed.actorUserId,
       id: parsed.id,
       email: parsed.email.toLowerCase(),
       name: parsed.name || parsed.email,

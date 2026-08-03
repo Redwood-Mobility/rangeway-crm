@@ -4,7 +4,7 @@ Atlas is Rangeway's internal relationship and site-development system. It is bei
 
 > **Foundation status — do not deploy yet.** This branch proves the Atlas V2 platform foundation; it is not the complete operating-office UI. Do not deploy or cut over to it until the equipped foundation gates, the Operating Core, representative acceptance projects, and the cutover plan are separately reviewed and approved.
 
-The current foundation includes PostgreSQL migrations, organization-scoped human/agent/automation identities, stable API envelopes and request IDs, an atomic mutation/audit/outbox path, a bounded-retry outbox worker, and recoverable deployment and backup tooling. Project Rooms, Workstreams, universal Work Items, Today, portfolio health, decisions, risks, milestones, and their Kanban/list/calendar projections belong to the next Operating Core plan.
+The current foundation includes PostgreSQL migrations, organization-scoped human/agent/automation identities, stable API envelopes and request IDs, idempotent mutation/audit/outbox transactions, an explicit bounded-retry outbox worker registry, least-privilege database roles, and recoverable deployment and backup tooling. Project Rooms, Workstreams, universal Work Items, Today, portfolio health, decisions, risks, milestones, and their Kanban/list/calendar projections belong to the next Operating Core plan.
 
 ## Architecture
 
@@ -13,7 +13,7 @@ Atlas V2 is a TypeScript modular monolith built and deployed from one repository
 - `atlas-web`: Express, the versioned `/api/v2` boundary, and the built React client.
 - `atlas-worker`: background outbox processing with bounded retries and safe concurrent claims.
 
-PostgreSQL 17 is authoritative for V2 records, audit history, and the transactional outbox. A separate `atlas-artifacts` volume is reserved for uploaded and generated artifacts. Caddy terminates production TLS. The web and worker use the same image but start with different commands.
+PostgreSQL 17 is authoritative for V2 records, append-only audit history, API idempotency records, and the transactional outbox. A separate `atlas-artifacts` volume is reserved for uploaded and generated artifacts. Caddy terminates production TLS. The web and worker use the same image but start with different commands. Production migrations run through the operations-only `atlas_migrator` service; web and worker never migrate on startup and connect as `atlas_web` and `atlas_worker` respectively.
 
 Every client, human, agent, automation, and future integration crosses the API and shared permission boundary. No client receives direct database access. A successful business mutation, audit event, and outbox event commit in one PostgreSQL transaction.
 
@@ -99,11 +99,15 @@ Open `http://localhost:5173`. `npm run dev` is a convenience command for web plu
 
 ## Authentication and actors
 
-- **Human:** a real user with an organization membership. Local password login is available only with `AUTH_MODE=local` outside production and issues the canonical signed `rw_session` cookie. Production is constrained to Google Workspace mode.
+- **Human:** a real user with an organization membership. Local password login is available only with `AUTH_MODE=local` outside production and issues the canonical signed `rw_session` cookie. Production is constrained to Google Workspace mode. The first successful Workspace login links the provisioned user to Google's immutable subject; later email changes update that same identity, while recycled-email or subject-mismatch attempts are rejected.
 - **Agent:** a named service actor such as Codex or Hermes. It uses its own one-time `atlas_…` bearer credential and never impersonates an unrecorded human.
 - **Automation:** a non-human scheduled or event-driven actor. It also has its own bearer credential and distinct audit attribution.
 
 An HTTP request may present one human session cookie or one Atlas bearer credential, never both. Every authenticated actor is organization-scoped and every mutation carries the actor and request ID into audit and outbox records.
+
+Mutation routes that declare `Idempotency-Key` require a caller-generated key. Retrying the same operation, actor, organization, key, and request body returns the stored response without repeating business, audit, or outbox writes. Reusing that scope and key for a different request returns `409 CONFLICT`.
+
+Production uses `ATLAS_ORIGIN` as the browser return origin and `GOOGLE_REDIRECT_URI` as the exact OAuth callback. Both must be HTTPS, the callback must use the same origin, and the callback path is `/api/auth/google/callback`.
 
 ## Verification commands
 

@@ -11,6 +11,12 @@ const organizationNameSchema = z.strictObject({
   name: z.string().trim().min(1).max(200),
 });
 
+const idempotencyKeySchema = z
+  .string()
+  .min(8)
+  .max(128)
+  .regex(/^[A-Za-z0-9._:-]+$/);
+
 export function createOrganizationRouter(
   organizations: OrganizationMutationPort,
 ): Router {
@@ -19,10 +25,12 @@ export function createOrganizationRouter(
   router.patch("/organizations/:organizationId", requireActor, async (req, res) => {
     const { organizationId } = organizationParamsSchema.parse(req.params);
     const { name } = organizationNameSchema.parse(req.body);
+    const idempotencyKey = idempotencyKeySchema.parse(req.get("Idempotency-Key"));
     const organization = await organizations.rename(
       req.actor!,
       organizationId,
       name,
+      idempotencyKey,
     );
     res.json({ organization });
   });

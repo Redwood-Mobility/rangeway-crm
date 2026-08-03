@@ -111,6 +111,95 @@ export class IdentityService {
     }
   }
 
+  async authenticateGoogle(
+    organizationId: string,
+    googleSubject: string,
+    email: string,
+    displayName: string,
+  ): Promise<ActorIdentity> {
+    const normalizedSubject = googleSubject.trim();
+    const normalizedEmail = email.trim().toLowerCase();
+    const normalizedDisplayName = displayName.trim() || normalizedEmail;
+    if (!normalizedSubject || normalizedSubject.length > 255 || !normalizedEmail) {
+      throw unauthenticatedError();
+    }
+
+    try {
+      const actor = await withTransaction(this.pool, async (client) => {
+        const subjectActor = await this.repository.findHumanActorByGoogleSubject(
+          organizationId,
+          normalizedSubject,
+          client,
+          { forUpdate: true },
+        );
+        if (subjectActor) {
+          if (subjectActor.actorDisabledAt || subjectActor.userDisabledAt) {
+            throw unauthenticatedError();
+          }
+          const emailActor = await this.repository.findHumanActorByEmail(
+            organizationId,
+            normalizedEmail,
+            client,
+            { forUpdate: true },
+          );
+          if (emailActor && emailActor.userId !== subjectActor.userId) {
+            throw unauthenticatedError();
+          }
+          return this.repository.updateHumanGoogleProfile(
+            organizationId,
+            subjectActor.userId,
+            normalizedSubject,
+            normalizedEmail,
+            normalizedDisplayName,
+            client,
+          );
+        }
+
+        const emailActor = await this.repository.findHumanActorByEmail(
+          organizationId,
+          normalizedEmail,
+          client,
+          { forUpdate: true },
+        );
+        if (
+          !emailActor ||
+          emailActor.actorDisabledAt ||
+          emailActor.userDisabledAt ||
+          (emailActor.googleSubject !== null &&
+            emailActor.googleSubject !== normalizedSubject)
+        ) {
+          throw unauthenticatedError();
+        }
+
+        if (emailActor.googleSubject === normalizedSubject) {
+          return this.repository.updateHumanGoogleProfile(
+            organizationId,
+            emailActor.userId,
+            normalizedSubject,
+            normalizedEmail,
+            normalizedDisplayName,
+            client,
+          );
+        }
+        return this.repository.linkHumanActorToGoogle(
+          organizationId,
+          emailActor.userId,
+          normalizedSubject,
+          normalizedEmail,
+          normalizedDisplayName,
+          client,
+        );
+      });
+      if (!actor || actor.actorDisabledAt || actor.userDisabledAt) {
+        throw unauthenticatedError();
+      }
+      return authenticatedHumanIdentity(actor);
+    } catch (error) {
+      if (isUniqueViolation(error)) throw unauthenticatedError();
+      throw error;
+    }
+  }
+
   async createServiceActor(input: CreateServiceActorInput): Promise<CreatedServiceIdentity> {
     if (input.actorType !== "agent" && input.actorType !== "automation") {
       throw new ApiError(400, "INVALID_INPUT", "Service actors must be agents or automations.");
@@ -132,10 +221,13 @@ export class IdentityService {
     return { ...publicServiceIdentity(created), actorType: created.actorType, serviceKey };
   }
 
-  async authenticateHuman(organizationId: string, email: string): Promise<ActorIdentity> {
-    const actor = await this.repository.findHumanActorByEmail(
+  async authenticateHumanSession(
+    organizationId: string,
+    userId: string,
+  ): Promise<ActorIdentity> {
+    const actor = await this.repository.findHumanActorByUserId(
       organizationId,
-      email.toLowerCase(),
+      userId,
       this.pool,
     );
     if (!actor || actor.actorDisabledAt || actor.userDisabledAt) {

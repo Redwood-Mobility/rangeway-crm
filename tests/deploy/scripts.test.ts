@@ -43,8 +43,10 @@ function fakeTool(binDirectory: string, name: string, body: string): void {
 function productionEnvironment(): string {
   return [
     "NODE_ENV=production",
-    "POSTGRES_PASSWORD=correct-horse-battery-staple",
-    "DATABASE_URL=postgresql://atlas:correct-horse-battery-staple@db:5432/atlas",
+    "POSTGRES_BOOTSTRAP_PASSWORD=bootstrap-password",
+    "ATLAS_MIGRATOR_PASSWORD=migrator-password",
+    "ATLAS_WEB_PASSWORD=web-password",
+    "ATLAS_WORKER_PASSWORD=worker-password",
     "SESSION_SECRET=a-production-session-secret-at-least-32-characters",
     "ATLAS_ORIGIN=https://atlas.rangeway.app",
     "AUTH_MODE=google",
@@ -129,7 +131,10 @@ if [[ "$*" == "volume inspect atlas-db" ]]; then
   [[ "\${FAKE_HAS_DB:-0}" == "1" ]] && exit 0 || exit 1
 fi
 if [[ "$*" == "compose ps -q db" ]]; then printf '%s\\n' db-container; exit 0; fi
+if [[ "$*" == "compose ps -q web" ]]; then printf '%s\\n' web-container; exit 0; fi
+if [[ "$*" == "compose ps -q worker" ]]; then printf '%s\\n' worker-container; exit 0; fi
 if [[ "$*" == *"State.Health.Status"* ]]; then printf '%s\\n' healthy; exit 0; fi
+if [[ "$*" == *"--profile operations run --rm migrator"* && "\${FAKE_MIGRATION_FAIL:-0}" == "1" ]]; then exit 59; fi
 exit 0`);
   fakeTool(binDirectory, "ssh", `
 printf '%s\\n' "$*" >> "\${FAKE_LOG_DIR}/ssh.log"
@@ -190,10 +195,12 @@ function installRemoteBackup(fixture: DeployFixture): string {
 set -euo pipefail
 ATLAS_BACKUP_FORMAT="atlas-v2-postgres-artifacts-v1"
 exact='${exactBackup}'
+printf '%s\\n' "\${ATLAS_KEEP_QUIESCED:-unset}" > "\${FAKE_LOG_DIR}/backup-quiesced.log"
+docker stop web-container worker-container >/dev/null
 mkdir -p "\${exact}"
 printf dump > "\${exact}/atlas-postgres.dump"
 printf artifacts > "\${exact}/atlas-artifacts.tgz"
-printf metadata > "\${exact}/metadata.txt"
+printf 'web_was_active=1\nworker_was_active=1\nwriters_quiesced=1\n' > "\${exact}/metadata.txt"
 (cd "\${exact}" && sha256sum atlas-postgres.dump atlas-artifacts.tgz metadata.txt > manifest.sha256)
 printf 'ATLAS_BACKUP_PATH=%s\\n' "\${exact}"
 `);
@@ -313,7 +320,7 @@ describe("deploy.sh behavior", () => {
     expect(existsSync(path.join(fixture.logDirectory, "rsync-counter"))).toBe(false);
   });
 
-  it("prints exact recovery evidence after a post-backup failure without changing the release marker", () => {
+  it("restarts the exact prior-active containers after a failure before migration begins", () => {
     const fixture = createDeployFixture();
     const exactBackup = installRemoteBackup(fixture);
     const result = deploy(fixture, { FAKE_HAS_DB: "1", FAKE_RSYNC_FAIL_ON: "1" });
@@ -321,8 +328,33 @@ describe("deploy.sh behavior", () => {
     expect(result.status).not.toBe(0);
     expect(result.stderr).toContain(`Previous Git commit: ${releaseCommit}`);
     expect(result.stderr).toContain(`Exact pre-deploy backup: ${exactBackup}`);
-    expect(result.stderr).toMatch(/No rollback was run automatically/i);
+    expect(result.stderr).toMatch(/prior-active services restarted/i);
+    const dockerLog = readFileSync(path.join(fixture.logDirectory, "docker.log"), "utf8");
+    expect(dockerLog).toContain("start worker-container");
+    expect(dockerLog).toContain("start web-container");
     expect(readFileSync(path.join(fixture.remoteDirectory, ".atlas-release"), "utf8").trim()).toBe(releaseCommit);
+  });
+
+  it("fails closed after migration begins and never restarts incompatible old containers", () => {
+    const fixture = createDeployFixture();
+    const exactBackup = installRemoteBackup(fixture);
+    const result = deploy(fixture, { FAKE_HAS_DB: "1", FAKE_MIGRATION_FAIL: "1" });
+
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain(`Exact pre-deploy backup: ${exactBackup}`);
+    expect(result.stderr).toMatch(/migration compatibility boundary crossed|fail closed/i);
+    const dockerLog = readFileSync(path.join(fixture.logDirectory, "docker.log"), "utf8");
+    expect(dockerLog).not.toContain("start worker-container");
+    expect(dockerLog).not.toContain("start web-container");
+  });
+
+  it("requests one quiesced backup for an existing deployment", () => {
+    const fixture = createDeployFixture();
+    installRemoteBackup(fixture);
+    const result = deploy(fixture, { FAKE_HAS_DB: "1" });
+
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+    expect(readFileSync(path.join(fixture.logDirectory, "backup-quiesced.log"), "utf8").trim()).toBe("1");
   });
 
   it("does not install a release marker when target-bound health fails", () => {
@@ -462,6 +494,18 @@ function backup(fixture: BackupFixture, overrides: NodeJS.ProcessEnv = {}) {
 }
 
 describe("backup.sh behavior", () => {
+  it("supports a deploy-only quiesced success mode without changing standalone restart behavior", () => {
+    const fixture = createBackupFixture();
+    const result = backup(fixture, { ATLAS_KEEP_QUIESCED: "1" });
+
+    expect(result.status, result.stderr).toBe(0);
+    const log = readFileSync(path.join(fixture.logDirectory, "docker.log"), "utf8");
+    expect(log).toContain("compose stop web");
+    expect(log).toContain("compose stop worker");
+    expect(log).not.toContain("compose start web");
+    expect(log).not.toContain("compose start worker");
+  });
+
   it("rejects a canonical backup root inside the synchronized repository before mutation", () => {
     const fixture = createBackupFixture();
     const nestedBackup = path.join(fixture.repository, "nested", "..", "backups");

@@ -97,12 +97,32 @@ ENV_FILE="$(realpath "${ENV_FILE_INPUT}")"
 if grep -q "REPLACE_WITH" "${ENV_FILE}"; then
   fail "production environment file still contains REPLACE_WITH placeholders."
 fi
-for required_key in POSTGRES_PASSWORD DATABASE_URL SESSION_SECRET ATLAS_ORIGIN AUTH_MODE; do
+for required_key in \
+  POSTGRES_BOOTSTRAP_PASSWORD \
+  ATLAS_MIGRATOR_PASSWORD \
+  ATLAS_WEB_PASSWORD \
+  ATLAS_WORKER_PASSWORD \
+  SESSION_SECRET \
+  ATLAS_ORIGIN \
+  AUTH_MODE \
+  GOOGLE_CLIENT_ID \
+  GOOGLE_CLIENT_SECRET \
+  GOOGLE_REDIRECT_URI; do
   grep -Eq "^${required_key}=.+$" "${ENV_FILE}" \
     || fail "production environment file is missing ${required_key}."
 done
-grep -Eq '^DATABASE_URL=postgres(ql)?://[^@]+@db:5432/atlas(\?.*)?$' "${ENV_FILE}" \
-  || fail "DATABASE_URL must target the Compose service db:5432/atlas."
+grep -Fxq 'NODE_ENV=production' "${ENV_FILE}" \
+  || fail "production environment must set NODE_ENV=production."
+grep -Fxq 'AUTH_MODE=google' "${ENV_FILE}" \
+  || fail "production environment must set AUTH_MODE=google."
+grep -Eq '^ATLAS_ORIGIN=https://[^/]+$' "${ENV_FILE}" \
+  || fail "ATLAS_ORIGIN must be an HTTPS origin without a path."
+grep -Eq '^GOOGLE_REDIRECT_URI=https://[^/]+/api/auth/google/callback$' "${ENV_FILE}" \
+  || fail "GOOGLE_REDIRECT_URI must be the HTTPS Atlas callback URL."
+ATLAS_ORIGIN_VALUE="$(sed -n 's/^ATLAS_ORIGIN=//p' "${ENV_FILE}")"
+GOOGLE_REDIRECT_URI_VALUE="$(sed -n 's/^GOOGLE_REDIRECT_URI=//p' "${ENV_FILE}")"
+[[ "${GOOGLE_REDIRECT_URI_VALUE}" == "${ATLAS_ORIGIN_VALUE}/api/auth/google/callback" ]] \
+  || fail "GOOGLE_REDIRECT_URI must use the exact ATLAS_ORIGIN."
 
 ENV_SOURCE_EXCLUDE=""
 case "${ENV_FILE}" in
@@ -154,7 +174,7 @@ REMOTE_PATHS
 }
 
 # Resolve remote symlinks and dot segments before the first remote mutation.
-REMOTE_PATH_STATE="$(resolve_remote_paths 2> >(tee /dev/stderr))"
+REMOTE_PATH_STATE="$(resolve_remote_paths 2> >(tee /dev/stderr >/dev/null))"
 
 REMOTE_DIR=""
 REMOTE_BACKUP_ROOT=""
@@ -202,6 +222,32 @@ remote_dir="$1"
 backup_root="$2"
 previous_commit="none"
 exact_backup="none"
+web_container="none"
+worker_container="none"
+writers_quiesced=0
+
+restart_prior_writers() {
+  local restart_status=0
+  set +e
+  [[ "${worker_container}" == "none" ]] || docker start "${worker_container}" >/dev/null || restart_status=1
+  [[ "${web_container}" == "none" ]] || docker start "${web_container}" >/dev/null || restart_status=1
+  set -e
+  return "${restart_status}"
+}
+
+restart_preflight_failure() {
+  local failure_status="$?"
+  trap - EXIT
+  if [[ "${failure_status}" -ne 0 && "${writers_quiesced}" -eq 1 ]]; then
+    if restart_prior_writers; then
+      echo "Deployment preflight failed; prior-active services restarted before migration." >&2
+    else
+      echo "Deployment preflight failed and one or more prior-active services could not be restarted." >&2
+    fi
+  fi
+  exit "${failure_status}"
+}
+trap restart_preflight_failure EXIT
 
 if [[ -f "${remote_dir}/.atlas-release" ]]; then
   previous_commit="$(tr -d '[:space:]' < "${remote_dir}/.atlas-release")"
@@ -215,13 +261,24 @@ if docker volume inspect atlas-db >/dev/null 2>&1; then
   [[ "${previous_commit}" =~ ^[0-9a-f]{40}$ ]] \
     || { echo "Existing Atlas V2 database has no valid recorded release commit; refusing replacement." >&2; exit 1; }
 
+  prior_web_container="$(cd "${remote_dir}" && docker compose ps -q web)"
+  prior_worker_container="$(cd "${remote_dir}" && docker compose ps -q worker)"
+  [[ -z "${prior_web_container}" || "${prior_web_container}" =~ ^[A-Za-z0-9_.-]+$ ]] \
+    || { echo "Could not capture the exact prior web container." >&2; exit 1; }
+  [[ -z "${prior_worker_container}" || "${prior_worker_container}" =~ ^[A-Za-z0-9_.-]+$ ]] \
+    || { echo "Could not capture the exact prior worker container." >&2; exit 1; }
+
   backup_output="$({
     cd "${remote_dir}"
     BACKUP_ROOT="${backup_root}" \
       COMPOSE_PROJECT_NAME="atlas-v2" \
       ATLAS_GIT_COMMIT="${previous_commit}" \
+      ATLAS_KEEP_QUIESCED=1 \
       ./deploy/backup.sh
   })"
+  # A successful keep-quiesced backup has stopped the prior writers even if
+  # its machine-readable stdout is malformed and must be rejected below.
+  writers_quiesced=1
   [[ "$(printf '%s\n' "${backup_output}" | wc -l | tr -d '[:space:]')" == "1" ]] \
     || { echo "Backup script did not emit exactly one machine-readable path." >&2; exit 1; }
   case "${backup_output}" in
@@ -241,10 +298,26 @@ if docker volume inspect atlas-db >/dev/null 2>&1; then
   done
   (cd "${exact_backup}" && sha256sum --check manifest.sha256) >&2
 
+  web_was_active="$(sed -n 's/^web_was_active=//p' "${exact_backup}/metadata.txt")"
+  worker_was_active="$(sed -n 's/^worker_was_active=//p' "${exact_backup}/metadata.txt")"
+  [[ "${web_was_active}" == "0" || "${web_was_active}" == "1" ]] \
+    || { echo "Backup metadata has an invalid web_was_active value." >&2; exit 1; }
+  [[ "${worker_was_active}" == "0" || "${worker_was_active}" == "1" ]] \
+    || { echo "Backup metadata has an invalid worker_was_active value." >&2; exit 1; }
+  if [[ "${web_was_active}" -eq 1 ]]; then
+    web_container="${prior_web_container}"
+    [[ "${web_container}" =~ ^[A-Za-z0-9_.-]+$ ]] \
+      || { echo "Could not capture the exact prior web container." >&2; exit 1; }
+  fi
+  if [[ "${worker_was_active}" -eq 1 ]]; then
+    worker_container="${prior_worker_container}"
+    [[ "${worker_container}" =~ ^[A-Za-z0-9_.-]+$ ]] \
+      || { echo "Could not capture the exact prior worker container." >&2; exit 1; }
+  fi
+
   if [[ ! -x "${remote_dir}/deploy/restore-test.sh" ]]; then
     echo "Existing Atlas V2 database found, but the non-destructive restore test is unavailable." >&2
     echo "Deployment stopped before source sync or migration." >&2
-    echo "No rollback was run automatically." >&2
     echo "Previous Git commit: ${previous_commit}" >&2
     echo "Exact pre-deploy backup: ${exact_backup}" >&2
     exit 1
@@ -255,7 +328,6 @@ if docker volume inspect atlas-db >/dev/null 2>&1; then
   ) >&2; then
     echo "Fresh pre-deploy backup failed its non-destructive restore test." >&2
     echo "Deployment stopped before source sync or migration." >&2
-    echo "No rollback was run automatically." >&2
     echo "Previous Git commit: ${previous_commit}" >&2
     echo "Exact pre-deploy backup: ${exact_backup}" >&2
     exit 1
@@ -263,52 +335,109 @@ if docker volume inspect atlas-db >/dev/null 2>&1; then
   echo "Fresh pre-deploy backup passed its non-destructive restore test: ${exact_backup}" >&2
 fi
 
+trap - EXIT
 printf 'PREVIOUS_COMMIT=%s\n' "${previous_commit}"
 printf 'EXACT_BACKUP=%s\n' "${exact_backup}"
+printf 'WEB_CONTAINER=%s\n' "${web_container}"
+printf 'WORKER_CONTAINER=%s\n' "${worker_container}"
 REMOTE_PREFLIGHT
 }
 
 # Back up only the explicitly named V2 volumes before source or containers change.
-REMOTE_STATE="$(run_remote_preflight 2> >(tee /dev/stderr))"
+REMOTE_STATE="$(run_remote_preflight 2> >(tee /dev/stderr >/dev/null))"
 
 PREVIOUS_COMMIT="none"
 EXACT_BACKUP="none"
+WEB_CONTAINER="none"
+WORKER_CONTAINER="none"
+PREVIOUS_COMMIT_COUNT=0
+EXACT_BACKUP_COUNT=0
+WEB_CONTAINER_COUNT=0
+WORKER_CONTAINER_COUNT=0
 while IFS='=' read -r state_key state_value; do
   case "${state_key}" in
-    PREVIOUS_COMMIT) PREVIOUS_COMMIT="${state_value}" ;;
-    EXACT_BACKUP) EXACT_BACKUP="${state_value}" ;;
+    PREVIOUS_COMMIT)
+      PREVIOUS_COMMIT_COUNT=$((PREVIOUS_COMMIT_COUNT + 1))
+      PREVIOUS_COMMIT="${state_value}"
+      ;;
+    EXACT_BACKUP)
+      EXACT_BACKUP_COUNT=$((EXACT_BACKUP_COUNT + 1))
+      EXACT_BACKUP="${state_value}"
+      ;;
+    WEB_CONTAINER)
+      WEB_CONTAINER_COUNT=$((WEB_CONTAINER_COUNT + 1))
+      WEB_CONTAINER="${state_value}"
+      ;;
+    WORKER_CONTAINER)
+      WORKER_CONTAINER_COUNT=$((WORKER_CONTAINER_COUNT + 1))
+      WORKER_CONTAINER="${state_value}"
+      ;;
+    *) fail "remote preflight response contained an unexpected key: ${state_key}." ;;
   esac
 done <<< "${REMOTE_STATE}"
+[[ "${PREVIOUS_COMMIT_COUNT}" -eq 1 && "${EXACT_BACKUP_COUNT}" -eq 1 \
+  && "${WEB_CONTAINER_COUNT}" -eq 1 && "${WORKER_CONTAINER_COUNT}" -eq 1 ]] \
+  || fail "remote preflight values must each be returned exactly once."
 [[ "${PREVIOUS_COMMIT}" == "none" || "${PREVIOUS_COMMIT}" =~ ^[0-9a-f]{40}$ ]] \
   || fail "remote preflight returned an invalid previous commit."
 [[ "${EXACT_BACKUP}" == "none" || "${EXACT_BACKUP}" == "${REMOTE_BACKUP_ROOT}/"* ]] \
   || fail "remote preflight returned an invalid backup path."
+[[ "${WEB_CONTAINER}" == "none" || "${WEB_CONTAINER}" =~ ^[A-Za-z0-9_.-]+$ ]] \
+  || fail "remote preflight returned an invalid web container."
+[[ "${WORKER_CONTAINER}" == "none" || "${WORKER_CONTAINER}" =~ ^[A-Za-z0-9_.-]+$ ]] \
+  || fail "remote preflight returned an invalid worker container."
 
 GUIDANCE_PRINTED=0
-print_recovery_guidance() {
+MIGRATION_STARTED=0
+DEPLOYMENT_COMPLETE=0
+recover_failed_deployment() {
   local failure_status="$1"
   [[ "${GUIDANCE_PRINTED}" -eq 0 ]] || return 0
   GUIDANCE_PRINTED=1
+  trap - ERR EXIT
+  set +e
   {
     echo "Atlas V2 deployment failed with status ${failure_status}."
-    echo "No rollback was run automatically."
     echo "Previous Git commit: ${PREVIOUS_COMMIT}"
     echo "Exact pre-deploy backup: ${EXACT_BACKUP}"
-    echo "Manual recovery: inspect the failed services and backup manifest before creating a clean worktree at the previous commit or performing any operator-reviewed restore."
   } >&2
-}
-on_deploy_error() {
-  local failure_status="$?"
-  print_recovery_guidance "${failure_status}"
-  return "${failure_status}"
+
+  if [[ "${MIGRATION_STARTED}" -eq 0 ]]; then
+    if ssh "${SSH_OPTS[@]}" "${REMOTE_TARGET}" bash -s -- \
+      "${WEB_CONTAINER}" "${WORKER_CONTAINER}" <<'REMOTE_RESTART_PRIOR'
+set -euo pipefail
+web_container="$1"
+worker_container="$2"
+[[ "${worker_container}" == "none" ]] || docker start "${worker_container}" >/dev/null
+[[ "${web_container}" == "none" ]] || docker start "${web_container}" >/dev/null
+REMOTE_RESTART_PRIOR
+    then
+      echo "Failure occurred before migration; exact prior-active services restarted." >&2
+    else
+      echo "Failure occurred before migration, but one or more exact prior-active services could not be restarted." >&2
+    fi
+  else
+    if ssh "${SSH_OPTS[@]}" "${REMOTE_TARGET}" bash -s -- "${REMOTE_DIR}" <<'REMOTE_FAIL_CLOSED'
+set -euo pipefail
+cd "$1"
+docker compose stop web worker
+REMOTE_FAIL_CLOSED
+    then
+      echo "Migration compatibility boundary crossed; Atlas writers remain stopped (fail closed)." >&2
+    else
+      echo "Migration compatibility boundary crossed, but the deployer could not confirm that Atlas writers stopped." >&2
+    fi
+    echo "Operator recovery: inspect the failed release and exact backup before any reviewed restore or forward fix." >&2
+  fi
+
+  exit "${failure_status}"
 }
 on_deploy_exit() {
   local failure_status="$?"
-  if [[ "${failure_status}" -ne 0 ]]; then
-    print_recovery_guidance "${failure_status}"
+  if [[ "${failure_status}" -ne 0 && "${DEPLOYMENT_COMPLETE}" -eq 0 ]]; then
+    recover_failed_deployment "${failure_status}"
   fi
 }
-trap on_deploy_error ERR
 trap on_deploy_exit EXIT
 
 RSYNC_TREE_ARGS=(
@@ -335,14 +464,14 @@ rsync "${RSYNC_TREE_ARGS[@]}" ./ "${REMOTE_TARGET}:${REMOTE_DIR}/"
 rsync -az --chmod=F600 -e "${RSYNC_RSH}" \
   "${ENV_FILE}" "${REMOTE_TARGET}:${REMOTE_DIR}/.env"
 
-ssh "${SSH_OPTS[@]}" "${REMOTE_TARGET}" bash -s -- "${REMOTE_DIR}" <<'REMOTE_DEPLOY'
+ssh "${SSH_OPTS[@]}" "${REMOTE_TARGET}" bash -s -- "${REMOTE_DIR}" <<'REMOTE_PREPARE'
 set -euo pipefail
 
 remote_dir="$1"
 cd "${remote_dir}"
 
 docker compose config >/dev/null
-docker compose build web
+docker compose build web worker
 docker compose up -d db
 
 db_container="$(docker compose ps -q db)"
@@ -356,11 +485,23 @@ done
 [[ "$(docker inspect --format '{{.State.Health.Status}}' "${db_container}")" == "healthy" ]] \
   || { echo "Atlas V2 database did not become healthy." >&2; docker compose logs db >&2; exit 1; }
 
-docker compose run --rm web npm run db:migrate
+docker compose exec -T db /docker-entrypoint-initdb.d/001-atlas-roles.sh
+REMOTE_PREPARE
+
+# From this exact point onward, an old application image may be incompatible
+# with the migrated schema. Any failure must keep all writers stopped.
+MIGRATION_STARTED=1
+ssh "${SSH_OPTS[@]}" "${REMOTE_TARGET}" bash -s -- "${REMOTE_DIR}" <<'REMOTE_MIGRATE_AND_START'
+set -euo pipefail
+
+remote_dir="$1"
+cd "${remote_dir}"
+
+docker compose --profile operations run --rm migrator
 docker compose up -d web worker caddy
 docker compose up -d --wait --wait-timeout 180
 docker compose ps
-REMOTE_DEPLOY
+REMOTE_MIGRATE_AND_START
 
 TARGET_HEALTH_RESPONSE="$({
   ssh "${SSH_OPTS[@]}" "${REMOTE_TARGET}" bash -s -- <<'REMOTE_HEALTH'
@@ -402,7 +543,8 @@ printf '%s\n' "${release_commit}" > "${remote_dir}/.atlas-release.next"
 mv -- "${remote_dir}/.atlas-release.next" "${remote_dir}/.atlas-release"
 REMOTE_RELEASE
 
-trap - ERR EXIT
+DEPLOYMENT_COMPLETE=1
+trap - EXIT
 echo "Atlas V2 release ${LOCAL_COMMIT} passed target-bound and public HTTPS health verification."
 echo "No rollback was run automatically."
 echo "Previous Git commit: ${PREVIOUS_COMMIT}"

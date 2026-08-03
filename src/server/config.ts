@@ -26,7 +26,6 @@ const configSchema = z
     googleRedirectUri: optionalString,
     workerPollMs: z.coerce.number().int().positive().default(1000),
     // V1 compatibility fields remain until the V2 identity and persistence work replaces them.
-    publicUrl: z.string().trim().url().default("http://localhost:5173"),
     adminEmail: z.string().trim().email().default("admin@rangeway.energy"),
     adminPassword: z.string().default("rangeway-dev"),
     googleAllowedDomain: z.string().trim().min(1).default("rangeway.energy"),
@@ -42,6 +41,14 @@ const configSchema = z
     }
     if (!value.databaseUrl) {
       context.addIssue({ code: "custom", path: ["databaseUrl"], message: "DATABASE_URL is required in production." });
+    } else {
+      try {
+        if (new URL(value.databaseUrl).username !== "atlas_web") {
+          context.addIssue({ code: "custom", path: ["databaseUrl"], message: "DATABASE_URL must use the least-privilege atlas_web role in production." });
+        }
+      } catch {
+        context.addIssue({ code: "custom", path: ["databaseUrl"], message: "DATABASE_URL must be a valid PostgreSQL URL." });
+      }
     }
     if (value.sessionSecret === developmentSessionSecret) {
       context.addIssue({ code: "custom", path: ["sessionSecret"], message: "SESSION_SECRET is required in production." });
@@ -50,6 +57,8 @@ const configSchema = z
       context.addIssue({ code: "custom", path: ["atlasOrigin"], message: "ATLAS_ORIGIN is required in production." });
     } else if (new URL(value.atlasOrigin).protocol !== "https:") {
       context.addIssue({ code: "custom", path: ["atlasOrigin"], message: "ATLAS_ORIGIN must use HTTPS in production." });
+    } else if (value.atlasOrigin !== new URL(value.atlasOrigin).origin) {
+      context.addIssue({ code: "custom", path: ["atlasOrigin"], message: "ATLAS_ORIGIN must contain only the browser origin." });
     }
 
     for (const [field, name] of [
@@ -59,6 +68,25 @@ const configSchema = z
     ] as const) {
       if (!value[field]) {
         context.addIssue({ code: "custom", path: [field], message: `${name} is required in production.` });
+      }
+    }
+
+    if (value.googleRedirectUri) {
+      try {
+        const redirect = new URL(value.googleRedirectUri);
+        if (redirect.protocol !== "https:") {
+          context.addIssue({ code: "custom", path: ["googleRedirectUri"], message: "GOOGLE_REDIRECT_URI must use HTTPS in production." });
+        } else if (redirect.origin !== new URL(value.atlasOrigin).origin) {
+          context.addIssue({ code: "custom", path: ["googleRedirectUri"], message: "GOOGLE_REDIRECT_URI must use the same origin as ATLAS_ORIGIN." });
+        } else if (
+          redirect.pathname !== "/api/auth/google/callback" ||
+          redirect.search ||
+          redirect.hash
+        ) {
+          context.addIssue({ code: "custom", path: ["googleRedirectUri"], message: "GOOGLE_REDIRECT_URI must use the Atlas Google callback path." });
+        }
+      } catch {
+        context.addIssue({ code: "custom", path: ["googleRedirectUri"], message: "GOOGLE_REDIRECT_URI must be a valid URL." });
       }
     }
   });
@@ -80,7 +108,6 @@ export function parseConfig(env: NodeJS.ProcessEnv): Config {
     googleClientSecret: env.GOOGLE_CLIENT_SECRET,
     googleRedirectUri: env.GOOGLE_REDIRECT_URI,
     workerPollMs: env.WORKER_POLL_MS,
-    publicUrl: env.PUBLIC_URL ?? env.ATLAS_ORIGIN,
     adminEmail: env.ADMIN_EMAIL,
     adminPassword: env.ADMIN_PASSWORD,
     googleAllowedDomain: env.GOOGLE_ALLOWED_DOMAIN,

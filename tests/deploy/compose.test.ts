@@ -44,15 +44,20 @@ const resolvedCompose = hasDockerCompose
 describe.skipIf(!hasDockerCompose)("resolved Docker Compose topology", () => {
   const compose = resolvedCompose!;
 
-  it("contains exactly the four Atlas V2 services", () => {
-    expect(Object.keys(compose.services).sort()).toEqual(["caddy", "db", "web", "worker"]);
+  it("contains the four runtime services plus the operations-only migrator", () => {
+    expect(Object.keys(compose.services).sort()).toEqual(["caddy", "db", "migrator", "web", "worker"]);
   });
 
-  it("runs web and worker from one image with different commands", () => {
+  it("runs web and worker without schema-owner credentials or startup migrations", () => {
     expect(compose.services.web.image).toBe(compose.services.worker.image);
-    expect(commandIncludes(compose.services.web.command, "npm run db:migrate && npm start")).toBe(true);
-    expect(commandIncludes(compose.services.worker.command, "npm run db:migrate && npm run start:worker")).toBe(true);
+    expect(commandIncludes(compose.services.web.command, "npm start")).toBe(true);
+    expect(commandIncludes(compose.services.worker.command, "npm run start:worker")).toBe(true);
+    expect(commandIncludes(compose.services.web.command, "db:migrate")).toBe(false);
+    expect(commandIncludes(compose.services.worker.command, "db:migrate")).toBe(false);
     expect(compose.services.web.command).not.toEqual(compose.services.worker.command);
+    expect(String((compose.services.web.environment as Record<string, unknown>).DATABASE_URL)).toContain("atlas_web:");
+    expect(String((compose.services.worker.environment as Record<string, unknown>).DATABASE_URL)).toContain("atlas_worker:");
+    expect(String((compose.services.migrator.environment as Record<string, unknown>).DATABASE_URL)).toContain("atlas_migrator:");
   });
 
   it("keeps PostgreSQL 17 private on the dedicated database volume", () => {
@@ -79,6 +84,7 @@ describe.skipIf(!hasDockerCompose)("resolved Docker Compose topology", () => {
   it("gates app processes on database health and exposes web health", () => {
     expect(compose.services.web.depends_on).toMatchObject({ db: { condition: "service_healthy" } });
     expect(compose.services.worker.depends_on).toMatchObject({ db: { condition: "service_healthy" } });
+    expect(compose.services.migrator.depends_on).toMatchObject({ db: { condition: "service_healthy" } });
     expect(commandIncludes((compose.services.web.healthcheck as { test?: unknown }).test, "/api/v2/health")).toBe(true);
   });
 
@@ -106,15 +112,21 @@ describe("deterministic deployment source contract", () => {
 
   it("defines the exact V2 services, images, commands, mounts, and health dependencies", () => {
     expect(composeSource).toMatch(/^name: atlas-v2$/m);
-    expect(composeSource.match(/^  (web|worker|db|caddy):$/gm)?.map((line) => line.trim()).sort()).toEqual([
+    expect(composeSource.match(/^  (web|worker|migrator|db|caddy):$/gm)?.map((line) => line.trim()).sort()).toEqual([
       "caddy:",
       "db:",
+      "migrator:",
       "web:",
       "worker:",
     ]);
     expect(composeSource).toContain("postgres:17-bookworm");
-    expect(composeSource).toContain("npm run db:migrate && npm start");
-    expect(composeSource).toContain("npm run db:migrate && npm run start:worker");
+    expect(composeSource).toContain('command: ["npm", "start"]');
+    expect(composeSource).toContain('command: ["npm", "run", "start:worker"]');
+    expect(composeSource).toContain('command: ["npm", "run", "db:migrate"]');
+    expect(composeSource).toContain("profiles: [operations]");
+    expect(composeSource).toContain("postgresql://atlas_web:");
+    expect(composeSource).toContain("postgresql://atlas_worker:");
+    expect(composeSource).toContain("postgresql://atlas_migrator:");
     expect(composeSource).toContain("atlas-db:/var/lib/postgresql/data");
     expect(composeSource.match(/atlas-artifacts:\/app\/artifacts/g)).toHaveLength(2);
     expect(composeSource.match(/condition: service_healthy/g)?.length).toBeGreaterThanOrEqual(3);
@@ -152,8 +164,17 @@ describe("deterministic deployment source contract", () => {
 
   it("uses the compiled migration entrypoint and the Compose database hostname", () => {
     expect(packageJson.scripts["db:migrate"]).toBe("node dist/server/platform/db/migrate.js");
-    expect(productionEnvironment).toContain("@db:5432/atlas");
-    expect(productionEnvironment).toMatch(/^POSTGRES_PASSWORD=.+$/m);
+    expect(composeSource).toContain("@db:5432/atlas");
+    for (const variable of [
+      "POSTGRES_BOOTSTRAP_PASSWORD",
+      "ATLAS_MIGRATOR_PASSWORD",
+      "ATLAS_WEB_PASSWORD",
+      "ATLAS_WORKER_PASSWORD",
+    ]) {
+      expect(productionEnvironment).toMatch(new RegExp(`^${variable}=.+$`, "m"));
+    }
+    expect(productionEnvironment).not.toMatch(/^DATABASE_URL=/m);
+    expect(productionEnvironment).not.toMatch(/^POSTGRES_PASSWORD=/m);
   });
 
   it("proxies the production domain to the V2 web service", () => {
@@ -177,7 +198,8 @@ describe("deterministic deployment source contract", () => {
     expect(deployScript).toContain("npm run build");
     expect(deployScript).toContain("@redocly/cli lint openapi/atlas-v2.yaml");
     expect(deployScript).toContain("docker compose up -d db");
-    expect(deployScript).toContain("docker compose run --rm web npm run db:migrate");
+    expect(deployScript).toContain("docker compose exec -T db /docker-entrypoint-initdb.d/001-atlas-roles.sh");
+    expect(deployScript).toContain("docker compose --profile operations run --rm migrator");
     expect(deployScript).toContain("docker compose up -d web worker caddy");
     expect(deployScript).toContain("https://atlas.rangeway.app/api/v2/health");
     expect(deployScript).toContain("apiVersion");

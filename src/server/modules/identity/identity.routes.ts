@@ -25,6 +25,12 @@ export interface V2IdentityPort extends IdentityAuthenticationPort {
     email: string,
     password: string,
   ): Promise<ActorIdentity>;
+  authenticateGoogle(
+    organizationId: string,
+    googleSubject: string,
+    email: string,
+    displayName: string,
+  ): Promise<ActorIdentity>;
 }
 
 export type SessionUserResolver = (
@@ -82,6 +88,7 @@ export function createIdentityRouter(
       config.sessionSecret,
       identityContext.organizationId,
       sessionUser,
+      identityContext.userId,
     );
     res.json({ actor: req.actor });
   });

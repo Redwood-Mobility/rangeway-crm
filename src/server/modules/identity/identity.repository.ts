@@ -33,6 +33,7 @@ export interface HumanActorRecord {
   role: OrganizationRole;
   userId: string;
   email: string;
+  googleSubject: string | null;
   localPasswordHash: string | null;
   actorDisabledAt: Date | null;
   userDisabledAt: Date | null;
@@ -59,6 +60,34 @@ export interface IdentityRepositoryPort {
   findHumanActorByEmail(
     organizationId: string,
     email: string,
+    client: QueryClient,
+    options?: { forUpdate?: boolean },
+  ): Promise<HumanActorRecord | null>;
+  findHumanActorByGoogleSubject(
+    organizationId: string,
+    googleSubject: string,
+    client: QueryClient,
+    options?: { forUpdate?: boolean },
+  ): Promise<HumanActorRecord | null>;
+  findHumanActorByUserId(
+    organizationId: string,
+    userId: string,
+    client: QueryClient,
+  ): Promise<HumanActorRecord | null>;
+  linkHumanActorToGoogle(
+    organizationId: string,
+    userId: string,
+    googleSubject: string,
+    email: string,
+    displayName: string,
+    client: QueryClient,
+  ): Promise<HumanActorRecord | null>;
+  updateHumanGoogleProfile(
+    organizationId: string,
+    userId: string,
+    googleSubject: string,
+    email: string,
+    displayName: string,
     client: QueryClient,
   ): Promise<HumanActorRecord | null>;
   createServiceActor(
@@ -87,6 +116,7 @@ interface HumanActorRow extends QueryResultRow {
   role: OrganizationRole;
   user_id: string;
   email: string;
+  google_subject: string | null;
   local_password_hash: string | null;
   actor_disabled_at: Date | null;
   user_disabled_at: Date | null;
@@ -112,6 +142,7 @@ function mapHumanActor(row: HumanActorRow): HumanActorRecord {
     role: row.role,
     userId: row.user_id,
     email: row.email,
+    googleSubject: row.google_subject,
     localPasswordHash: row.local_password_hash,
     actorDisabledAt: row.actor_disabled_at,
     userDisabledAt: row.user_disabled_at,
@@ -132,6 +163,42 @@ function mapServiceActor(row: ServiceActorRow): ServiceActorRecord {
 }
 
 export class IdentityRepository implements IdentityRepositoryPort {
+  private async findHumanActor(
+    organizationId: string,
+    field: "email" | "google_subject" | "id",
+    value: string,
+    client: QueryClient,
+    forUpdate = false,
+  ): Promise<HumanActorRecord | null> {
+    const userPredicate = field === "id" ? "u.id = $2" : `u.${field} = $2`;
+    const result = await client.query<HumanActorRow>(
+      `SELECT a.id AS actor_id,
+              a.type AS actor_type,
+              a.display_name AS actor_name,
+              a.organization_id,
+              a.role,
+              u.id AS user_id,
+              u.email::text AS email,
+              u.google_subject,
+              u.local_password_hash,
+              a.disabled_at AS actor_disabled_at,
+              u.disabled_at AS user_disabled_at
+         FROM actors a
+         JOIN users u ON u.id = a.user_id
+         JOIN organization_memberships m
+           ON m.organization_id = a.organization_id
+          AND m.user_id = u.id
+          AND m.role = a.role
+        WHERE a.organization_id = $1
+          AND m.organization_id = $1
+          AND a.type = 'human'
+          AND ${userPredicate}
+        ${forUpdate ? "FOR UPDATE OF a, u, m" : ""}`,
+      [organizationId, value],
+    );
+    return result.rows[0] ? mapHumanActor(result.rows[0]) : null;
+  }
+
   async createHumanUser(
     input: CreateHumanUserInput,
     client: QueryClient,
@@ -178,6 +245,7 @@ export class IdentityRepository implements IdentityRepositoryPort {
       role: actor.role,
       userId: user.id,
       email: user.email,
+      googleSubject: null,
       actorDisabledAt: actor.disabled_at,
       userDisabledAt: user.disabled_at,
     };
@@ -187,31 +255,107 @@ export class IdentityRepository implements IdentityRepositoryPort {
     organizationId: string,
     email: string,
     client: QueryClient,
+    options: { forUpdate?: boolean } = {},
   ): Promise<HumanActorRecord | null> {
-    const result = await client.query<HumanActorRow>(
-      `SELECT a.id AS actor_id,
-              a.type AS actor_type,
-              a.display_name AS actor_name,
-              a.organization_id,
-              a.role,
-              u.id AS user_id,
-              u.email::text AS email,
-              u.local_password_hash,
-              a.disabled_at AS actor_disabled_at,
-              u.disabled_at AS user_disabled_at
-         FROM actors a
-         JOIN users u ON u.id = a.user_id
-         JOIN organization_memberships m
-           ON m.organization_id = a.organization_id
-          AND m.user_id = u.id
-          AND m.role = a.role
-        WHERE a.organization_id = $1
-          AND m.organization_id = $1
-          AND a.type = 'human'
-          AND u.email = $2`,
-      [organizationId, email],
+    return this.findHumanActor(
+      organizationId,
+      "email",
+      email,
+      client,
+      options.forUpdate,
     );
-    return result.rows[0] ? mapHumanActor(result.rows[0]) : null;
+  }
+
+  async findHumanActorByGoogleSubject(
+    organizationId: string,
+    googleSubject: string,
+    client: QueryClient,
+    options: { forUpdate?: boolean } = {},
+  ): Promise<HumanActorRecord | null> {
+    return this.findHumanActor(
+      organizationId,
+      "google_subject",
+      googleSubject,
+      client,
+      options.forUpdate,
+    );
+  }
+
+  async findHumanActorByUserId(
+    organizationId: string,
+    userId: string,
+    client: QueryClient,
+  ): Promise<HumanActorRecord | null> {
+    return this.findHumanActor(organizationId, "id", userId, client);
+  }
+
+  async linkHumanActorToGoogle(
+    organizationId: string,
+    userId: string,
+    googleSubject: string,
+    email: string,
+    displayName: string,
+    client: QueryClient,
+  ): Promise<HumanActorRecord | null> {
+    const linked = await client.query(
+      `UPDATE users u
+          SET google_subject = $3,
+              email = $4,
+              display_name = $5,
+              updated_at = now()
+         FROM actors a, organization_memberships m
+        WHERE u.id = $2
+          AND u.google_subject IS NULL
+          AND a.user_id = u.id
+          AND a.organization_id = $1
+          AND a.type = 'human'
+          AND m.organization_id = a.organization_id
+          AND m.user_id = u.id
+          AND m.role = a.role`,
+      [organizationId, userId, googleSubject, email, displayName],
+    );
+    if (linked.rowCount !== 1) return null;
+    await client.query(
+      `UPDATE actors
+          SET display_name = $3, updated_at = now()
+        WHERE organization_id = $1 AND user_id = $2 AND type = 'human'`,
+      [organizationId, userId, displayName],
+    );
+    return this.findHumanActorByUserId(organizationId, userId, client);
+  }
+
+  async updateHumanGoogleProfile(
+    organizationId: string,
+    userId: string,
+    googleSubject: string,
+    email: string,
+    displayName: string,
+    client: QueryClient,
+  ): Promise<HumanActorRecord | null> {
+    const updated = await client.query(
+      `UPDATE users u
+          SET email = $4,
+              display_name = $5,
+              updated_at = now()
+         FROM actors a, organization_memberships m
+        WHERE u.id = $2
+          AND u.google_subject = $3
+          AND a.user_id = u.id
+          AND a.organization_id = $1
+          AND a.type = 'human'
+          AND m.organization_id = a.organization_id
+          AND m.user_id = u.id
+          AND m.role = a.role`,
+      [organizationId, userId, googleSubject, email, displayName],
+    );
+    if (updated.rowCount !== 1) return null;
+    await client.query(
+      `UPDATE actors
+          SET display_name = $3, updated_at = now()
+        WHERE organization_id = $1 AND user_id = $2 AND type = 'human'`,
+      [organizationId, userId, displayName],
+    );
+    return this.findHumanActorByUserId(organizationId, userId, client);
   }
 
   async createServiceActor(
