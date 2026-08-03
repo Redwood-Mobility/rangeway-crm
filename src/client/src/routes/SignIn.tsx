@@ -11,6 +11,7 @@ export function SignIn() {
   const location = useLocation();
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [showLocal, setShowLocal] = useState(false);
 
   const returnTo = (location.state as { returnTo?: string } | null)?.returnTo ?? "/today";
 
@@ -47,12 +48,33 @@ export function SignIn() {
           organization owner.
         </p>
 
+        {/*
+          Google is the production path. Local email sign-in exists for
+          development and is refused by the server in production, so it stays
+          behind a disclosure rather than presenting a dead form by default.
+        */}
+        <a className="button button--primary" href="/api/auth/google" style={{ width: "100%" }}>
+          Continue with Google
+        </a>
+
+        {showLocal ? null : (
+          <button
+            type="button"
+            className="button button--quiet"
+            onClick={() => setShowLocal(true)}
+          >
+            Sign in with email instead
+          </button>
+        )}
+
         {message ? (
           <p className="field-error" role="alert">
             {message}
           </p>
         ) : null}
 
+        {showLocal ? (
+        <>
         <Field label="Email" htmlFor="signin-email">
           <input
             id="signin-email"
@@ -77,9 +99,11 @@ export function SignIn() {
           />
         </Field>
 
-        <button type="submit" className="button button--primary" disabled={signIn.isPending}>
-          {signIn.isPending ? "Signing in…" : "Sign in"}
+        <button type="submit" className="button" disabled={signIn.isPending}>
+          {signIn.isPending ? "Signing in…" : "Sign in with email"}
         </button>
+        </>
+        ) : null}
       </form>
     </main>
   );

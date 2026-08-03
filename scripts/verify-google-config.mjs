@@ -18,7 +18,7 @@ const {
   GOOGLE_CLIENT_ID = "",
   GOOGLE_CLIENT_SECRET = "",
   GOOGLE_REDIRECT_URI = "",
-  GOOGLE_ALLOWED_DOMAIN = "rangeway.energy",
+  GOOGLE_ALLOWED_DOMAIN = "rangeway.co",
 } = process.env;
 
 const callbackPath = "/api/auth/google/callback";

@@ -55,7 +55,10 @@ export async function runMigrations(
   migrationsDirectory = defaultMigrationsDirectory,
 ): Promise<void> {
   const filenames = (await readdir(migrationsDirectory))
-    .filter((filename) => filename.endsWith(".sql"))
+    // Only real migration files. A stray sidecar — macOS writes `._name.sql`
+    // AppleDouble files when archiving — would otherwise be read as SQL and
+    // sent to PostgreSQL as binary, failing with an opaque protocol error.
+    .filter((filename) => filename.endsWith(".sql") && !filename.startsWith("."))
     .sort();
 
   const migrations = await Promise.all(

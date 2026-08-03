@@ -28,9 +28,9 @@ const configSchema = z
     workerPollMs: z.coerce.number().int().positive().default(1000),
     releaseSha: z.string().trim().default("development"),
     // V1 compatibility fields remain until the V2 identity and persistence work replaces them.
-    adminEmail: z.string().trim().email().default("admin@rangeway.energy"),
+    adminEmail: z.string().trim().email().default("admin@rangeway.co"),
     adminPassword: z.string().default("rangeway-dev"),
-    googleAllowedDomain: z.string().trim().min(1).default("rangeway.energy"),
+    googleAllowedDomain: z.string().trim().min(1).default("rangeway.co"),
     databasePath: z.string().trim().min(1).default(defaultDatabasePath),
     uploadDir: z.string().trim().min(1).default(defaultUploadDir),
     maxUploadBytes: z.coerce.number().int().positive().default(30 * 1024 * 1024)

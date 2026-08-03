@@ -34,9 +34,11 @@ const systemdVersion = Number.parseInt(
     .match(/^systemd (\d+)/)?.[1] ?? "0",
   10,
 );
+// Matches the release set deploy.sh accepts. The systemd capability checks
+// below are the real gate; the version is only a coarse filter.
 const hasSupportedAtlasSystemdHost = hasSystemdManager &&
   /^ID=ubuntu$/m.test(osRelease) &&
-  /^VERSION_ID="?24\.04"?$/m.test(osRelease) &&
+  /^VERSION_ID="?(?:24|26)\.04"?$/m.test(osRelease) &&
   systemdVersion >= 255;
 
 afterEach(() => {
