@@ -97,8 +97,22 @@ function toEvent(
 }
 
 function errorMessage(error: unknown): string {
-  const message = error instanceof Error ? error.message : String(error);
-  return message.slice(0, maximumErrorLength);
+  const fallback = "Unknown outbox processing error.";
+  try {
+    if (typeof error === "string") {
+      return (error || fallback).slice(0, maximumErrorLength);
+    }
+    if (typeof error !== "object" || error === null || !(error instanceof Error)) {
+      return fallback;
+    }
+
+    const message: unknown = error.message;
+    return typeof message === "string" && message.length > 0
+      ? message.slice(0, maximumErrorLength)
+      : fallback;
+  } catch {
+    return fallback;
+  }
 }
 
 async function withClient<T>(
@@ -151,9 +165,14 @@ export class OutboxWorker {
     this.wakePoll?.();
   }
 
-  async waitForCurrentBatch(timeoutMilliseconds: number): Promise<void> {
+  async waitForCurrentBatch(timeoutMilliseconds?: number): Promise<void> {
     const batch = this.currentBatch;
     if (!batch) return;
+
+    if (timeoutMilliseconds === undefined) {
+      await batch.then(() => undefined);
+      return;
+    }
 
     let timeout: NodeJS.Timeout | undefined;
     try {
@@ -173,7 +192,15 @@ export class OutboxWorker {
 
   private async claimAndProcess(): Promise<number> {
     const events = await this.claimBatch();
-    await Promise.all(events.map((event) => this.processEvent(event)));
+    const results = await Promise.allSettled(
+      events.map((event) => this.processEvent(event)),
+    );
+    const failures = results
+      .filter((result): result is PromiseRejectedResult => result.status === "rejected")
+      .map((result) => result.reason);
+    if (failures.length > 0) {
+      throw new AggregateError(failures, "One or more outbox events failed to settle.");
+    }
     return events.length;
   }
 

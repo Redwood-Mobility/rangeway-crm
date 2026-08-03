@@ -70,6 +70,10 @@ class TransactionalOutboxDatabase {
   readonly statements: string[] = [];
   private committed: StoredEvent[];
   private transaction: StoredEvent[] | null = null;
+  private readonly failureRejections = new Map<
+    string,
+    { error: Error; observed: () => void }
+  >();
 
   constructor(events: StoredEvent[]) {
     this.committed = cloneEvents(events);
@@ -156,6 +160,11 @@ class TransactionalOutboxDatabase {
           Date | null,
           Date,
         ];
+        const rejection = this.failureRejections.get(id);
+        if (rejection) {
+          rejection.observed();
+          throw rejection.error;
+        }
         const event = events.find(
           (candidate) =>
             candidate.id === id &&
@@ -193,6 +202,14 @@ class TransactionalOutboxDatabase {
     const event = this.event(id);
     event.processing_token = token;
     event.processing_started_at = now;
+  }
+
+  rejectFailurePersistence(
+    id: string,
+    error: Error,
+    observed: () => void,
+  ): void {
+    this.failureRejections.set(id, { error, observed });
   }
 }
 
@@ -275,6 +292,99 @@ describe("outbox worker", () => {
     expect(database.event().last_error).toHaveLength(2_000);
     expect(calculateRetryDelayMs(1)).toBe(10_000);
     expect(calculateRetryDelayMs(9)).toBe(15 * 60_000);
+  });
+
+  it.each([
+    ["hostile proxy", new Proxy({}, {
+      getPrototypeOf: () => {
+        throw new Error("getPrototypeOf exploded");
+      },
+      get: () => {
+        throw new Error("property access exploded");
+      },
+    })],
+    ["throwing toString", { toString: () => { throw new Error("toString exploded"); } }],
+    ["non-string Error.message", Object.assign(new Error(), { message: { secret: true } })],
+    ["symbol", Symbol("handler failure")],
+    ["null", null],
+    ["undefined", undefined],
+  ])("normalizes %s failures and always clears the lease", async (_label, thrown) => {
+    const database = new TransactionalOutboxDatabase([storedEvent()]);
+    const subject = worker(database, {
+      "location-pursuit.updated.v1": async () => {
+        throw thrown;
+      },
+    });
+
+    await expect(subject.runOnce()).resolves.toBe(1);
+
+    expect(database.event()).toMatchObject({
+      attempt_count: 1,
+      last_error: "Unknown outbox processing error.",
+      processing_started_at: null,
+      processing_token: null,
+      published_at: null,
+    });
+    expect(database.event().last_error!.length).toBeLessThanOrEqual(2_000);
+  });
+
+  it("keeps the batch pending until every claimed event settles", async () => {
+    const failingEvent = storedEvent({
+      id: "10000000-0000-4000-8000-000000000010",
+      created_at: new Date(now.getTime() - 3_000),
+    });
+    const blockedEvent = storedEvent({
+      id: "10000000-0000-4000-8000-000000000011",
+      created_at: new Date(now.getTime() - 2_000),
+    });
+    const database = new TransactionalOutboxDatabase([failingEvent, blockedEvent]);
+    let observePersistenceFailure: (() => void) | undefined;
+    const persistenceFailed = new Promise<void>((resolve) => {
+      observePersistenceFailure = resolve;
+    });
+    database.rejectFailurePersistence(
+      failingEvent.id,
+      new Error("failure write unavailable"),
+      () => observePersistenceFailure?.(),
+    );
+    let releaseSibling: (() => void) | undefined;
+    const siblingCanFinish = new Promise<void>((resolve) => {
+      releaseSibling = resolve;
+    });
+    const subject = worker(database, {
+      "location-pursuit.updated.v1": async (event) => {
+        if (event.id === failingEvent.id) throw new Error("handler failed");
+        await siblingCanFinish;
+      },
+    });
+
+    let batchSettled = false;
+    const batch = subject.runOnce().finally(() => {
+      batchSettled = true;
+    });
+    let shutdownSettled = false;
+    const shutdownWait = subject.waitForCurrentBatch(1_000).then(
+      () => {
+        shutdownSettled = true;
+        return undefined;
+      },
+      (error: unknown) => {
+        shutdownSettled = true;
+        throw error;
+      },
+    );
+    await persistenceFailed;
+    await Promise.resolve();
+
+    try {
+      expect(batchSettled).toBe(false);
+      expect(shutdownSettled).toBe(false);
+    } finally {
+      releaseSibling?.();
+    }
+    await expect(batch).rejects.toBeInstanceOf(AggregateError);
+    await expect(shutdownWait).rejects.toBeInstanceOf(AggregateError);
+    expect(database.event(blockedEvent.id).published_at).toEqual(now);
   });
 
   it("marks the tenth failure terminal and never selects it again", async () => {
@@ -437,6 +547,38 @@ async function seedPostgreSqlEvent(pool: Pool): Promise<string> {
   return eventId;
 }
 
+function withClaimInterceptor(
+  pool: Pool,
+  intercept: <Row extends QueryResultRow>(
+    next: () => Promise<{ rows: Row[]; rowCount: number | null }>,
+  ) => Promise<{ rows: Row[]; rowCount: number | null }>,
+): Pool {
+  return {
+    connect: async () => {
+      const client = await pool.connect();
+      return new Proxy(client, {
+        get(target, property, receiver) {
+          if (property === "query") {
+            return async <Row extends QueryResultRow = QueryResultRow>(
+              sql: string,
+              values: unknown[] = [],
+            ) => {
+              const next = () => target.query<Row>(sql, values);
+              return sql.includes("FOR UPDATE SKIP LOCKED")
+                ? intercept(next)
+                : next();
+            };
+          }
+          const value = Reflect.get(target, property, receiver) as unknown;
+          return typeof value === "function"
+            ? value.bind(target)
+            : value;
+        },
+      });
+    },
+  } as unknown as Pool;
+}
+
 describe("outbox worker PostgreSQL concurrency", () => {
   it("allows only one of two workers to claim and handle a pending event", async (context) => {
     await withTemporaryPostgreSql(context, async (pool) => {
@@ -445,16 +587,35 @@ describe("outbox worker PostgreSQL concurrency", () => {
       const handler: OutboxHandler = async (event, handlerContext) => {
         handled.push(`${event.id}:${handlerContext.idempotencyKey}`);
       };
-      const createSubject = () =>
+      let markFirstLocked: (() => void) | undefined;
+      const firstLocked = new Promise<void>((resolve) => {
+        markFirstLocked = resolve;
+      });
+      let markSecondSelected: (() => void) | undefined;
+      const secondSelected = new Promise<void>((resolve) => {
+        markSecondSelected = resolve;
+      });
+      const firstPool = withClaimInterceptor(pool, async (next) => {
+        const result = await next();
+        markFirstLocked?.();
+        await secondSelected;
+        return result;
+      });
+      const secondPool = withClaimInterceptor(pool, async (next) => {
+        const result = await next();
+        markSecondSelected?.();
+        return result;
+      });
+      const createSubject = (workerPool: Pool) =>
         new OutboxWorker({
-          pool,
+          pool: workerPool,
           handlers: { "location-pursuit.updated.v1": handler },
         });
 
-      const results = await Promise.all([
-        createSubject().runOnce(),
-        createSubject().runOnce(),
-      ]);
+      const firstRun = createSubject(firstPool).runOnce();
+      await firstLocked;
+      const secondRun = createSubject(secondPool).runOnce();
+      const results = await Promise.all([firstRun, secondRun]);
 
       expect(results.reduce((sum, count) => sum + count, 0)).toBe(1);
       expect(handled).toEqual([`${eventId}:${eventId}`]);

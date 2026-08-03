@@ -1,81 +1,178 @@
 import process from "node:process";
+import { pathToFileURL } from "node:url";
+import type { Pool } from "pg";
 import { config } from "../server/config.js";
-import { createPool } from "../server/platform/db/client.js";
+import { createPool as createPostgreSqlPool } from "../server/platform/db/client.js";
 import { OutboxWorker } from "./outbox-worker.js";
 
-const shutdownTimeoutMilliseconds = 25_000;
+const defaultShutdownTimeoutMilliseconds = 25_000;
+type WorkerSignal = "SIGINT" | "SIGTERM";
 
-async function main(): Promise<void> {
-  if (!config.databaseUrl) {
+export interface WorkerPool {
+  end(): Promise<void>;
+}
+
+export interface OutboxRuntimeWorker {
+  run(pollMilliseconds: number): Promise<void>;
+  stopClaiming(): void;
+  waitForCurrentBatch(timeoutMilliseconds?: number): Promise<void>;
+}
+
+export interface WorkerLifecycle {
+  on(signal: WorkerSignal, listener: () => void): void;
+  off(signal: WorkerSignal, listener: () => void): void;
+  exit(code: number): void;
+}
+
+export interface WorkerRuntimeOptions {
+  databaseUrl: string;
+  workerPollMilliseconds: number;
+  createPool: (databaseUrl: string) => WorkerPool;
+  createWorker: (pool: WorkerPool) => OutboxRuntimeWorker;
+  lifecycle: WorkerLifecycle;
+  shutdownTimeoutMilliseconds?: number;
+}
+
+class ShutdownDeadlineError extends Error {
+  constructor() {
+    super("Outbox worker exceeded its shutdown deadline.");
+    this.name = "ShutdownDeadlineError";
+  }
+}
+
+async function withinDeadline<T>(
+  operation: Promise<T>,
+  timeoutMilliseconds: number,
+): Promise<T> {
+  let timeout: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      operation,
+      new Promise<never>((_resolve, reject) => {
+        timeout = setTimeout(
+          () => reject(new ShutdownDeadlineError()),
+          timeoutMilliseconds,
+        );
+      }),
+    ]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
+}
+
+export async function runWorkerRuntime(options: WorkerRuntimeOptions): Promise<void> {
+  if (!options.databaseUrl) {
     throw new Error("DATABASE_URL is required to run the outbox worker.");
   }
 
-  const pool = createPool(config.databaseUrl);
-  const worker = new OutboxWorker({
-    pool,
-    // External integrations will register versioned handlers in a later task.
-    handlers: {},
+  const pool = options.createPool(options.databaseUrl);
+  const worker = options.createWorker(pool);
+  const shutdownTimeoutMilliseconds =
+    options.shutdownTimeoutMilliseconds ?? defaultShutdownTimeoutMilliseconds;
+  let shutdownPromise: Promise<void> | null = null;
+  let poolClose: Promise<void> | null = null;
+  let announceShutdown: (() => void) | undefined;
+  const shutdownRequested = new Promise<void>((resolve) => {
+    announceShutdown = resolve;
   });
 
-  let shutdownStarted = false;
-  let poolClose: Promise<void> | null = null;
   const closePool = (): Promise<void> => {
     poolClose ??= pool.end();
     return poolClose;
   };
 
-  const run = worker.run(config.workerPollMs);
+  const beginShutdown = (): Promise<void> => {
+    if (shutdownPromise) return shutdownPromise;
 
-  const removeSignalHandlers = () => {
-    process.off("SIGTERM", requestShutdown);
-    process.off("SIGINT", requestShutdown);
-  };
-
-  const requestShutdown = () => {
-    if (shutdownStarted) return;
-    shutdownStarted = true;
     worker.stopClaiming();
-
-    void (async () => {
-      let shutdownFailed = false;
+    const gracefulShutdown = (async () => {
+      const failures: unknown[] = [];
       try {
-        await worker.waitForCurrentBatch(shutdownTimeoutMilliseconds);
+        await worker.waitForCurrentBatch();
       } catch (error) {
-        shutdownFailed = true;
-        console.error(error);
+        failures.push(error);
       }
-
       try {
         await closePool();
       } catch (error) {
-        shutdownFailed = true;
-        console.error(error);
-      } finally {
-        removeSignalHandlers();
+        failures.push(error);
       }
 
-      if (shutdownFailed) process.exitCode = 1;
+      if (failures.length === 1) throw failures[0];
+      if (failures.length > 1) {
+        throw new AggregateError(failures, "Outbox worker shutdown failed.");
+      }
     })();
+    shutdownPromise = withinDeadline(
+      gracefulShutdown,
+      shutdownTimeoutMilliseconds,
+    ).catch((error: unknown) => {
+      if (error instanceof ShutdownDeadlineError) {
+        options.lifecycle.exit(1);
+        return;
+      }
+      throw error;
+    });
+    announceShutdown?.();
+    return shutdownPromise;
   };
 
-  process.on("SIGTERM", requestShutdown);
-  process.on("SIGINT", requestShutdown);
+  const requestShutdown = () => {
+    void beginShutdown().catch(() => undefined);
+  };
+  const removeSignalHandlers = () => {
+    options.lifecycle.off("SIGTERM", requestShutdown);
+    options.lifecycle.off("SIGINT", requestShutdown);
+  };
+
+  options.lifecycle.on("SIGTERM", requestShutdown);
+  options.lifecycle.on("SIGINT", requestShutdown);
+
+  const runResult = worker.run(options.workerPollMilliseconds).then(
+    () => ({ status: "completed" as const }),
+    (error: unknown) => ({ status: "failed" as const, error }),
+  );
 
   try {
-    await run;
-  } catch (error) {
-    process.exitCode = 1;
-    console.error(error);
-  } finally {
-    worker.stopClaiming();
-    if (!shutdownStarted) {
-      removeSignalHandlers();
-      await closePool();
+    const outcome = await Promise.race([
+      runResult,
+      shutdownRequested.then(() => ({ status: "shutdown" as const })),
+    ]);
+    if (outcome.status === "failed") {
+      await beginShutdown();
+      throw outcome.error;
     }
+    await beginShutdown();
+  } finally {
+    removeSignalHandlers();
   }
 }
 
-main().catch((error: unknown) => {
-  console.error(error);
-  process.exitCode = 1;
-});
+export function main(): Promise<void> {
+  const lifecycle: WorkerLifecycle = {
+    on: (signal, listener) => process.on(signal, listener),
+    off: (signal, listener) => process.off(signal, listener),
+    exit: (code) => process.exit(code),
+  };
+
+  return runWorkerRuntime({
+    databaseUrl: config.databaseUrl,
+    workerPollMilliseconds: config.workerPollMs,
+    createPool: createPostgreSqlPool,
+    createWorker: (pool) =>
+      new OutboxWorker({
+        pool: pool as Pool,
+        // External integrations will register versioned handlers in a later task.
+        handlers: {},
+      }),
+    lifecycle,
+  });
+}
+
+const entrypoint = process.argv[1];
+if (entrypoint && import.meta.url === pathToFileURL(entrypoint).href) {
+  main().catch((error: unknown) => {
+    console.error(error);
+    process.exitCode = 1;
+  });
+}
