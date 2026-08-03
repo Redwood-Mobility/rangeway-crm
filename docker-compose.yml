@@ -1,29 +1,73 @@
-name: atlas
+name: atlas-v2
+
+x-app-service: &app-service
+  image: atlas-v2-app:${ATLAS_IMAGE_TAG:-local}
+  env_file:
+    - path: .env
+      required: false
+  init: true
+  restart: unless-stopped
+  stop_grace_period: 30s
 
 services:
-  crm:
-    build: .
-    restart: unless-stopped
-    env_file: .env
-    volumes:
-      - crm-data:/app/data
-      - crm-uploads:/app/uploads
+  web:
+    <<: *app-service
+    build:
+      context: .
+      target: runtime
+    command: ["/bin/sh", "-c", "npm run db:migrate && npm start"]
+    depends_on:
+      db:
+        condition: service_healthy
     expose:
       - "8080"
+    volumes:
+      - atlas-artifacts:/app/artifacts
     healthcheck:
-      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8080/api/health').then((r) => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
-      interval: 30s
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8080/api/v2/health').then(async (response) => { const body = await response.json(); process.exit(response.ok && body.apiVersion === 'v2' ? 0 : 1); }).catch(() => process.exit(1))"]
+      interval: 15s
       timeout: 5s
-      retries: 3
-      start_period: 15s
+      retries: 5
+      start_period: 30s
+    mem_limit: 768m
+    cpus: 1.0
+
+  worker:
+    <<: *app-service
+    command: ["/bin/sh", "-c", "npm run db:migrate && npm run start:worker"]
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - atlas-artifacts:/app/artifacts
+    mem_limit: 384m
+    cpus: 0.5
+
+  db:
+    image: postgres:17-bookworm
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: atlas
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-}
+      POSTGRES_DB: atlas
+    volumes:
+      - atlas-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready --username=atlas --dbname=atlas"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    shm_size: 128m
+    mem_limit: 1024m
+    cpus: 1.0
 
   caddy:
     image: caddy:2.10-alpine
     restart: unless-stopped
     depends_on:
-      crm:
+      web:
         condition: service_healthy
-    env_file: .env
     ports:
       - "80:80"
       - "443:443"
@@ -31,9 +75,15 @@ services:
       - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy-data:/data
       - caddy-config:/config
+    mem_limit: 128m
+    cpus: 0.25
 
 volumes:
-  crm-data:
-  crm-uploads:
+  atlas-db:
+    name: atlas-db
+  atlas-artifacts:
+    name: atlas-artifacts
   caddy-data:
+    name: atlas-v2-caddy-data
   caddy-config:
+    name: atlas-v2-caddy-config

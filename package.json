@@ -15,7 +15,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:integration": "vitest run tests/server tests/worker",
-    "db:migrate": "tsx src/server/platform/db/migrate.ts"
+    "db:migrate": "node dist/server/platform/db/migrate.js"
   },
   "dependencies": {
     "@vitejs/plugin-react": "^5.1.1",
