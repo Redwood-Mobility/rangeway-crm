@@ -299,7 +299,14 @@ describe("deterministic deployment source contract", () => {
     expect(backupScript).toContain("ATLAS_REPOSITORY_ROOT");
     expect(backupScript).toContain("--repository-root");
     expect(backupScript).not.toMatch(/dirname -- "\$\{BASH_SOURCE\[0\]\}"/);
-    expect(backupScript).toContain("atlas-artifacts:/artifacts:ro");
+    expect(backupScript).toContain('ARTIFACT_VOLUME_NAME="${ATLAS_ARTIFACT_VOLUME_NAME:-atlas-artifacts}"');
+    expect(backupScript).toContain('DB_VOLUME_NAME="${ATLAS_DB_VOLUME_NAME:-atlas-db}"');
+    expect(backupScript).toContain("label=com.docker.compose.project=${COMPOSE_PROJECT_NAME}");
+    expect(backupScript).toContain("label=com.docker.compose.service=${service}");
+    expect(backupScript).toContain('docker exec "${DB_CONTAINER}"');
+    expect(backupScript).toContain('docker stop -- "${WEB_CONTAINER}"');
+    expect(backupScript).toContain('docker start -- "${WEB_CONTAINER}"');
+    expect(backupScript).not.toMatch(/docker compose/);
     expect(backupScript).toContain("sha256sum");
     expect(backupScript).toMatch(/-s .*atlas-postgres\.dump/);
     expect(backupScript).toMatch(/-s .*atlas-artifacts\.tgz/);
@@ -321,7 +328,7 @@ describe("deterministic deployment source contract", () => {
     expect(restoreScript).toContain("atlas_restore_");
     expect(restoreScript).toContain("docker volume create");
     expect(restoreScript).toContain("docker volume rm");
-    expect(restoreScript).not.toMatch(/docker compose down|docker system prune/);
+    expect(restoreScript).not.toMatch(/docker compose|docker system prune/);
   });
 
   it("accepts a backup after the mutable Rangeway organization name has changed", () => {

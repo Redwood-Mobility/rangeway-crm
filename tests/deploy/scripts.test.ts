@@ -127,6 +127,7 @@ function createDeployFixture(): DeployFixture {
   chmodSync(roleInitializer, 0o755);
   copyFileSync(path.join(sourceRoot, "deploy/Caddyfile"), caddyConfig);
   writeFileSync(path.join(repository, "package.json"), "{}\n");
+  writeFileSync(path.join(repository, "docker-compose.yml"), "name: atlas-v2\nservices: {}\n");
   writeFileSync(path.join(repository, "openapi/atlas-v2.yaml"), "openapi: 3.1.0\n");
   writeFileSync(path.join(repository, "db/migrations/0001_platform.sql"), "SELECT 1;\n");
   const environmentFile = path.join(repository, ".env.production");
@@ -147,7 +148,7 @@ if [[ "\${1:-}" == "archive" ]]; then
     case "\${argument}" in --output=*) output="\${argument#--output=}" ;; esac
   done
   [[ -n "\${output}" ]]
-  /usr/bin/tar -cf "\${output}" package.json openapi deploy
+  /usr/bin/tar -cf "\${output}" package.json docker-compose.yml openapi deploy
   exit 0
 fi
 exit 0`);
@@ -201,6 +202,9 @@ fi`);
   fakeTool(binDirectory, "sleep", "exit 0");
   fakeTool(binDirectory, "docker", `
 printf '%s\\n' "$*" >> "\${FAKE_LOG_DIR}/docker.log"
+if [[ "\${1:-}" == "compose" && ! -f "\${FAKE_REMOTE_DIR}/docker-compose.yml" ]]; then
+  exit 98
+fi
 if [[ "$*" == *"compose ps --all --format"* ]]; then
   [[ "\${FAKE_COMPOSE_PS_FAIL:-0}" == "1" ]] && exit 93
   printf '%b' "\${FAKE_WRITER_SNAPSHOT:-web|running|web-container\\nworker|running|worker-container\\n}"
@@ -227,12 +231,25 @@ if [[ "$*" == *"label=com.docker.compose.project=atlas-v2"* && "$*" == *"label=c
   exit 0
 fi
 if [[ "$*" == "volume inspect atlas-db" ]]; then
+  if [[ "\${FAKE_BACKUP_REQUIRES_UNPROMOTED_TREE:-0}" == "1" \
+    && -e "\${FAKE_REMOTE_DIR}/docker-compose.yml" ]]; then
+    exit 97
+  fi
   [[ "\${FAKE_HAS_DB:-0}" == "1" || -f "\${FAKE_LOG_DIR}/atlas-db-exists" ]] && exit 0 || exit 1
 fi
+if [[ "$*" == "volume inspect atlas-artifacts" ]]; then exit 0; fi
 if [[ "$*" == "compose ps -q db" ]]; then printf '%s\\n' db-container; exit 0; fi
 if [[ "$*" == "compose ps -q web" ]]; then printf '%s\\n' web-container; exit 0; fi
 if [[ "$*" == "compose ps -q worker" ]]; then printf '%s\\n' worker-container; exit 0; fi
 if [[ "$*" == *"State.Health.Status"* ]]; then printf '%s\\n' healthy; exit 0; fi
+if [[ "$*" == *".Mounts"* && "$*" == *"db-container"* ]]; then
+  printf '%s\\n' 'volume|atlas-db|/var/lib/postgresql/data'
+  exit 0
+fi
+if [[ "$*" == *"Config.Image"* && "$*" == *"db-container"* ]]; then
+  printf '%s\\n' postgres:17-bookworm
+  exit 0
+fi
 if [[ "$*" == "compose up -d db" ]]; then
   : > "\${FAKE_LOG_DIR}/atlas-db-exists"
   [[ "\${FAKE_BUILD_DB_FAIL_AFTER_VOLUME:-0}" == "1" ]] && exit 61
@@ -241,6 +258,21 @@ fi
 if [[ "$*" == *"pg_stat_activity"* ]]; then
   [[ "\${FAKE_DB_SESSION_QUERY_FAIL:-0}" == "1" ]] && exit 94
   printf '0\\n'
+  exit 0
+fi
+if [[ "\${1:-}" == "exec" && "\${2:-}" == "db-container" && "$*" == *"atlas_initial_provenance"* ]]; then
+  printf '%s\\n' atlas-initial-empty
+  exit 0
+fi
+if [[ "\${1:-}" == "exec" && "\${2:-}" == "db-container" && "$*" == *"pg_dump"* ]]; then
+  printf '%s' dump
+  exit 0
+fi
+if [[ "\${1:-}" == "run" && "$*" == *"atlas-artifacts:/artifacts:ro"* ]]; then
+  backup_mount=""
+  for argument in "$@"; do [[ "\${argument}" == *:/backup ]] && backup_mount="\${argument%:/backup}"; done
+  [[ -n "\${backup_mount}" ]] || exit 99
+  printf '%s' artifacts > "\${backup_mount}/atlas-artifacts.tgz"
   exit 0
 fi
 if [[ "$*" == *"--profile operations run"* && "$*" == *"migrator"* \
@@ -335,6 +367,7 @@ function deploy(fixture: DeployFixture, overrides: NodeJS.ProcessEnv = {}) {
       ...process.env,
       PATH: `${fixture.binDirectory}:${process.env.PATH}`,
       FAKE_LOG_DIR: fixture.logDirectory,
+      FAKE_REMOTE_DIR: fixture.remoteDirectory,
       ATLAS_HOST: "atlas-test-host",
       ATLAS_USER: "root",
       ATLAS_DIR: fixture.remoteDirectory,
@@ -778,21 +811,6 @@ describe("deploy.sh behavior", () => {
 
   it("backs up and restore-proves an empty first-deploy volume on retry with explicit unreleased provenance", () => {
     const fixture = createDeployFixture();
-    const exactBackup = path.join(fixture.backupRoot, "initial-provenance-proof");
-    executable(path.join(fixture.repository, "deploy/backup.sh"), `#!/usr/bin/env bash
-set -euo pipefail
-ATLAS_BACKUP_FORMAT="atlas-v2-postgres-artifacts-v1"
-[[ "\${ATLAS_REPOSITORY_ROOT:-}" == '${fixture.remoteDirectory}' ]]
-[[ "\${ATLAS_GIT_COMMIT:-}" == 'unreleased-v2-foundation' ]]
-[[ "\${ATLAS_INITIAL_PROVENANCE_SHA256:-}" =~ ^[0-9a-f]{64}$ ]]
-mkdir -p '${exactBackup}'
-printf dump > '${exactBackup}/atlas-postgres.dump'
-printf artifacts > '${exactBackup}/atlas-artifacts.tgz'
-printf 'git_commit=unreleased-v2-foundation\nmigration_provenance=zero\nmigration_set_sha256=%s\n' "\${ATLAS_INITIAL_PROVENANCE_SHA256}" > '${exactBackup}/metadata.txt'
-(cd '${exactBackup}' && sha256sum atlas-postgres.dump atlas-artifacts.tgz metadata.txt > manifest.sha256)
-printf 'unreleased-v2-foundation\n' > "\${FAKE_LOG_DIR}/backup-provenance.log"
-printf 'ATLAS_BACKUP_PATH=%s\n' '${exactBackup}'
-`);
     executable(path.join(fixture.repository, "deploy/restore-test.sh"), `#!/usr/bin/env bash
 set -euo pipefail
 grep -Fxq 'git_commit=unreleased-v2-foundation' "$1/metadata.txt"
@@ -813,12 +831,20 @@ printf '%s\n' "$1" > "\${FAKE_LOG_DIR}/restore-test.log"
     const retried = deploy(fixture, {
       FAKE_WEB_RUNNING: "0",
       FAKE_WORKER_RUNNING: "0",
+      FAKE_BACKUP_REQUIRES_UNPROMOTED_TREE: "1",
     });
     expect(retried.status, `${retried.stdout}\n${retried.stderr}`).toBe(0);
-    expect(readFileSync(path.join(fixture.logDirectory, "backup-provenance.log"), "utf8").trim())
-      .toBe("unreleased-v2-foundation");
-    expect(readFileSync(path.join(fixture.logDirectory, "restore-test.log"), "utf8").trim())
-      .toBe(exactBackup);
+    const exactBackup = readFileSync(
+      path.join(fixture.logDirectory, "restore-test.log"),
+      "utf8",
+    ).trim();
+    expect(path.dirname(exactBackup)).toBe(fixture.backupRoot);
+    expect(readFileSync(path.join(exactBackup, "metadata.txt"), "utf8"))
+      .toContain("git_commit=unreleased-v2-foundation\n");
+    const dockerLog = readFileSync(path.join(fixture.logDirectory, "docker.log"), "utf8");
+    expect(dockerLog).toContain("volume inspect atlas-artifacts");
+    expect(dockerLog).toContain("label=com.docker.compose.service=db");
+    expect(dockerLog).toContain("exec db-container env PGAPPNAME=atlas-deploy-");
     expect(readFileSync(path.join(fixture.remoteDirectory, ".atlas-release"), "utf8").trim())
       .toBe(releaseCommit);
     expect(readdirSync(fixture.coordinatorStage)).toEqual([]);
@@ -1055,6 +1081,103 @@ printf '%s\\n' "$pending_directory"`);
 printf '%s|%s\\n' "$PWD" "$*" >> "\${FAKE_LOG_DIR}/docker.log"
 last_argument=""
 for argument in "$@"; do last_argument="\${argument}"; done
+if [[ "\${FAKE_COMPOSE_FORBIDDEN:-0}" == "1" && "\${1:-}" == "compose" ]]; then
+  exit 93
+fi
+if [[ "\${FAKE_DIRECT_TOPOLOGY:-0}" == "1" ]]; then
+  if [[ "$*" == "volume inspect atlas-db" || "$*" == "volume inspect atlas-artifacts" ]]; then exit 0; fi
+  if [[ "$*" == *"label=com.docker.compose.project=atlas-v2"* ]]; then
+    service=""
+    case "$*" in
+      *"label=com.docker.compose.service=db"*) service="db" ;;
+      *"label=com.docker.compose.service=web"*) service="web" ;;
+      *"label=com.docker.compose.service=worker"*) service="worker" ;;
+      *"label=com.docker.compose.service=migrator"*) service="migrator" ;;
+    esac
+    [[ "\${FAKE_DISCOVERY_FAIL:-}" == "\${service}" ]] && exit 55
+    custom_output=""
+    case "\${service}" in
+      db) custom_output="\${FAKE_DB_DISCOVERY_OUTPUT:-}" ;;
+      web) custom_output="\${FAKE_WEB_DISCOVERY_OUTPUT:-}" ;;
+      worker) custom_output="\${FAKE_WORKER_DISCOVERY_OUTPUT:-}" ;;
+      migrator) custom_output="\${FAKE_MIGRATOR_DISCOVERY_OUTPUT:-}" ;;
+    esac
+    if [[ -n "\${custom_output}" && ! -f "\${FAKE_LOG_DIR}/\${service}-stopped" ]]; then
+      printf '%b' "\${custom_output}"
+      exit 0
+    fi
+    service_active=0
+    case "\${service}" in
+      db) service_active=1 ;;
+      web)
+        [[ "\${FAKE_WEB_STATE:-running}" == "running" || "\${FAKE_WEB_STATE:-running}" == "restarting" ]] \
+          && service_active=1
+        ;;
+      worker)
+        [[ "\${FAKE_WORKER_STATE:-running}" == "running" || "\${FAKE_WORKER_STATE:-running}" == "restarting" ]] \
+          && service_active=1
+        ;;
+      migrator) [[ "\${FAKE_ACTIVE_MIGRATOR:-0}" == "1" ]] && service_active=1 ;;
+    esac
+    if [[ "\${service_active}" == "1" && ! -f "\${FAKE_LOG_DIR}/\${service}-stopped" ]]; then
+      case "\${service}" in
+        db) container="db-container" ;;
+        web) container="web-container" ;;
+        worker) container="worker-container" ;;
+        migrator) container="migrator-active" ;;
+      esac
+      if [[ "$*" == *"--format"* ]]; then
+        printf '%s|atlas-v2|%s\\n' "\${container}" "\${service}"
+      else
+        printf '%s\\n' "\${container}"
+      fi
+    fi
+    exit 0
+  fi
+  if [[ "\${1:-}" == "stop" || "\${1:-}" == "start" ]]; then
+    operation="$1"
+    shift
+    [[ "\${1:-}" == "--" ]] && shift
+    for container in "$@"; do
+      case "\${container}" in
+        migrator-active) service="migrator" ;;
+        *-container) service="\${container%-container}" ;;
+        *) exit 56 ;;
+      esac
+      if [[ "\${operation}" == "stop" ]]; then
+        : > "\${FAKE_LOG_DIR}/\${service}-stopped"
+      else
+        /bin/unlink "\${FAKE_LOG_DIR}/\${service}-stopped" 2>/dev/null || true
+      fi
+    done
+    exit 0
+  fi
+  if [[ "$*" == *"Config.Image"* && "\${last_argument}" == "db-container" ]]; then
+    printf '%s\\n' postgres:17-bookworm
+    exit 0
+  fi
+  if [[ "$*" == *".Mounts"* && "\${last_argument}" == "db-container" ]]; then
+    printf '%s\\n' 'volume|atlas-db|/var/lib/postgresql/data'
+    exit 0
+  fi
+  if [[ "\${1:-}" == "exec" && "\${2:-}" == "db-container" && "$*" == *"atlas_initial_provenance"* ]]; then
+    printf '%s\\n' atlas-initial-empty
+    exit 0
+  fi
+  if [[ "\${1:-}" == "exec" && "\${2:-}" == "db-container" && "$*" == *"pg_dump"* ]]; then
+    [[ "\${FAKE_FAIL_STAGE:-}" == "pg_dump" ]] && exit 52
+    printf '%s' dump
+    exit 0
+  fi
+  if [[ "\${1:-}" == "run" ]]; then
+    [[ "\${FAKE_FAIL_STAGE:-}" == "tar" ]] && exit 53
+    backup_mount=""
+    for argument in "$@"; do [[ "\${argument}" == *:/backup ]] && backup_mount="\${argument%:/backup}"; done
+    [[ -n "\${backup_mount}" ]] || exit 54
+    printf '%s' artifacts > "\${backup_mount}/atlas-artifacts.tgz"
+    exit 0
+  fi
+fi
 if [[ "$*" == "compose ps -q db" ]]; then printf '%s\\n' db-container; exit 0; fi
 if [[ "$*" == *"compose ps --all --format"* ]]; then
   [[ "\${FAKE_SNAPSHOT_FAIL:-0}" == "1" ]] && exit 55
@@ -1139,20 +1262,49 @@ function backup(
       BACKUP_ROOT: fixture.backupRoot,
       ATLAS_GIT_COMMIT: releaseCommit,
       ATLAS_BACKUP_TEST_MODE: "1",
+      FAKE_DIRECT_TOPOLOGY: "1",
       ...overrides,
     },
   });
 }
 
 describe("backup.sh behavior", () => {
+  it("backs up an unreleased first-deploy database from installed operations while the live tree is empty", () => {
+    const fixture = createBackupFixture();
+    rmSync(fixture.repository, { recursive: true, force: true });
+    mkdirSync(fixture.repository, { recursive: true });
+    const migrationSetHash = "c".repeat(64);
+
+    const result = backup(fixture, {
+      ATLAS_GIT_COMMIT: "unreleased-v2-foundation",
+      ATLAS_INITIAL_PROVENANCE_SHA256: migrationSetHash,
+      FAKE_DIRECT_TOPOLOGY: "1",
+      FAKE_COMPOSE_FORBIDDEN: "1",
+    }, fixture.installedHelper);
+
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+    expect(readdirSync(fixture.repository)).toEqual([]);
+    const exactBackup = result.stdout.trim().slice("ATLAS_BACKUP_PATH=".length);
+    const metadata = readFileSync(path.join(exactBackup, "metadata.txt"), "utf8");
+    expect(metadata).toContain("git_commit=unreleased-v2-foundation\n");
+    expect(metadata).toContain("migration_provenance=zero\n");
+    expect(metadata).toContain(`migration_set_sha256=${migrationSetHash}\n`);
+    const dockerLog = readFileSync(path.join(fixture.logDirectory, "docker.log"), "utf8");
+    expect(dockerLog).not.toContain("|compose ");
+    expect(dockerLog).toContain("volume inspect atlas-db");
+    expect(dockerLog).toContain("volume inspect atlas-artifacts");
+    expect(dockerLog).toContain("label=com.docker.compose.service=db");
+    expect(dockerLog).toContain("exec db-container env PGAPPNAME=atlas-deploy-standalone-backup");
+  });
+
   it("runs the actual installed helper from a disjoint libexec path against the explicit repository root", () => {
     const fixture = createBackupFixture();
     const result = backup(fixture, {}, fixture.installedHelper);
 
     expect(result.status, result.stderr).toBe(0);
     const dockerLog = readFileSync(path.join(fixture.logDirectory, "docker.log"), "utf8");
-    expect(dockerLog).toContain(`${fixture.repository}|compose config`);
-    expect(dockerLog).not.toContain(`${path.dirname(path.dirname(fixture.installedHelper))}|compose config`);
+    expect(dockerLog).toContain(`${fixture.repository}|volume inspect atlas-db`);
+    expect(dockerLog).not.toContain("|compose ");
   });
 
   it("records only validated zero-state provenance for an unreleased first-deploy database", () => {
@@ -1203,10 +1355,10 @@ describe("backup.sh behavior", () => {
 
     expect(result.status, result.stderr).toBe(0);
     const log = readFileSync(path.join(fixture.logDirectory, "docker.log"), "utf8");
-    expect(log).toContain("compose stop web");
-    expect(log).toContain("compose stop worker");
-    expect(log).not.toContain("compose start web");
-    expect(log).not.toContain("compose start worker");
+    expect(log).toContain("stop -- web-container");
+    expect(log).toContain("stop -- worker-container");
+    expect(log).not.toContain("start -- web-container");
+    expect(log).not.toContain("start -- worker-container");
   });
 
   it("rejects a canonical backup root inside the synchronized repository before mutation", () => {
@@ -1229,64 +1381,63 @@ describe("backup.sh behavior", () => {
     const exactBackup = result.stdout.trim().slice("ATLAS_BACKUP_PATH=".length);
     expect(existsSync(path.join(exactBackup, "manifest.sha256"))).toBe(true);
     const log = readFileSync(path.join(fixture.logDirectory, "docker.log"), "utf8");
-    const stopWeb = log.indexOf("compose stop web");
-    const stopWorker = log.indexOf("compose stop worker");
+    const stopWeb = log.indexOf("stop -- web-container");
+    const stopWorker = log.indexOf("stop -- worker-container");
     const dump = log.indexOf("pg_dump");
     const archive = log.indexOf("run --rm");
-    const startWorker = log.indexOf("compose start worker");
-    const startWeb = log.indexOf("compose start web");
+    const startWorker = log.indexOf("start -- worker-container");
+    const startWeb = log.indexOf("start -- web-container");
     expect(stopWeb).toBeGreaterThanOrEqual(0);
     expect(stopWorker).toBeGreaterThan(stopWeb);
     expect(dump).toBeGreaterThan(stopWorker);
     expect(archive).toBeGreaterThan(dump);
     expect(startWorker).toBeGreaterThan(archive);
     expect(startWeb).toBeGreaterThan(startWorker);
-    expect(log).not.toMatch(/compose (?:stop|start) (?:db|caddy)/);
+    expect(log).not.toContain("|compose ");
+    expect(log).not.toMatch(/(?:stop|start) -- (?:db-container|caddy-container)/);
   });
 
-  it("uses one snapshot so a restarting-to-running transition cannot disappear between probes", () => {
+  it("retains the exact restarting writer ID without a second state-based lookup", () => {
     const fixture = createBackupFixture();
     const result = backup(fixture, {
-      FAKE_TRANSITION_RACE: "1",
-      FAKE_COMPOSE_SNAPSHOT: "web|restarting\nworker|exited\n",
+      FAKE_WEB_STATE: "restarting",
       FAKE_WORKER_STATE: "exited",
     });
 
     expect(result.status, result.stderr).toBe(0);
     const log = readFileSync(path.join(fixture.logDirectory, "docker.log"), "utf8");
-    expect(log.match(/compose ps --all --format/g)).toHaveLength(1);
-    expect(log).not.toContain("compose ps --status");
-    expect(log).toContain("compose stop web");
-    expect(log).toContain("compose start web");
-    expect(log).not.toContain("compose stop worker");
-    expect(log).not.toContain("compose start worker");
+    expect(log).toContain("stop -- web-container");
+    expect(log).toContain("start -- web-container");
+    expect(log).not.toContain("stop -- worker-container");
+    expect(log).not.toContain("start -- worker-container");
+    expect(log).not.toContain("|compose ");
   });
 
-  it("aborts on a service-state probe failure before stopping or backing up", () => {
+  it("aborts on an exact-label writer discovery failure before stopping or backing up", () => {
     const fixture = createBackupFixture();
-    const result = backup(fixture, { FAKE_SNAPSHOT_FAIL: "1" });
+    const result = backup(fixture, { FAKE_DISCOVERY_FAIL: "web" });
 
     expect(result.status).not.toBe(0);
     expect(result.stdout).not.toContain("ATLAS_BACKUP_PATH=");
     const log = readFileSync(path.join(fixture.logDirectory, "docker.log"), "utf8");
-    expect(log.match(/compose ps --all --format/g)).toHaveLength(1);
-    expect(log).not.toMatch(/compose stop|pg_dump|compose start/);
+    expect(log).toContain("label=com.docker.compose.service=web");
+    expect(log).not.toMatch(/\|(?:stop|start) |pg_dump/);
     expect(existsSync(fixture.backupRoot) ? readdirSync(fixture.backupRoot) : []).toEqual([]);
   });
 
   it.each([
-    ["duplicate", "web|running\nweb|restarting\nworker|exited\n"],
-    ["unknown", "web|running\ncaddy|running\n"],
-    ["malformed", "web running\nworker|exited\n"],
-  ])("rejects %s service-state snapshot output before backup", (_label, snapshot) => {
+    ["duplicate", "web-one|atlas-v2|web\nweb-two|atlas-v2|web\n"],
+    ["mismatched", "web-container|other-project|web\n"],
+    ["malformed", "web container\n"],
+  ])("rejects %s exact-label writer discovery output before backup", (_label, snapshot) => {
     const fixture = createBackupFixture();
-    const result = backup(fixture, { FAKE_COMPOSE_SNAPSHOT: snapshot });
+    const result = backup(fixture, { FAKE_WEB_DISCOVERY_OUTPUT: snapshot });
 
     expect(result.status).not.toBe(0);
     expect(result.stdout).not.toContain("ATLAS_BACKUP_PATH=");
     const log = readFileSync(path.join(fixture.logDirectory, "docker.log"), "utf8");
-    expect(log.match(/compose ps --all --format/g)).toHaveLength(1);
-    expect(log).not.toMatch(/compose stop|pg_dump|compose start/);
+    expect(log).toContain("label=com.docker.compose.service=web");
+    expect(log).not.toMatch(/\|(?:stop|start) |pg_dump/);
     expect(existsSync(fixture.backupRoot) ? readdirSync(fixture.backupRoot) : []).toEqual([]);
   });
 
@@ -1301,7 +1452,7 @@ describe("backup.sh behavior", () => {
     expect(result.stdout).not.toContain("ATLAS_BACKUP_PATH=");
     expect(readdirSync(fixture.backupRoot)).toEqual([collisionName]);
     const log = readFileSync(path.join(fixture.logDirectory, "docker.log"), "utf8");
-    expect(log).not.toMatch(/compose stop|pg_dump|compose start/);
+    expect(log).not.toMatch(/\|(?:stop|start) |pg_dump/);
   });
 
   it("treats restarting as active, restores only that service after failure, and removes partial output", () => {
@@ -1315,10 +1466,10 @@ describe("backup.sh behavior", () => {
     expect(result.status).not.toBe(0);
     expect(result.stdout).not.toContain("ATLAS_BACKUP_PATH=");
     const log = readFileSync(path.join(fixture.logDirectory, "docker.log"), "utf8");
-    expect(log).toContain("compose stop worker");
-    expect(log).toContain("compose start worker");
-    expect(log).not.toContain("compose stop web");
-    expect(log).not.toContain("compose start web");
+    expect(log).toContain("stop -- worker-container");
+    expect(log).toContain("start -- worker-container");
+    expect(log).not.toContain("stop -- web-container");
+    expect(log).not.toContain("start -- web-container");
     expect(readdirSync(fixture.backupRoot)).toEqual([]);
   });
 
@@ -1331,8 +1482,8 @@ describe("backup.sh behavior", () => {
       expect(result.status).not.toBe(0);
       expect(result.stdout).not.toContain("ATLAS_BACKUP_PATH=");
       const log = readFileSync(path.join(fixture.logDirectory, "docker.log"), "utf8");
-      expect(log).toContain("compose start worker");
-      expect(log).toContain("compose start web");
+      expect(log).toContain("start -- worker-container");
+      expect(log).toContain("start -- web-container");
       expect(readdirSync(fixture.backupRoot)).toEqual([]);
     },
   );
@@ -1343,9 +1494,21 @@ describe("backup.sh behavior", () => {
 
     expect(result.status, result.stderr).toBe(0);
     const log = readFileSync(path.join(fixture.logDirectory, "docker.log"), "utf8");
-    expect(log).toContain("compose stop web");
-    expect(log).toContain("compose start web");
-    expect(log).not.toContain("compose stop worker");
-    expect(log).not.toContain("compose start worker");
+    expect(log).toContain("stop -- web-container");
+    expect(log).toContain("start -- web-container");
+    expect(log).not.toContain("stop -- worker-container");
+    expect(log).not.toContain("start -- worker-container");
+  });
+
+  it("rejects one volume identity reused for database and artifacts before Docker access", () => {
+    const fixture = createBackupFixture();
+    const result = backup(fixture, {
+      ATLAS_DB_VOLUME_NAME: "atlas-shared",
+      ATLAS_ARTIFACT_VOLUME_NAME: "atlas-shared",
+    });
+
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toMatch(/volume.*distinct|distinct.*volume/i);
+    expect(existsSync(path.join(fixture.logDirectory, "docker.log"))).toBe(false);
   });
 });

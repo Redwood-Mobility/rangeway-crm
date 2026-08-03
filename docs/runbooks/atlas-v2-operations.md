@@ -139,7 +139,7 @@ The foundation has a guarded internal service boundary for creating and disablin
 
 ## Backup invocation
 
-Backups contain both a PostgreSQL custom dump and the artifact archive. Before `pg_dump`, the script snapshots the exact prior-active web/worker set, stops those writers, finds and stops every exact Compose-project `migrator` container, and proves no matching migrator remains. A migrator is never added to the restorable set. The script writes into a private pending directory, verifies non-empty artifacts, emits metadata and SHA-256 checksums, publishes one final directory atomically, and restarts only the web/worker subset that was active at acquisition.
+Backups contain both a PostgreSQL custom dump and the artifact archive. The installed helper does not load Compose or execute from the live release tree. It validates the exact `atlas-v2` Docker project plus distinct named `atlas-db` and `atlas-artifacts` volumes, discovers the one running database container through exact project/service labels, and proves that container mounts the expected database volume. Before `pg_dump`, it snapshots the exact running web/worker container IDs, stops those IDs, finds and stops every exact-label `migrator`, and proves no matching migrator remains. A migrator is never added to the restorable set. Database provenance and dumping run directly in the exact database container; the artifact archive mounts only the exact named artifact volume. The helper writes into a private pending directory, verifies non-empty artifacts, emits metadata and SHA-256 checksums, publishes one final directory atomically, and restarts only the exact web/worker IDs that were active at acquisition.
 
 Prepare a narrow backup root once:
 
@@ -147,7 +147,7 @@ Prepare a narrow backup root once:
 install -d -m 0700 -o root -g root /var/backups/atlas-v2
 ```
 
-Invoke a backup from the deployed repository:
+Invoke the installed backup helper with the exact trusted repository identity:
 
 ```bash
 BACKUP_ROOT=/var/backups/atlas-v2 \
@@ -156,6 +156,8 @@ COMPOSE_PROJECT_NAME=atlas-v2 \
 ```
 
 Capture the single `ATLAS_BACKUP_PATH=/var/backups/atlas-v2/<exact-directory>` output as evidence. Then perform the restore test in [the restore-test runbook](atlas-v2-restore-test.md). **A backup is untrusted until that restore test succeeds.**
+
+`--repository-root` remains the release-provenance and backup-root separation boundary; it is not a Compose execution root. During an authenticated `unreleased-v2-foundation` retry, `/opt/atlas-v2` may be the restored empty prior tree. The immutable installed helper must still operate from exact Docker labels and named volumes before candidate promotion, without reading candidate or staged paths.
 
 ## Deployment procedure
 
@@ -172,7 +174,7 @@ Each release creates an immutable archive of the exact clean `HEAD`, copies the 
 3. Confirm the equipped foundation gates, Operating Core, representative acceptance projects, and cutover plan are approved.
 4. Confirm the production environment file contains no placeholders; uses `NODE_ENV=production` and `AUTH_MODE=google`; provides distinct 24-128 character `POSTGRES_BOOTSTRAP_PASSWORD`, `ATLAS_MIGRATOR_PASSWORD`, `ATLAS_WEB_PASSWORD`, and `ATLAS_WORKER_PASSWORD` values using only letters, numbers, underscore, or hyphen; and contains no shared `DATABASE_URL`. `ATLAS_ORIGIN` and `GOOGLE_REDIRECT_URI` must be HTTPS, use the same origin, and the callback must end at `/api/auth/google/callback`. Development-owner and one-time production-owner variables must be absent.
 5. Confirm the V1 archive and V1 volumes are intact.
-6. Confirm bootstrap completed as root on Ubuntu 24.04 LTS/systemd 255 or newer and deployment access uses the restricted root administrator; confirm `/usr/local/sbin/atlas-v2-deployment-coordinator`, `/etc/systemd/system/atlas-v2-deployment-guardian.service`, `/usr/local/libexec/atlas-v2/{backup.sh,restore-test.sh,init-roles.sh,Caddyfile}`, `/var/lib/atlas-v2-deployment`, `/opt/atlas-v2`, and `/var/backups/atlas-v2` are root-owned with the documented modes. Confirm Docker and systemd are healthy. Deploy repeats the disposable transient-unit capability probe before remote staging or installation. If an Atlas V2 database already exists, the coordinator passes the exact `/opt/atlas-v2` repository root to the immutable installed backup tool and runs the immutable installed restore-test tool against that exact `ATLAS_BACKUP_PATH` before candidate promotion or migration. Any missing or failed restore test stops deployment with the previous provenance and exact backup path. A first-ever deployment with no V2 database has no prior state to back up and may proceed without this pre-deploy restore step. If that first attempt creates a database volume but fails before the compatibility boundary, one automatic retry may back up and restore-prove it only as `unreleased-v2-foundation`: no `.atlas-release` may exist, the database must prove the exact zero-migration state, and the manifest must carry the coordinator-recorded immutable migration-set hash.
+6. Confirm bootstrap completed as root on Ubuntu 24.04 LTS/systemd 255 or newer and deployment access uses the restricted root administrator; confirm `/usr/local/sbin/atlas-v2-deployment-coordinator`, `/etc/systemd/system/atlas-v2-deployment-guardian.service`, `/usr/local/libexec/atlas-v2/{backup.sh,restore-test.sh,init-roles.sh,Caddyfile}`, `/var/lib/atlas-v2-deployment`, `/opt/atlas-v2`, and `/var/backups/atlas-v2` are root-owned with the documented modes. Confirm Docker and systemd are healthy. Deploy repeats the disposable transient-unit capability probe before remote staging or installation. If an Atlas V2 database already exists, the coordinator passes the exact `/opt/atlas-v2` provenance root to the immutable installed backup tool, which uses exact Docker labels and named volumes without requiring a live Compose file, and then runs the immutable installed restore-test tool against that exact `ATLAS_BACKUP_PATH` before candidate promotion or migration. Any missing or failed restore test stops deployment with the previous provenance and exact backup path. A first-ever deployment with no V2 database has no prior state to back up and may proceed without this pre-deploy restore step. If that first attempt creates a database volume but fails before the compatibility boundary, one automatic retry may back up and restore-prove it only as `unreleased-v2-foundation`: no `.atlas-release` or live Compose tree may exist, the database must prove the exact zero-migration state, and the manifest must carry the coordinator-recorded immutable migration-set hash.
 7. Run the deploy script from the exact reviewed commit:
 
 ```bash

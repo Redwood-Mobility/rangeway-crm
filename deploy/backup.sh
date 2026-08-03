@@ -5,6 +5,8 @@ ATLAS_BACKUP_FORMAT="atlas-v2-postgres-artifacts-v1"
 UNRELEASED_PROVENANCE="unreleased-v2-foundation"
 BACKUP_ROOT_INPUT="${BACKUP_ROOT:-/var/backups/atlas-v2}"
 COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-atlas-v2}"
+DB_VOLUME_NAME="${ATLAS_DB_VOLUME_NAME:-atlas-db}"
+ARTIFACT_VOLUME_NAME="${ATLAS_ARTIFACT_VOLUME_NAME:-atlas-artifacts}"
 KEEP_QUIESCED="${ATLAS_KEEP_QUIESCED:-0}"
 BACKUP_TEST_MODE="${ATLAS_BACKUP_TEST_MODE:-0}"
 REPOSITORY_ROOT_INPUT="${ATLAS_REPOSITORY_ROOT:-}"
@@ -55,6 +57,22 @@ canonicalize_absolute_path() {
 
 [[ "${BACKUP_TEST_MODE}" == "0" || "${BACKUP_TEST_MODE}" == "1" ]] \
   || fail "ATLAS_BACKUP_TEST_MODE must be 0 or 1."
+[[ "${COMPOSE_PROJECT_NAME}" =~ ^[a-z0-9][a-z0-9_-]*$ ]] \
+  || fail "COMPOSE_PROJECT_NAME is invalid."
+[[ "${DB_VOLUME_NAME}" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] \
+  || fail "ATLAS_DB_VOLUME_NAME is invalid."
+[[ "${ARTIFACT_VOLUME_NAME}" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] \
+  || fail "ATLAS_ARTIFACT_VOLUME_NAME is invalid."
+[[ "${DB_VOLUME_NAME}" != "${ARTIFACT_VOLUME_NAME}" ]] \
+  || fail "database and artifact volume names must be distinct."
+if [[ "${BACKUP_TEST_MODE}" != "1" ]]; then
+  [[ "${COMPOSE_PROJECT_NAME}" == "atlas-v2" ]] \
+    || fail "production Docker project must be exactly atlas-v2."
+  [[ "${DB_VOLUME_NAME}" == "atlas-db" ]] \
+    || fail "production database volume must be exactly atlas-db."
+  [[ "${ARTIFACT_VOLUME_NAME}" == "atlas-artifacts" ]] \
+    || fail "production artifact volume must be exactly atlas-artifacts."
+fi
 [[ -n "${REPOSITORY_ROOT_INPUT}" ]] \
   || fail "ATLAS_REPOSITORY_ROOT or --repository-root is required."
 [[ "${REPOSITORY_ROOT_INPUT}" != *'*'* && "${REPOSITORY_ROOT_INPUT}" != *'?'* \
@@ -73,8 +91,6 @@ fi
 REPOSITORY_ROOT="$(cd -- "${LEXICAL_REPOSITORY_ROOT}" && pwd -P)"
 [[ "${REPOSITORY_ROOT}" == "${LEXICAL_REPOSITORY_ROOT}" ]] \
   || fail "repository root must not traverse a symlink."
-[[ -f "${REPOSITORY_ROOT}/docker-compose.yml" && ! -L "${REPOSITORY_ROOT}/docker-compose.yml" ]] \
-  || fail "repository root does not contain the reviewed Compose file."
 
 [[ "${BACKUP_ROOT_INPUT}" != *'*'* && "${BACKUP_ROOT_INPUT}" != *'?'* && "${BACKUP_ROOT_INPUT}" != *'['* ]] \
   || fail "BACKUP_ROOT cannot contain a glob."
@@ -110,13 +126,13 @@ for command_name in docker sha256sum mktemp git rm; do
   command -v "${command_name}" >/dev/null 2>&1 || fail "required command is unavailable: ${command_name}"
 done
 
-cd "${REPOSITORY_ROOT}"
 GIT_COMMIT="${ATLAS_GIT_COMMIT:-}"
-if [[ -z "${GIT_COMMIT}" && -f .atlas-release ]]; then
-  GIT_COMMIT="$(tr -d '[:space:]' < .atlas-release)"
+if [[ -z "${GIT_COMMIT}" && -f "${REPOSITORY_ROOT}/.atlas-release" ]]; then
+  GIT_COMMIT="$(tr -d '[:space:]' < "${REPOSITORY_ROOT}/.atlas-release")"
 fi
-if [[ -z "${GIT_COMMIT}" ]] && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-  GIT_COMMIT="$(git rev-parse --verify HEAD)"
+if [[ -z "${GIT_COMMIT}" ]] \
+  && git -C "${REPOSITORY_ROOT}" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  GIT_COMMIT="$(git -C "${REPOSITORY_ROOT}" rev-parse --verify HEAD)"
 fi
 MIGRATION_PROVENANCE="released"
 MIGRATION_SET_SHA256="none"
@@ -132,20 +148,51 @@ else
     || fail "ATLAS_GIT_COMMIT or .atlas-release must identify the deployed commit."
 fi
 
-docker compose config >/dev/null
+DISCOVERED_CONTAINER="none"
+discover_single_running_service() {
+  local service="$1"
+  local required="$2"
+  local snapshot line candidate project_label service_label extra
+  DISCOVERED_CONTAINER="none"
+  snapshot="$(docker ps \
+    --filter "label=com.docker.compose.project=${COMPOSE_PROJECT_NAME}" \
+    --filter "label=com.docker.compose.service=${service}" \
+    --format '{{.ID}}|{{.Label "com.docker.compose.project"}}|{{.Label "com.docker.compose.service"}}')" \
+    || fail "could not inspect the exact-label ${service} service."
+  while IFS= read -r line; do
+    [[ -n "${line}" ]] || continue
+    IFS='|' read -r candidate project_label service_label extra <<< "${line}"
+    [[ "${candidate}" =~ ^[A-Za-z0-9_.-]+$ && -z "${extra:-}" \
+      && "${line}" == *"|"*"|"* ]] \
+      || fail "exact-label ${service} discovery returned malformed output."
+    [[ "${project_label}" == "${COMPOSE_PROJECT_NAME}" && "${service_label}" == "${service}" ]] \
+      || fail "exact-label ${service} discovery returned mismatched labels."
+    [[ "${DISCOVERED_CONTAINER}" == "none" ]] \
+      || fail "exact-label ${service} discovery returned duplicate running containers."
+    DISCOVERED_CONTAINER="${candidate}"
+  done <<< "${snapshot}"
+  if [[ "${required}" == "required" && "${DISCOVERED_CONTAINER}" == "none" ]]; then
+    fail "the exact-label ${service} service is not running."
+  fi
+}
 
-DB_CONTAINER="$(docker compose ps -q db)"
-[[ -n "${DB_CONTAINER}" ]] || fail "the Compose database service is not running."
-[[ "$(docker inspect --format '{{.State.Running}}' "${DB_CONTAINER}")" == "true" ]] \
-  || fail "the Compose database container is not running."
-docker volume inspect atlas-artifacts >/dev/null 2>&1 \
+docker volume inspect "${DB_VOLUME_NAME}" >/dev/null 2>&1 \
+  || fail "the Atlas V2 database volume does not exist."
+docker volume inspect "${ARTIFACT_VOLUME_NAME}" >/dev/null 2>&1 \
   || fail "the Atlas V2 artifact volume does not exist."
+
+discover_single_running_service db required
+DB_CONTAINER="${DISCOVERED_CONTAINER}"
+DB_MOUNT="$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "/var/lib/postgresql/data"}}{{.Type}}|{{.Name}}|{{.Destination}}{{"\n"}}{{end}}{{end}}' "${DB_CONTAINER}")"
+[[ "${DB_MOUNT}" == "volume|${DB_VOLUME_NAME}|/var/lib/postgresql/data" ]] \
+  || fail "the exact-label database container is not attached to the expected database volume."
 
 DATABASE_IMAGE="$(docker inspect --format '{{.Config.Image}}' "${DB_CONTAINER}")"
 [[ -n "${DATABASE_IMAGE}" ]] || fail "could not resolve the database image."
 if [[ "${MIGRATION_PROVENANCE}" == "zero" ]]; then
   INITIAL_DATABASE_STATE="$(
-    docker compose exec -T -e "PGAPPNAME=atlas-deploy-${ATLAS_DEPLOYMENT_TOKEN:-standalone-backup}" db \
+    docker exec "${DB_CONTAINER}" env \
+      "PGAPPNAME=atlas-deploy-${ATLAS_DEPLOYMENT_TOKEN:-standalone-backup}" \
       psql --username=atlas --dbname=atlas --tuples-only --no-align \
       --variable=ON_ERROR_STOP=1 \
       --command="SELECT CASE WHEN to_regclass('public.schema_migrations') IS NULL AND NOT EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public' AND c.relname = ANY (ARRAY['organizations','users','actors','organization_memberships','audit_events','outbox_events','api_idempotency_keys'])) THEN 'atlas-initial-empty' ELSE 'atlas-initial-unknown' END AS atlas_initial_provenance;"
@@ -156,64 +203,16 @@ fi
 TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 
-SERVICE_SNAPSHOT=""
-if ! SERVICE_SNAPSHOT="$(
-  docker compose ps --all --format '{{.Service}}|{{.State}}' web worker
-)"; then
-  fail "could not capture the web/worker service-state snapshot."
-fi
-
-# Policy: running and restarting services are active writers. Stop and later
-# start exactly that prior-active subset; leave every other known state untouched.
 WEB_WAS_ACTIVE=0
 WORKER_WAS_ACTIVE=0
-WEB_RECORDS=0
-WORKER_RECORDS=0
-if [[ -n "${SERVICE_SNAPSHOT}" ]]; then
-  while IFS= read -r service_record; do
-    case "${service_record}" in
-      *"|"*"|"*|*[[:space:]]*)
-        fail "service-state snapshot contained a malformed record."
-        ;;
-      *"|"*) ;;
-      *)
-        fail "service-state snapshot contained a malformed record."
-        ;;
-    esac
-
-    service_name="${service_record%%|*}"
-    service_state="${service_record#*|}"
-    case "${service_name}" in
-      web)
-        WEB_RECORDS=$((WEB_RECORDS + 1))
-        [[ "${WEB_RECORDS}" -eq 1 ]] \
-          || fail "service-state snapshot contained duplicate web records."
-        ;;
-      worker)
-        WORKER_RECORDS=$((WORKER_RECORDS + 1))
-        [[ "${WORKER_RECORDS}" -eq 1 ]] \
-          || fail "service-state snapshot contained duplicate worker records."
-        ;;
-      *)
-        fail "service-state snapshot contained an unknown service."
-        ;;
-    esac
-
-    case "${service_state}" in
-      running|restarting)
-        if [[ "${service_name}" == "web" ]]; then
-          WEB_WAS_ACTIVE=1
-        else
-          WORKER_WAS_ACTIVE=1
-        fi
-        ;;
-      paused|removing|dead|created|exited) ;;
-      *)
-        fail "service-state snapshot contained an unknown state."
-        ;;
-    esac
-  done <<< "${SERVICE_SNAPSHOT}"
-fi
+WEB_CONTAINER="none"
+WORKER_CONTAINER="none"
+discover_single_running_service web optional
+WEB_CONTAINER="${DISCOVERED_CONTAINER}"
+[[ "${WEB_CONTAINER}" == "none" ]] || WEB_WAS_ACTIVE=1
+discover_single_running_service worker optional
+WORKER_CONTAINER="${DISCOVERED_CONTAINER}"
+[[ "${WORKER_CONTAINER}" == "none" ]] || WORKER_WAS_ACTIVE=1
 
 PENDING_DIR=""
 RESTORE_SERVICES=0
@@ -222,10 +221,10 @@ restart_app_services() {
   local restart_status=0
   set +e
   if [[ "${WORKER_WAS_ACTIVE}" -eq 1 ]]; then
-    docker compose start worker >&2 || restart_status=1
+    docker start -- "${WORKER_CONTAINER}" >&2 || restart_status=1
   fi
   if [[ "${WEB_WAS_ACTIVE}" -eq 1 ]]; then
-    docker compose start web >&2 || restart_status=1
+    docker start -- "${WEB_CONTAINER}" >&2 || restart_status=1
   fi
   set -e
   return "${restart_status}"
@@ -270,10 +269,10 @@ FINAL_DIR="${BACKUP_ROOT}/${STAMP}-${BACKUP_SUFFIX}"
 RESTORE_SERVICES=1
 
 if [[ "${WEB_WAS_ACTIVE}" -eq 1 ]]; then
-  docker compose stop web >&2
+  docker stop -- "${WEB_CONTAINER}" >&2
 fi
 if [[ "${WORKER_WAS_ACTIVE}" -eq 1 ]]; then
-  docker compose stop worker >&2
+  docker stop -- "${WORKER_CONTAINER}" >&2
 fi
 
 fence_exact_service() {
@@ -305,12 +304,13 @@ for fenced_service in web worker migrator; do
   fence_exact_service "${fenced_service}"
 done
 
-docker compose exec -T -e "PGAPPNAME=atlas-deploy-${ATLAS_DEPLOYMENT_TOKEN:-standalone-backup}" db \
+docker exec "${DB_CONTAINER}" env \
+  "PGAPPNAME=atlas-deploy-${ATLAS_DEPLOYMENT_TOKEN:-standalone-backup}" \
   pg_dump --format=custom --username=atlas --dbname=atlas \
   > "${PENDING_DIR}/atlas-postgres.dump"
 
 docker run --rm \
-  --volume atlas-artifacts:/artifacts:ro \
+  --volume "${ARTIFACT_VOLUME_NAME}:/artifacts:ro" \
   --volume "${PENDING_DIR}:/backup" \
   alpine:3.21 \
   tar -C /artifacts -czf /backup/atlas-artifacts.tgz .

@@ -4,7 +4,7 @@
 
 **A backup is not trusted until a restore test succeeds.** File existence, a successful `pg_dump`, or a matching checksum alone is not recovery evidence.
 
-This procedure is non-destructive: it restores into uniquely named temporary Docker volumes and a temporary PostgreSQL container. It must never target the live `atlas-db` or `atlas-artifacts` volumes. It does not authorize a live production restore.
+This procedure is non-destructive: it restores into uniquely named temporary Docker volumes and a temporary PostgreSQL container. It consumes only the exact backup directory and does not load Compose, inspect the live release tree, or use a candidate tree. It must never target the live `atlas-db` or `atlas-artifacts` volumes. It does not authorize a live production restore.
 
 ## Prerequisites
 
