@@ -32,14 +32,24 @@ const hasDockerCompose = composeProbe.status === 0;
 // The migrator sits behind the `operations` profile so it never runs as part of
 // the default runtime. Resolving without that profile would correctly omit it,
 // and these cases assert the complete topology including it.
+function resolve(profiles: string[]) {
+  return JSON.parse(
+    execFileSync(
+      "docker",
+      ["compose", ...profiles.flatMap((profile) => ["--profile", profile]), "config", "--format", "json"],
+      { cwd: repositoryRoot, encoding: "utf8" },
+    ),
+  ) as {
+    services: Record<string, Record<string, unknown>>;
+    volumes?: Record<string, unknown>;
+  };
+}
+
+// The default topology is co-tenant: no Caddy, web on loopback for an existing
+// reverse proxy. `edge` adds Caddy for a host Atlas owns outright.
+const coTenantCompose = hasDockerCompose ? resolve(["operations"]) : undefined;
 const resolvedCompose = hasDockerCompose
-  ? (JSON.parse(
-      execFileSync(
-        "docker",
-        ["compose", "--profile", "operations", "config", "--format", "json"],
-        { cwd: repositoryRoot, encoding: "utf8" },
-      ),
-    ) as {
+  ? (resolve(["operations", "edge"]) as {
       services: Record<string, Record<string, unknown>>;
       volumes?: Record<string, unknown>;
     })
@@ -50,6 +60,28 @@ describe.skipIf(!hasDockerCompose)("resolved Docker Compose topology", () => {
 
   it("contains the four runtime services plus the operations-only migrator", () => {
     expect(Object.keys(compose.services).sort()).toEqual(["caddy", "db", "migrator", "web", "worker"]);
+  });
+
+  it("leaves Caddy out of the default co-tenant topology", () => {
+    // Starting Caddy on a host whose web server already owns 80/443 would
+    // contend with every other site on it.
+    expect(Object.keys(coTenantCompose!.services).sort()).toEqual([
+      "db",
+      "migrator",
+      "web",
+      "worker",
+    ]);
+  });
+
+  it("publishes web on loopback only so a reverse proxy fronts it", () => {
+    const published = coTenantCompose!.services.web.ports as Array<Record<string, unknown>>;
+    expect(published).toHaveLength(1);
+    expect(String(published[0].host_ip)).toBe("127.0.0.1");
+    expect(Number(published[0].target)).toBe(8080);
+    for (const [name, service] of Object.entries(coTenantCompose!.services)) {
+      if (name === "web") continue;
+      expect(service.ports ?? []).toEqual([]);
+    }
   });
 
   it("runs web and worker without schema-owner credentials or startup migrations", () => {
@@ -82,12 +114,14 @@ describe.skipIf(!hasDockerCompose)("resolved Docker Compose topology", () => {
     expect(mountedSources(compose.services.worker).get("atlas-artifacts")).toBe("/app/artifacts");
   });
 
-  it("publishes ports from Caddy only", () => {
+  it("publishes the public ports from Caddy alone in the edge topology", () => {
+    const caddyPorts = compose.services.caddy.ports as Array<Record<string, unknown>>;
+    expect(caddyPorts.map((port) => Number(port.target)).sort((a, b) => a - b)).toEqual([80, 443]);
     for (const [serviceName, service] of Object.entries(compose.services)) {
-      if (serviceName === "caddy") {
-        expect(Array.isArray(service.ports) && service.ports.length > 0).toBe(true);
-      } else {
-        expect(service.ports ?? []).toEqual([]);
+      if (serviceName === "caddy") continue;
+      // Web still binds loopback; nothing else reaches the public interface.
+      for (const port of (service.ports ?? []) as Array<Record<string, unknown>>) {
+        expect(String(port.host_ip)).toBe("127.0.0.1");
       }
     }
   });

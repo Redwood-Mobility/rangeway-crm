@@ -31,6 +31,12 @@ services:
         condition: service_healthy
     expose:
       - "8080"
+    # Published on loopback only. On a host that already terminates TLS — the
+    # Rangeway web server runs nginx for the public sites — that reverse proxy
+    # forwards to this port, and Atlas is never directly reachable from outside.
+    # On a dedicated host the `edge` profile below puts Caddy in front instead.
+    ports:
+      - "127.0.0.1:${ATLAS_BIND_PORT:-8081}:8080"
     volumes:
       - atlas-artifacts:/app/artifacts
     healthcheck:
@@ -97,8 +103,11 @@ services:
     mem_limit: 1024m
     cpus: 1.0
 
+  # Only for a host Atlas owns outright. Activate with `--profile edge`. Starting
+  # it on a shared host would contend with the existing web server for 80/443.
   caddy:
     image: caddy:2.10-alpine
+    profiles: [edge]
     restart: unless-stopped
     depends_on:
       web:

@@ -185,8 +185,13 @@ if [[ "${test_mode}" != "1" ]]; then
     || { echo "Atlas deployment requires readable /etc/os-release metadata." >&2; exit 1; }
   os_id="$(sed -n 's/^ID=//p' /etc/os-release | tr -d '"')"
   os_version="$(sed -n 's/^VERSION_ID=//p' /etc/os-release | tr -d '"')"
-  [[ "${os_id}" == "ubuntu" && "${os_version}" == "24.04" ]] \
-    || { echo "Atlas deployment requires Ubuntu 24.04 LTS." >&2; exit 1; }
+  # The systemd and cgroup behaviour this deployment depends on is verified
+  # directly below, so the accepted releases are the supported LTS line rather
+  # than one pinned version. The transient-unit probe is the real gate.
+  case "${os_id}:${os_version}" in
+    ubuntu:24.04|ubuntu:26.04) ;;
+    *) echo "Atlas deployment requires Ubuntu 24.04 or 26.04 LTS." >&2; exit 1 ;;
+  esac
   systemd_version="$(systemctl --version | sed -n '1s/^systemd \([0-9][0-9]*\).*/\1/p')"
   [[ "${systemd_version}" =~ ^[0-9]+$ && "${systemd_version}" -ge 255 ]] \
     || { echo "Atlas deployment requires systemd 255 or newer." >&2; exit 1; }
