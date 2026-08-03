@@ -149,8 +149,13 @@ if [[ "\${1:-}" == "bash" && "\${2:-}" == "-s" && "\${3:-}" == "--" ]]; then
     printf '%s\\n' '--- remote script ---'
     /bin/cat "\${script_file}"
   } >> "\${FAKE_LOG_DIR}/ssh-scripts.log"
-  /bin/bash "\${script_file}" "$@"
-  status=$?
+  if [[ -n "\${FAKE_REMOTE_SYMLINK_OUTPUT:-}" ]] && /usr/bin/grep -q "REMOTE_DIR=%s" "\${script_file}"; then
+    printf '%b' "\${FAKE_REMOTE_SYMLINK_OUTPUT}"
+    status=0
+  else
+    /bin/bash "\${script_file}" "$@"
+    status=$?
+  fi
   /bin/unlink "\${script_file}"
   exit "\${status}"
 fi
@@ -226,6 +231,38 @@ describe("deploy.sh behavior", () => {
     );
   });
 
+  it("rejects unsafe canonical paths returned through a remote symlink before mutation", () => {
+    const fixture = createDeployFixture();
+    const result = deploy(fixture, {
+      FAKE_REMOTE_SYMLINK_OUTPUT:
+        "REMOTE_DIR=/opt/atlas v2\nREMOTE_BACKUP_ROOT=/var/backups/atlas-v2\n",
+    });
+
+    expect(result.status).not.toBe(0);
+    expect(`${result.stdout}${result.stderr}`).toMatch(/unsupported|canonical|deployment paths/i);
+    expect(readFileSync(path.join(fixture.logDirectory, "ssh.log"), "utf8").trim().split("\n")).toHaveLength(1);
+    expect(existsSync(path.join(fixture.logDirectory, "docker.log"))).toBe(false);
+    expect(existsSync(path.join(fixture.logDirectory, "rsync-counter"))).toBe(false);
+    expect(existsSync(fixture.remoteDirectory)).toBe(false);
+  });
+
+  it("rejects duplicate canonical path keys before mutation", () => {
+    const fixture = createDeployFixture();
+    const result = deploy(fixture, {
+      FAKE_REMOTE_SYMLINK_OUTPUT: [
+        `REMOTE_DIR=${fixture.remoteDirectory}`,
+        `REMOTE_DIR=${fixture.remoteDirectory}-duplicate`,
+        `REMOTE_BACKUP_ROOT=${fixture.backupRoot}`,
+        "",
+      ].join("\n"),
+    });
+
+    expect(result.status).not.toBe(0);
+    expect(`${result.stdout}${result.stderr}`).toMatch(/exactly once|canonical|deployment paths/i);
+    expect(readFileSync(path.join(fixture.logDirectory, "ssh.log"), "utf8").trim().split("\n")).toHaveLength(1);
+    expect(existsSync(path.join(fixture.logDirectory, "rsync-counter"))).toBe(false);
+  });
+
   it("prints exact recovery evidence after a post-backup failure without changing the release marker", () => {
     const fixture = createDeployFixture();
     const exactBackup = installRemoteBackup(fixture);
@@ -297,8 +334,21 @@ printf '%s\\n' "$*" >> "\${FAKE_LOG_DIR}/docker.log"
 last_argument=""
 for argument in "$@"; do last_argument="\${argument}"; done
 if [[ "$*" == "compose ps -q db" ]]; then printf '%s\\n' db-container; exit 0; fi
-if [[ "$*" == *"compose ps"* && "\${last_argument}" == "web" ]]; then case ",\${FAKE_RUNNING_SERVICES:-web,worker}," in *,web,*) printf '%s\\n' web-container ;; esac; exit 0; fi
-if [[ "$*" == *"compose ps"* && "\${last_argument}" == "worker" ]]; then case ",\${FAKE_RUNNING_SERVICES:-web,worker}," in *,worker,*) printf '%s\\n' worker-container ;; esac; exit 0; fi
+if [[ "$*" == *"compose ps"* && ( "\${last_argument}" == "web" || "\${last_argument}" == "worker" ) ]]; then
+  requested_status=""
+  previous_argument=""
+  for argument in "$@"; do
+    [[ "\${previous_argument}" == "--status" ]] && requested_status="\${argument}"
+    previous_argument="\${argument}"
+  done
+  [[ "\${FAKE_PROBE_FAIL:-}" == "\${last_argument}:\${requested_status}" ]] && exit 55
+  case "\${last_argument}" in
+    web) service_state="\${FAKE_WEB_STATE:-running}" ;;
+    worker) service_state="\${FAKE_WORKER_STATE:-running}" ;;
+  esac
+  [[ "\${service_state}" == "\${requested_status}" ]] && printf '%s\\n' "\${last_argument}-container"
+  exit 0
+fi
 if [[ "$*" == *"State.Running"* ]]; then printf '%s\\n' true; exit 0; fi
 if [[ "$*" == *"Config.Image"* ]]; then printf '%s\\n' postgres:17-bookworm; exit 0; fi
 if [[ "$*" == "volume inspect atlas-artifacts" ]]; then exit 0; fi
@@ -370,6 +420,36 @@ describe("backup.sh behavior", () => {
     expect(log).not.toMatch(/compose (?:stop|start) (?:db|caddy)/);
   });
 
+  it("aborts on a service-state probe failure before stopping or backing up", () => {
+    const fixture = createBackupFixture();
+    const result = backup(fixture, { FAKE_PROBE_FAIL: "worker:restarting" });
+
+    expect(result.status).not.toBe(0);
+    expect(result.stdout).not.toContain("ATLAS_BACKUP_PATH=");
+    const log = readFileSync(path.join(fixture.logDirectory, "docker.log"), "utf8");
+    expect(log).toContain("compose ps --status restarting -q worker");
+    expect(log).not.toMatch(/compose stop|pg_dump|compose start/);
+    expect(existsSync(fixture.backupRoot) ? readdirSync(fixture.backupRoot) : []).toEqual([]);
+  });
+
+  it("treats restarting as active, restores only that service after failure, and removes partial output", () => {
+    const fixture = createBackupFixture();
+    const result = backup(fixture, {
+      FAKE_WEB_STATE: "stopped",
+      FAKE_WORKER_STATE: "restarting",
+      FAKE_FAIL_STAGE: "pg_dump",
+    });
+
+    expect(result.status).not.toBe(0);
+    expect(result.stdout).not.toContain("ATLAS_BACKUP_PATH=");
+    const log = readFileSync(path.join(fixture.logDirectory, "docker.log"), "utf8");
+    expect(log).toContain("compose stop worker");
+    expect(log).toContain("compose start worker");
+    expect(log).not.toContain("compose stop web");
+    expect(log).not.toContain("compose start web");
+    expect(readdirSync(fixture.backupRoot)).toEqual([]);
+  });
+
   it.each(["pg_dump", "tar", "checksum"])(
     "restarts the originally running app services and publishes nothing when %s fails",
     (failureStage) => {
@@ -381,13 +461,13 @@ describe("backup.sh behavior", () => {
       const log = readFileSync(path.join(fixture.logDirectory, "docker.log"), "utf8");
       expect(log).toContain("compose start worker");
       expect(log).toContain("compose start web");
-      expect(readdirSync(fixture.backupRoot).filter((entry) => !entry.startsWith("."))).toEqual([]);
+      expect(readdirSync(fixture.backupRoot)).toEqual([]);
     },
   );
 
   it("restarts exactly the app services that were running before backup", () => {
     const fixture = createBackupFixture();
-    const result = backup(fixture, { FAKE_RUNNING_SERVICES: "web" });
+    const result = backup(fixture, { FAKE_WORKER_STATE: "stopped" });
 
     expect(result.status, result.stderr).toBe(0);
     const log = readFileSync(path.join(fixture.logDirectory, "docker.log"), "utf8");

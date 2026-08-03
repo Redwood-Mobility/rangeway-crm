@@ -197,7 +197,11 @@ describe("deterministic deployment source contract", () => {
     expect(backupScript).toContain("sha256sum");
     expect(backupScript).toMatch(/-s .*atlas-postgres\.dump/);
     expect(backupScript).toMatch(/-s .*atlas-artifacts\.tgz/);
-    expect(backupScript).not.toMatch(/(^|\s)rm\s|docker volume rm|find .*delete/);
+    const exactPendingCleanup = 'rm -rf -- "${PENDING_DIR}"';
+    expect(backupScript).toContain(exactPendingCleanup);
+    expect(backupScript.replace(exactPendingCleanup, "")).not.toMatch(
+      /(^|\s)rm\s|docker volume rm|find .*delete/,
+    );
   });
 
   it("restore testing verifies integrity and uses explicit unique temporary resources", () => {

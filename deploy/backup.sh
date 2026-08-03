@@ -68,7 +68,7 @@ case "${BACKUP_ROOT}" in
 esac
 [[ "${BACKUP_ROOT}" =~ ^/[A-Za-z0-9._/-]+$ ]] || fail "BACKUP_ROOT contains unsupported characters."
 
-for command_name in docker sha256sum mktemp git; do
+for command_name in docker sha256sum mktemp git rm; do
   command -v "${command_name}" >/dev/null 2>&1 || fail "required command is unavailable: ${command_name}"
 done
 
@@ -97,6 +97,30 @@ DATABASE_IMAGE="$(docker inspect --format '{{.Config.Image}}' "${DB_CONTAINER}")
 TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 
+probe_service_active() {
+  local service="$1"
+  local running_containers
+  local restarting_containers
+
+  if ! running_containers="$(docker compose ps --status running -q "${service}")"; then
+    fail "could not determine whether ${service} is running."
+  fi
+  if ! restarting_containers="$(docker compose ps --status restarting -q "${service}")"; then
+    fail "could not determine whether ${service} is restarting."
+  fi
+
+  if [[ -n "${running_containers}" || -n "${restarting_containers}" ]]; then
+    printf '1\n'
+  else
+    printf '0\n'
+  fi
+}
+
+# Policy: running and restarting services are active writers. Stop and later
+# start exactly that prior-active subset; leave every other state untouched.
+WEB_WAS_ACTIVE="$(probe_service_active web)"
+WORKER_WAS_ACTIVE="$(probe_service_active worker)"
+
 mkdir -p -- "${BACKUP_ROOT}"
 BACKUP_ROOT="$(cd -- "${BACKUP_ROOT}" && pwd -P)"
 PENDING_DIR="$(mktemp -d "${BACKUP_ROOT}/.atlas-backup-${STAMP}.XXXXXX")"
@@ -104,41 +128,53 @@ BACKUP_SUFFIX="${PENDING_DIR##*.}"
 FINAL_DIR="${BACKUP_ROOT}/${STAMP}-${BACKUP_SUFFIX}"
 [[ ! -e "${FINAL_DIR}" ]] || fail "backup destination already exists: ${FINAL_DIR}"
 
-WEB_WAS_RUNNING=0
-WORKER_WAS_RUNNING=0
-[[ -n "$(docker compose ps --status running -q web)" ]] && WEB_WAS_RUNNING=1
-[[ -n "$(docker compose ps --status running -q worker)" ]] && WORKER_WAS_RUNNING=1
 RESTORE_SERVICES=1
 
 restart_app_services() {
   local restart_status=0
   set +e
-  if [[ "${WORKER_WAS_RUNNING}" -eq 1 ]]; then
+  if [[ "${WORKER_WAS_ACTIVE}" -eq 1 ]]; then
     docker compose start worker >&2 || restart_status=1
   fi
-  if [[ "${WEB_WAS_RUNNING}" -eq 1 ]]; then
+  if [[ "${WEB_WAS_ACTIVE}" -eq 1 ]]; then
     docker compose start web >&2 || restart_status=1
   fi
   set -e
   return "${restart_status}"
 }
 
+cleanup_pending_backup() {
+  [[ -n "${PENDING_DIR:-}" && -e "${PENDING_DIR}" ]] || return 0
+  case "${PENDING_DIR}" in
+    "${BACKUP_ROOT}"/.atlas-backup-*)
+      rm -rf -- "${PENDING_DIR}"
+      ;;
+    *)
+      echo "Atlas V2 backup cleanup refused an unexpected path: ${PENDING_DIR}" >&2
+      return 1
+      ;;
+  esac
+}
+
 restart_on_exit() {
   local original_status="$?"
   local restart_status=0
+  local cleanup_status=0
   trap - EXIT INT TERM
   if [[ "${RESTORE_SERVICES}" -eq 1 ]]; then
     restart_app_services || restart_status="$?"
   fi
+  cleanup_pending_backup || cleanup_status="$?"
   [[ "${original_status}" -ne 0 ]] && exit "${original_status}"
-  exit "${restart_status}"
+  [[ "${restart_status}" -ne 0 ]] && exit "${restart_status}"
+  exit "${cleanup_status}"
 }
 trap restart_on_exit EXIT INT TERM
 
-if [[ "${WEB_WAS_RUNNING}" -eq 1 ]]; then
+if [[ "${WEB_WAS_ACTIVE}" -eq 1 ]]; then
   docker compose stop web >&2
 fi
-if [[ "${WORKER_WAS_RUNNING}" -eq 1 ]]; then
+if [[ "${WORKER_WAS_ACTIVE}" -eq 1 ]]; then
   docker compose stop worker >&2
 fi
 
@@ -173,7 +209,8 @@ docker run --rm \
 
 restart_app_services || fail "one or more app services could not be restarted after backup."
 RESTORE_SERVICES=0
-trap - EXIT INT TERM
 
 mv -- "${PENDING_DIR}" "${FINAL_DIR}"
+PENDING_DIR=""
+trap - EXIT INT TERM
 printf 'ATLAS_BACKUP_PATH=%s\n' "${FINAL_DIR}"

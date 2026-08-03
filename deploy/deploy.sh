@@ -61,6 +61,19 @@ path_is_equal_or_descendant() {
   [[ "${candidate}" == "${ancestor}" || "${candidate}" == "${ancestor}/"* ]]
 }
 
+validate_canonical_remote_path() {
+  local candidate="$1"
+  local label="$2"
+  local lexical_path
+
+  validate_remote_path_input "${candidate}" "${label}"
+  [[ "${candidate}" != "/" ]] || fail "${label} cannot resolve to the filesystem root."
+  lexical_path="$(canonicalize_absolute_path "${candidate}")" \
+    || fail "${label} must be an absolute path."
+  [[ "${lexical_path}" == "${candidate}" ]] \
+    || fail "${label} did not return one canonical path."
+}
+
 [[ -n "${REMOTE_HOST}" ]] || fail "set ATLAS_HOST to the target VPS hostname or IP."
 [[ "${REMOTE_HOST}" =~ ^[A-Za-z0-9._:-]+$ ]] || fail "ATLAS_HOST contains unsupported characters."
 [[ "${REMOTE_USER}" =~ ^[A-Za-z0-9._-]+$ ]] || fail "ATLAS_USER contains unsupported characters."
@@ -145,20 +158,40 @@ REMOTE_PATH_STATE="$(resolve_remote_paths 2> >(tee /dev/stderr))"
 
 REMOTE_DIR=""
 REMOTE_BACKUP_ROOT=""
+REMOTE_DIR_COUNT=0
+REMOTE_BACKUP_ROOT_COUNT=0
 while IFS='=' read -r path_key path_value; do
   case "${path_key}" in
-    REMOTE_DIR) REMOTE_DIR="${path_value}" ;;
-    REMOTE_BACKUP_ROOT) REMOTE_BACKUP_ROOT="${path_value}" ;;
+    REMOTE_DIR)
+      REMOTE_DIR_COUNT=$((REMOTE_DIR_COUNT + 1))
+      [[ "${REMOTE_DIR_COUNT}" -eq 1 ]] \
+        || fail "remote path response must contain REMOTE_DIR exactly once."
+      REMOTE_DIR="${path_value}"
+      ;;
+    REMOTE_BACKUP_ROOT)
+      REMOTE_BACKUP_ROOT_COUNT=$((REMOTE_BACKUP_ROOT_COUNT + 1))
+      [[ "${REMOTE_BACKUP_ROOT_COUNT}" -eq 1 ]] \
+        || fail "remote path response must contain REMOTE_BACKUP_ROOT exactly once."
+      REMOTE_BACKUP_ROOT="${path_value}"
+      ;;
+    *)
+      fail "remote path response contained an unexpected key."
+      ;;
   esac
 done <<< "${REMOTE_PATH_STATE}"
-[[ -n "${REMOTE_DIR}" && -n "${REMOTE_BACKUP_ROOT}" ]] \
-  || fail "remote deployment paths could not be canonicalized."
+[[ "${REMOTE_DIR_COUNT}" -eq 1 && "${REMOTE_BACKUP_ROOT_COUNT}" -eq 1 ]] \
+  || fail "remote deployment paths must each be returned exactly once."
+validate_canonical_remote_path "${REMOTE_DIR}" "canonical ATLAS_DIR"
+validate_canonical_remote_path "${REMOTE_BACKUP_ROOT}" "canonical ATLAS_BACKUP_ROOT"
 if path_is_equal_or_descendant "${REMOTE_BACKUP_ROOT}" "${REMOTE_DIR}"; then
   fail "canonical ATLAS_BACKUP_ROOT must be outside the synchronized ATLAS_DIR tree."
 fi
 
-ssh "${SSH_OPTS[@]}" "${REMOTE_TARGET}" \
-  "mkdir -p -- '${REMOTE_DIR}' '${REMOTE_BACKUP_ROOT}'"
+ssh "${SSH_OPTS[@]}" "${REMOTE_TARGET}" bash -s -- \
+  "${REMOTE_DIR}" "${REMOTE_BACKUP_ROOT}" <<'REMOTE_MKDIR'
+set -euo pipefail
+mkdir -p -- "$1" "$2"
+REMOTE_MKDIR
 
 run_remote_preflight() {
   ssh "${SSH_OPTS[@]}" "${REMOTE_TARGET}" bash -s -- \
