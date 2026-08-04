@@ -1,6 +1,11 @@
 import { Router, type RequestHandler } from "express";
 import { z } from "zod";
+import { randomBytes } from "node:crypto";
 import { requireActor } from "../../platform/http/request-context.js";
+import { buildConsentUrl, exchangeConsentCode, type GoogleOAuthConfig } from "./google-client.js";
+import { newCredentialReference, storeGoogleTokens } from "./credential-store.js";
+import { ApiError } from "../../platform/http/api-error.js";
+import type { Pool } from "pg";
 import type { WorkspacePort } from "./workspace.service.js";
 
 const uuid = z.uuid();
@@ -45,9 +50,88 @@ function mutateRoute(
   };
 }
 
-export function createWorkspaceRouter(core: WorkspacePort): Router {
+export interface WorkspaceConsentOptions {
+  pool: Pool;
+  oauth: GoogleOAuthConfig | null;
+  atlasOrigin: string;
+  isProduction: boolean;
+}
+
+export function createWorkspaceRouter(
+  core: WorkspacePort,
+  consent?: WorkspaceConsentOptions,
+): Router {
   const router = Router();
   router.use(requireActor);
+
+  if (consent?.oauth) {
+    const oauth = consent.oauth;
+    const stateCookie = "rw_workspace_state";
+    const cookiePath = "/api/v2/workspace/google";
+
+    // Starts the Workspace consent. This is deliberately separate from sign-in:
+    // signing in needs only identity, while indexing needs read scopes the user
+    // grants explicitly and can decline without losing access to Atlas.
+    router.get("/workspace/google/connect", (req, res) => {
+      const actor = req.actor!;
+      if (actor.actorType !== "human") {
+        throw new ApiError(403, "FORBIDDEN", "A Workspace connection belongs to a person.");
+      }
+      const state = randomBytes(24).toString("base64url");
+      res.cookie(stateCookie, state, {
+        httpOnly: true,
+        sameSite: "lax",
+        secure: consent.isProduction,
+        maxAge: 600_000,
+        path: cookiePath,
+      });
+      res.redirect(buildConsentUrl(oauth, state, req.query.email ? String(req.query.email) : undefined));
+    });
+
+    router.get("/workspace/google/callback", async (req, res, next) => {
+      try {
+        const actor = req.actor!;
+        const expected = String(req.cookies?.[stateCookie] ?? "");
+        const provided = typeof req.query.state === "string" ? req.query.state : "";
+        res.clearCookie(stateCookie, { path: cookiePath });
+
+        // A mismatched or missing state means this callback did not originate
+        // from a consent Atlas started.
+        if (!expected || !provided || expected !== provided) {
+          throw new ApiError(400, "INVALID_INPUT", "That authorization could not be verified.");
+        }
+        if (typeof req.query.error === "string" && req.query.error) {
+          res.redirect(`${consent.atlasOrigin}/settings/workspace?connect=declined`);
+          return;
+        }
+        const code = typeof req.query.code === "string" ? req.query.code : "";
+        if (!code) throw new ApiError(400, "INVALID_INPUT", "Authorization code missing.");
+
+        const tokens = await exchangeConsentCode(oauth, code);
+        const credentialReference = newCredentialReference();
+        await storeGoogleTokens(consent.pool, {
+          organizationId: actor.organizationId,
+          ownerUserId: actor.userId!,
+          credentialReference,
+          tokens,
+        });
+
+        await core.mutate(
+          actor,
+          "workspace.connect",
+          {
+            googleEmail: req.query.email ? String(req.query.email) : `${actor.userId}@${oauth.allowedDomain}`,
+            scopes: tokens.grantedScopes,
+            credentialReference,
+          },
+          `workspace-connect-${credentialReference}`.slice(0, 128),
+        );
+        res.redirect(`${consent.atlasOrigin}/settings/workspace?connect=ok`);
+      } catch (error) {
+        next(error);
+      }
+    });
+  }
 
   router.get("/workspace/connections", queryRoute(core, "workspace.connections", z.object({})));
   router.post(

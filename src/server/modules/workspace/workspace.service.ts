@@ -90,6 +90,15 @@ export interface GoogleGateway {
   }): Promise<GoogleFixture>;
 }
 
+/**
+ * The live client needs to know whose credential it is using, which is only
+ * known per request, so the service resolves a gateway per sync rather than
+ * holding one. Tests pass a plain gateway and it is used as-is.
+ */
+export type GoogleGatewayResolver =
+  | GoogleGateway
+  | ((context: { organizationId: string; ownerUserId: string }) => GoogleGateway);
+
 export class RecordedGoogleGateway implements GoogleGateway {
   constructor(private readonly fixture: GoogleFixture) {}
   async fetchIncremental(): Promise<GoogleFixture> {
@@ -105,8 +114,15 @@ export interface WorkspacePort {
 export class WorkspaceService implements WorkspacePort {
   constructor(
     private readonly pool: Pool,
-    private readonly gateway?: GoogleGateway,
+    private readonly gateway?: GoogleGatewayResolver,
   ) {}
+
+  private resolveGateway(organizationId: string, ownerUserId: string): GoogleGateway | undefined {
+    if (!this.gateway) return undefined;
+    return typeof this.gateway === "function"
+      ? this.gateway({ organizationId, ownerUserId })
+      : this.gateway;
+  }
 
   async query(actor: ActorContext, operation: string, input: Input): Promise<Result> {
     switch (operation) {
@@ -152,12 +168,13 @@ export class WorkspaceService implements WorkspacePort {
     if (connection.status === "revoked" || connection.disconnected_at) {
       throw new ApiError(409, "CONFLICT", "That connection is disconnected.");
     }
-    if (!this.gateway) {
+    const gateway = this.resolveGateway(actor.organizationId, userId);
+    if (!gateway) {
       throw new ApiError(503, "SERVICE_UNAVAILABLE", "No Google gateway is configured.");
     }
 
     try {
-      const fixture = await this.gateway.fetchIncremental({
+      const fixture = await gateway.fetchIncremental({
         credentialReference: String(connection.credential_reference),
         gmailHistoryId: String(connection.gmail_history_id),
         drivePageToken: String(connection.drive_page_token),

@@ -33,7 +33,8 @@ import { createReportRouter } from "./modules/reports/report.routes.js";
 import { ReportService, type ReportPort } from "./modules/reports/report.service.js";
 import { AgentService, type AgentPort } from "./modules/agents/agent.service.js";
 import { createWorkspaceRouter } from "./modules/workspace/workspace.routes.js";
-import { WorkspaceService, type GoogleGateway, type WorkspacePort } from "./modules/workspace/workspace.service.js";
+import { WorkspaceService, type GoogleGatewayResolver, type WorkspacePort } from "./modules/workspace/workspace.service.js";
+import { LiveGoogleGateway } from "./modules/workspace/google-client.js";
 import {
   OrganizationService,
   type OrganizationMutationPort,
@@ -98,7 +99,7 @@ export interface CreateAppOptions {
   v2Workspace?: WorkspacePort;
   v2Agents?: AgentPort;
   v2Reports?: ReportPort;
-  googleGateway?: GoogleGateway;
+  googleGateway?: GoogleGatewayResolver;
   googleOAuth?: GoogleOAuthGateway;
   logger?: ErrorLogger;
 }
@@ -117,8 +118,24 @@ const v2Organizations =
 const v2OperatingCore =
   options.v2OperatingCore ?? new OperatingCoreService(v2Pool);
 const v2Pursuit = options.v2Pursuit ?? new PursuitService(v2Pool);
+const workspaceOAuth =
+  config.googleClientId && config.googleClientSecret
+    ? {
+        clientId: config.googleClientId,
+        clientSecret: config.googleClientSecret,
+        redirectUri: `${config.atlasOrigin}/api/v2/workspace/google/callback`,
+        allowedDomain: config.googleAllowedDomain,
+      }
+    : null;
 const v2Workspace =
-  options.v2Workspace ?? new WorkspaceService(v2Pool, options.googleGateway);
+  options.v2Workspace ??
+  new WorkspaceService(
+    v2Pool,
+    options.googleGateway ??
+      (workspaceOAuth
+        ? (context) => new LiveGoogleGateway(v2Pool, workspaceOAuth, context)
+        : undefined),
+  );
 const v2Agents = options.v2Agents ?? new AgentService(v2Pool);
 const v2Reports = options.v2Reports ?? new ReportService(v2Pool);
 const errorLogger: ErrorLogger = options.logger ?? {
@@ -226,7 +243,17 @@ app.get("/api/v2/ready", async (_req, res, next) => {
 app.use("/api/v2", createOrganizationRouter(v2Organizations));
 app.use("/api/v2", createOperatingCoreRouter(v2OperatingCore));
 app.use("/api/v2", createPursuitRouter(v2Pursuit));
-app.use("/api/v2", createWorkspaceRouter(v2Workspace));
+app.use(
+  "/api/v2",
+  createWorkspaceRouter(v2Workspace, {
+    pool: v2Pool,
+    // Workspace consent uses its own callback so sign-in and read-scope grants
+    // stay separable; declining Workspace must not affect signing in.
+    oauth: workspaceOAuth,
+    atlasOrigin: config.atlasOrigin,
+    isProduction: config.isProduction,
+  }),
+);
 app.use("/api/v2", createAgentRouter(v2Agents));
 app.use("/api/v2", createReportRouter(v2Reports));
 app.use("/api/v2", requireActor, (_req, _res, next) => {

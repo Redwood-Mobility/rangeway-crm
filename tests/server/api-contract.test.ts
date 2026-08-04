@@ -47,7 +47,7 @@ class ContractIdentity {
     if (
       scopedOrganizationId !== organizationId ||
       subject !== "google-subject-001" ||
-      email !== "admin@rangeway.energy"
+      email !== "admin@rangeway.co"
     ) {
       throw new ApiError(401, "UNAUTHENTICATED", "Authentication required.");
     }
@@ -76,7 +76,7 @@ class ContractIdentity {
   ) {
     if (
       scopedOrganizationId !== organizationId ||
-      email !== "admin@rangeway.energy" ||
+      email !== "admin@rangeway.co" ||
       password !== "correct-horse-battery-staple"
     ) {
       throw new ApiError(401, "UNAUTHENTICATED", "Authentication required.");
@@ -166,7 +166,7 @@ describe("Atlas V2 API contract", () => {
 
   it("rejects simultaneous cookie and bearer credentials", async () => {
     const login = await request(testApp()).post("/api/v2/auth/local/login").send({
-      email: "admin@rangeway.energy",
+      email: "admin@rangeway.co",
       password: "correct-horse-battery-staple",
     });
     const cookie = login.headers["set-cookie"][0].split(";")[0];
@@ -190,7 +190,7 @@ describe("Atlas V2 API contract", () => {
         .set("Authorization", `Bearer ${serviceKey}`);
     const unknown = await authenticated("/api/v2/not-a-resource");
     const hidden = await authenticated("/api/v2/auth/local/login").send({
-      email: "admin@rangeway.energy",
+      email: "admin@rangeway.co",
       password: "correct-horse-battery-staple",
     });
 
@@ -207,7 +207,7 @@ describe("Atlas V2 API contract", () => {
   it("establishes a Secure, HTTP-only signed session and returns actor context", async () => {
     const app = testApp();
     const login = await request(app).post("/api/v2/auth/local/login").send({
-      email: "admin@rangeway.energy",
+      email: "admin@rangeway.co",
       password: "correct-horse-battery-staple",
     });
     const requestId = expectRequestId(login);
@@ -233,7 +233,7 @@ describe("Atlas V2 API contract", () => {
     expect(legacyMe.body).toEqual({
       user: {
         id: expect.any(String),
-        email: "admin@rangeway.energy",
+        email: "admin@rangeway.co",
         name: "Atlas Admin",
         picture: "",
       },
@@ -242,7 +242,7 @@ describe("Atlas V2 API contract", () => {
 
   it("rejects unknown local-login fields to match the OpenAPI schema", async () => {
     const response = await request(testApp()).post("/api/v2/auth/local/login").send({
-      email: "admin@rangeway.energy",
+      email: "admin@rangeway.co",
       password: "correct-horse-battery-staple",
       unexpected: "must-not-be-accepted",
     });
@@ -263,7 +263,7 @@ describe("Atlas V2 API contract", () => {
     vi.setSystemTime(new Date("2026-08-02T12:00:00.000Z"));
     const app = testApp();
     const login = await request(app).post("/api/v2/auth/local/login").send({
-      email: "admin@rangeway.energy",
+      email: "admin@rangeway.co",
       password: "correct-horse-battery-staple",
     });
     const cookie = login.headers["set-cookie"][0].split(";")[0];
@@ -304,7 +304,7 @@ describe("Atlas V2 API contract", () => {
     )
       .post("/api/v2/auth/local/login")
       .send({
-        email: "admin@rangeway.energy",
+        email: "admin@rangeway.co",
         password: "correct-horse-battery-staple",
       });
 
@@ -343,7 +343,7 @@ describe("Atlas V2 API contract", () => {
       exchangeCode: vi.fn(async () => "verified-google-id-token"),
       verifyIdToken: vi.fn(async () => ({
         subject: "google-subject-001",
-        email: "ADMIN@RANGEWAY.ENERGY",
+        email: "ADMIN@RANGEWAY.CO",
         name: "Atlas Admin",
         picture: "https://example.test/avatar.png",
       })),
@@ -386,7 +386,7 @@ describe("Atlas V2 API contract", () => {
     expect(authenticateGoogle).toHaveBeenCalledWith(
       organizationId,
       "google-subject-001",
-      "admin@rangeway.energy",
+      "admin@rangeway.co",
       "Atlas Admin",
       callback.headers["x-request-id"],
     );
@@ -455,7 +455,7 @@ describe("Atlas V2 API contract", () => {
         exchangeCode: async () => "verified-google-id-token",
         verifyIdToken: async () => ({
           subject: "google-subject-001",
-          email: "admin@rangeway.energy",
+          email: "admin@rangeway.co",
           name: "Disabled Atlas Admin",
           picture: "",
         }),
@@ -561,7 +561,7 @@ describe("Atlas V2 API contract", () => {
     ]) {
       const response = await request(testApp(runtimeConfig))
         .post("/api/v2/auth/local/login")
-        .send({ email: "admin@rangeway.energy", password: "anything" });
+        .send({ email: "admin@rangeway.co", password: "anything" });
 
       expect(response.status).toBe(404);
       expect(response.body.error).toMatchObject({
@@ -602,7 +602,7 @@ describe("Atlas V2 API contract", () => {
     }))
       .post(`/api/v2/auth/local/login?token=${secret}`)
       .set("Content-Type", "application/json")
-      .send(`{"email":"admin@rangeway.energy","password":"${secret}"`);
+      .send(`{"email":"admin@rangeway.co","password":"${secret}"`);
 
     expect(response.status).toBe(400);
     expect(response.body.error).toEqual({
@@ -619,7 +619,7 @@ describe("Atlas V2 API contract", () => {
     const response = await request(testApp())
       .post("/api/v2/auth/local/login")
       .set("Content-Type", "application/json")
-      .send({ email: "admin@rangeway.energy", password: `${secret}${"x".repeat(1024 * 1024)}` });
+      .send({ email: "admin@rangeway.co", password: `${secret}${"x".repeat(1024 * 1024)}` });
 
     expect(response.status).toBe(413);
     expect(response.body.error).toEqual({

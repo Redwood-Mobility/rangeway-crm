@@ -201,7 +201,7 @@ describe("production legacy isolation", () => {
         exchangeCode: async () => "verified-token",
         verifyIdToken: async () => ({
           subject: "google-subject-001",
-          email: "ADMIN@RANGEWAY.ENERGY",
+          email: "ADMIN@RANGEWAY.CO",
           name: "Atlas Admin",
           picture: "",
         }),
@@ -230,7 +230,7 @@ describe("production legacy isolation", () => {
     expect(me.body).toEqual({
       user: {
         id: "20000000-0000-4000-8000-000000000001",
-        email: "admin@rangeway.energy",
+        email: "admin@rangeway.co",
         name: "Atlas Admin",
         picture: "",
       },
@@ -262,20 +262,20 @@ describe("production legacy isolation", () => {
         v2Identity: identity,
         googleOAuth: {
           exchangeCode: async () => "verified-token",
-          verifyIdToken: async () => ({ subject: "subject", email: "owner@rangeway.energy", name: "Atlas V2 Owner", picture: "" }),
+          verifyIdToken: async () => ({ subject: "subject", email: "owner@rangeway.co", name: "Atlas V2 Owner", picture: "" }),
         },
       });
       const afterApp = [fs.existsSync(process.env.DATABASE_PATH), fs.existsSync(process.env.UPLOAD_DIR)];
       await request(app).get("/api/v2/health");
       const afterV2Health = [fs.existsSync(process.env.DATABASE_PATH), fs.existsSync(process.env.UPLOAD_DIR)];
-      await request(app).post("/api/v2/auth/local/login").send({ email: "owner@rangeway.energy", password: "development-owner-password" });
+      await request(app).post("/api/v2/auth/local/login").send({ email: "owner@rangeway.co", password: "development-owner-password" });
       const afterV2LocalLogin = [fs.existsSync(process.env.DATABASE_PATH), fs.existsSync(process.env.UPLOAD_DIR)];
       const beginGoogle = await request(app).get("/api/auth/google");
       const stateCookie = beginGoogle.headers["set-cookie"][0].split(";")[0];
       const state = new URL(beginGoogle.headers.location).searchParams.get("state");
       await request(app).get("/api/auth/google/callback").query({ code: "code", state }).set("Cookie", stateCookie);
       const afterV2GoogleLogin = [fs.existsSync(process.env.DATABASE_PATH), fs.existsSync(process.env.UPLOAD_DIR)];
-      const legacyLogin = await request(app).post("/api/login").send({ email: "admin@rangeway.energy", password: "rangeway-dev" });
+      const legacyLogin = await request(app).post("/api/login").send({ email: "admin@rangeway.co", password: "rangeway-dev" });
       const cookie = legacyLogin.headers["set-cookie"][0].split(";")[0];
       const afterV1Login = [fs.existsSync(process.env.DATABASE_PATH), fs.existsSync(process.env.UPLOAD_DIR)];
       await request(app).post("/api/documents").set("Cookie", cookie).attach("file", Buffer.from("pdf"), { filename: "test.pdf", contentType: "application/pdf" });

@@ -15,6 +15,7 @@ import { Projects } from "./routes/Projects.js";
 import { SignIn } from "./routes/SignIn.js";
 import { Today } from "./routes/Today.js";
 import { Work } from "./routes/Work.js";
+import { Workspace } from "./routes/Workspace.js";
 import "./styles/app.css";
 
 const queryClient = new QueryClient({
@@ -69,6 +70,7 @@ function App() {
         <Route path="/work" element={<Work />} />
         <Route path="/work/:view" element={<Work />} />
         <Route path="/settings/agents" element={<Agents />} />
+        <Route path="/settings/workspace" element={<Workspace />} />
         <Route path="/stakeholders" element={<People />} />
         <Route path="/stakeholders/:index" element={<People />} />
         <Route path="*" element={<NotFound />} />
