@@ -120,7 +120,11 @@ export function createWorkspaceRouter(
           actor,
           "workspace.connect",
           {
-            googleEmail: req.query.email ? String(req.query.email) : `${actor.userId}@${oauth.allowedDomain}`,
+            // Google's own verified answer for the account that granted consent.
+            // Never the Atlas user and never a query parameter: this address is
+            // shown as fact and keys whether a later consent updates this
+            // connection or creates a second one.
+            googleEmail: tokens.googleEmail,
             scopes: tokens.grantedScopes,
             credentialReference,
           },

@@ -76,6 +76,71 @@ function jsonFetch(payload: unknown, ok = true): typeof fetch {
     })) as unknown as typeof fetch;
 }
 
+/** Routes the token exchange and the identity check to separate payloads. */
+function consentFetch(token: unknown, tokenInfo: unknown, tokenInfoOk = true): typeof fetch {
+  return (async (input: string | URL) => {
+    const url = String(input);
+    const forTokenInfo = url.includes("tokeninfo");
+    return new Response(JSON.stringify(forTokenInfo ? tokenInfo : token), {
+      status: forTokenInfo && !tokenInfoOk ? 400 : 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  }) as unknown as typeof fetch;
+}
+
+const grantedTokens = {
+  access_token: "ya29.access",
+  refresh_token: "1//refresh",
+  expires_in: 3600,
+  scope: workspaceScopes.join(" "),
+  id_token: "header.payload.signature",
+};
+
+const verifiedIdentity = {
+  aud: oauth.clientId,
+  email: "Zak@Rangeway.co",
+  email_verified: true,
+  hd: "rangeway.co",
+};
+
+describe("connected account identity", () => {
+  it("takes the address from Google rather than inventing one", async () => {
+    const result = await exchangeConsentCode(
+      oauth,
+      "code",
+      consentFetch(grantedTokens, verifiedIdentity),
+    );
+
+    expect(result.googleEmail).toBe("zak@rangeway.co");
+    expect(result.refreshToken).toBe("1//refresh");
+  });
+
+  it("refuses an exchange that identifies no account", async () => {
+    // Storing a placeholder here would display an address nobody authorized.
+    const { id_token, ...withoutIdentity } = grantedTokens;
+    await expect(
+      exchangeConsentCode(oauth, "code", consentFetch(withoutIdentity, verifiedIdentity)),
+    ).rejects.toMatchObject({ status: 409, code: "CONFLICT" });
+  });
+
+  it.each([
+    ["issued for another application", { ...verifiedIdentity, aud: "other.apps.googleusercontent.com" }],
+    ["email is unverified", { ...verifiedIdentity, email_verified: false }],
+    ["hosted domain does not match", { ...verifiedIdentity, hd: "example.com" }],
+    ["address is outside the domain", { ...verifiedIdentity, email: "someone@example.com" }],
+  ])("refuses a consent whose %s", async (_label, identity) => {
+    await expect(
+      exchangeConsentCode(oauth, "code", consentFetch(grantedTokens, identity)),
+    ).rejects.toMatchObject({ status: 409, code: "CONFLICT" });
+  });
+
+  it("refuses when Google will not verify the identity token", async () => {
+    await expect(
+      exchangeConsentCode(oauth, "code", consentFetch(grantedTokens, {}, false)),
+    ).rejects.toMatchObject({ status: 409, code: "CONFLICT" });
+  });
+});
+
 describe("Google consent request", () => {
   it("asks for offline access and the three read scopes", () => {
     const url = new URL(buildConsentUrl(oauth, "state-value", "zak@rangeway.co"));

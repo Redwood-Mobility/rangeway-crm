@@ -48,8 +48,60 @@ interface TokenResponse {
   refresh_token?: string;
   expires_in?: number;
   scope?: string;
+  id_token?: string;
   error?: string;
   error_description?: string;
+}
+
+interface TokenInfo {
+  aud?: string;
+  email?: string;
+  email_verified?: boolean | string;
+  hd?: string;
+}
+
+/**
+ * Establishes which Google account was actually connected.
+ *
+ * The address is asked of Google and checked, never derived from the signed-in
+ * Atlas user or from a query parameter. A connection labelled with an address
+ * nobody authorized is worse than no label: it is displayed as fact, and it is
+ * part of the key that decides whether a later consent updates this connection
+ * or silently creates a second one.
+ */
+async function verifiedConsentEmail(
+  config: GoogleOAuthConfig,
+  idToken: string,
+  fetchImplementation: typeof fetch,
+): Promise<string> {
+  if (!idToken) {
+    throw new ApiError(
+      409,
+      "CONFLICT",
+      "Google did not identify the connected account. Connect again.",
+    );
+  }
+  const response = await fetchImplementation(
+    `https://oauth2.googleapis.com/tokeninfo?id_token=${encodeURIComponent(idToken)}`,
+  );
+  if (!response.ok) {
+    throw new ApiError(409, "CONFLICT", "That Google authorization could not be verified.");
+  }
+  const info = (await response.json()) as TokenInfo;
+  const email = String(info.email ?? "").toLowerCase();
+  const hostedDomain = String(info.hd ?? "").toLowerCase();
+  const allowedDomain = config.allowedDomain.toLowerCase();
+
+  if (info.aud !== config.clientId) {
+    throw new ApiError(409, "CONFLICT", "That Google authorization was issued for another application.");
+  }
+  if (info.email_verified !== true && info.email_verified !== "true") {
+    throw new ApiError(409, "CONFLICT", "That Google account has no verified email address.");
+  }
+  if (hostedDomain !== allowedDomain || !email.endsWith(`@${allowedDomain}`)) {
+    throw new ApiError(409, "CONFLICT", `Atlas connects ${allowedDomain} accounts only.`);
+  }
+  return email;
 }
 
 async function requestTokens(
@@ -78,7 +130,7 @@ export async function exchangeConsentCode(
   config: GoogleOAuthConfig,
   code: string,
   fetchImplementation: typeof fetch = fetch,
-): Promise<GoogleTokens & { grantedScopes: string[] }> {
+): Promise<GoogleTokens & { grantedScopes: string[]; googleEmail: string }> {
   const payload = await requestTokens(
     config,
     { code, grant_type: "authorization_code", redirect_uri: config.redirectUri },
@@ -92,6 +144,7 @@ export async function exchangeConsentCode(
     );
   }
   return {
+    googleEmail: await verifiedConsentEmail(config, payload.id_token ?? "", fetchImplementation),
     refreshToken: payload.refresh_token,
     accessToken: payload.access_token ?? "",
     accessTokenExpiresAt: payload.expires_in
