@@ -194,8 +194,22 @@ async function accessTokenFor(
   return accessToken;
 }
 
+/** Bounds any single sync so one enormous mailbox cannot run without end. */
+const maxSyncPages = 10;
+
 interface GmailListResponse {
   messages?: Array<{ id: string; threadId: string }>;
+  nextPageToken?: string;
+}
+
+/** `users.messages.list` carries no history ID; the profile is where it lives. */
+interface GmailProfile {
+  emailAddress?: string;
+  historyId?: string;
+}
+
+interface GmailHistoryResponse {
+  history?: Array<{ messagesAdded?: Array<{ message: { id: string; threadId: string } }> }>;
   historyId?: string;
   nextPageToken?: string;
 }
@@ -265,10 +279,12 @@ export class LiveGoogleGateway implements GoogleGateway {
       input.credentialReference,
       this.fetchImplementation,
     );
-    const call = async <T>(url: string): Promise<T> => {
+    /** Resolves to null on 404 when the caller can recover from absence. */
+    const call = async <T>(url: string, tolerateMissing = false): Promise<T | null> => {
       const response = await this.fetchImplementation(url, {
         headers: { Authorization: `Bearer ${accessToken}` },
       });
+      if (response.status === 404 && tolerateMissing) return null;
       if (!response.ok) {
         // A revoked or expired grant surfaces as a sync failure, which pauses
         // only this owner's connection.
@@ -276,20 +292,66 @@ export class LiveGoogleGateway implements GoogleGateway {
       }
       return (await response.json()) as T;
     };
+    const require = async <T>(url: string): Promise<T> => (await call<T>(url)) as T;
 
     const fixture: GoogleFixture = { threads: [], driveItems: [], calendarEvents: [] };
 
-    // Gmail. A bounded first page keeps an initial connect from pulling an
-    // entire mailbox in one request; the history token drives later syncs.
-    const listUrl = new URL("https://gmail.googleapis.com/gmail/v1/users/me/messages");
-    listUrl.searchParams.set("maxResults", "50");
-    const list = await call<GmailListResponse>(listUrl.toString());
+    // Gmail. The stored history ID is the checkpoint: with one, only what
+    // changed since is fetched; without one, a bounded first page seeds the
+    // index rather than pulling an entire mailbox in a single request.
+    const messageIds = new Map<string, string>();
+    let nextHistoryId = "";
+
+    if (input.gmailHistoryId) {
+      let pageToken = "";
+      let pages = 0;
+      do {
+        const historyUrl = new URL("https://gmail.googleapis.com/gmail/v1/users/me/history");
+        historyUrl.searchParams.set("startHistoryId", input.gmailHistoryId);
+        historyUrl.searchParams.set("historyTypes", "messageAdded");
+        if (pageToken) historyUrl.searchParams.set("pageToken", pageToken);
+        // Google expires history older than about a week. A 404 means this
+        // checkpoint is too old to resume from, not that the sync failed.
+        const page = await call<GmailHistoryResponse>(historyUrl.toString(), true);
+        if (!page) {
+          messageIds.clear();
+          nextHistoryId = "";
+          break;
+        }
+        for (const entry of page.history ?? []) {
+          for (const added of entry.messagesAdded ?? []) {
+            messageIds.set(added.message.id, added.message.threadId);
+          }
+        }
+        if (page.historyId) nextHistoryId = String(page.historyId);
+        pageToken = page.nextPageToken ?? "";
+      } while (pageToken && ++pages < maxSyncPages);
+    }
+
+    if (!nextHistoryId) {
+      // Read the checkpoint before listing. Replaying a message that arrives
+      // mid-pull is harmless because indexing upserts; missing one is not.
+      const profile = await require<GmailProfile>(
+        "https://gmail.googleapis.com/gmail/v1/users/me/profile",
+      );
+      nextHistoryId = String(profile.historyId ?? "");
+
+      const listUrl = new URL("https://gmail.googleapis.com/gmail/v1/users/me/messages");
+      listUrl.searchParams.set("maxResults", "50");
+      const list = await require<GmailListResponse>(listUrl.toString());
+      for (const reference of list.messages ?? []) {
+        messageIds.set(reference.id, reference.threadId);
+      }
+    }
 
     const byThread = new Map<string, GmailMessage[]>();
-    for (const reference of list.messages ?? []) {
+    for (const messageId of messageIds.keys()) {
+      // A message deleted between listing and fetching is simply absent now.
       const message = await call<GmailMessage>(
-        `https://gmail.googleapis.com/gmail/v1/users/me/messages/${reference.id}?format=full`,
+        `https://gmail.googleapis.com/gmail/v1/users/me/messages/${messageId}?format=full`,
+        true,
       );
+      if (!message) continue;
       byThread.set(message.threadId, [...(byThread.get(message.threadId) ?? []), message]);
     }
     for (const [threadId, messages] of byThread) {
@@ -317,7 +379,7 @@ export class LiveGoogleGateway implements GoogleGateway {
         })),
       });
     }
-    if (list.historyId) fixture.gmailHistoryId = String(list.historyId);
+    if (nextHistoryId) fixture.gmailHistoryId = nextHistoryId;
 
     // Drive: metadata and permissions only.
     const driveUrl = new URL("https://www.googleapis.com/drive/v3/files");
@@ -327,7 +389,7 @@ export class LiveGoogleGateway implements GoogleGateway {
       "nextPageToken,files(id,name,mimeType,webViewLink,modifiedTime,permissions(id,type,role,emailAddress))",
     );
     if (input.drivePageToken) driveUrl.searchParams.set("pageToken", input.drivePageToken);
-    const drive = await call<{
+    const drive = await require<{
       files?: Array<{
         id: string;
         name: string;
@@ -350,47 +412,62 @@ export class LiveGoogleGateway implements GoogleGateway {
     }
     if (drive.nextPageToken) fixture.drivePageToken = drive.nextPageToken;
 
-    // Calendar.
-    const calendarUrl = new URL(
-      "https://www.googleapis.com/calendar/v3/calendars/primary/events",
-    );
-    calendarUrl.searchParams.set("maxResults", "100");
-    calendarUrl.searchParams.set("singleEvents", "true");
-    if (input.calendarSyncToken) {
-      calendarUrl.searchParams.set("syncToken", input.calendarSyncToken);
-    } else {
-      calendarUrl.searchParams.set("timeMin", new Date(Date.now() - 30 * 86_400_000).toISOString());
-    }
-    const calendar = await call<{
-      items?: Array<{
-        id: string;
-        summary?: string;
-        description?: string;
-        location?: string;
-        start?: { dateTime?: string; date?: string; timeZone?: string };
-        end?: { dateTime?: string; date?: string; timeZone?: string };
-        attendees?: unknown[];
-      }>;
-      nextSyncToken?: string;
-    }>(calendarUrl.toString());
-    for (const event of calendar.items ?? []) {
-      const startsAt = event.start?.dateTime ?? event.start?.date;
-      const endsAt = event.end?.dateTime ?? event.end?.date;
-      if (!startsAt || !endsAt) continue;
-      fixture.calendarEvents!.push({
-        providerEventId: event.id,
-        calendarId: "primary",
-        summary: event.summary ?? "",
-        description: event.description ?? "",
-        location: event.location ?? "",
-        startsAt: new Date(startsAt).toISOString(),
-        endsAt: new Date(endsAt).toISOString(),
-        // Kept verbatim so a Hawaii event renders in Hawaii time.
-        timeZone: event.start?.timeZone ?? "UTC",
-        attendees: event.attendees ?? [],
-      });
-    }
-    if (calendar.nextSyncToken) fixture.calendarSyncToken = calendar.nextSyncToken;
+    // Calendar. Google returns `nextSyncToken` only on the final page, so a
+    // single request leaves nothing to resume from and the same window is
+    // re-read forever. Page to the end.
+    let calendarPageToken = "";
+    let calendarPages = 0;
+    do {
+      const calendarUrl = new URL(
+        "https://www.googleapis.com/calendar/v3/calendars/primary/events",
+      );
+      calendarUrl.searchParams.set("maxResults", "100");
+      calendarUrl.searchParams.set("singleEvents", "true");
+      if (calendarPageToken) {
+        // A page token already carries the original query; Google rejects it
+        // alongside a sync token.
+        calendarUrl.searchParams.set("pageToken", calendarPageToken);
+      } else if (input.calendarSyncToken) {
+        calendarUrl.searchParams.set("syncToken", input.calendarSyncToken);
+      } else {
+        calendarUrl.searchParams.set("timeMin", new Date(Date.now() - 30 * 86_400_000).toISOString());
+      }
+      // An expired sync token is a 410 from Calendar; the sync then fails and
+      // the owner reconnects. Only absence is tolerated here.
+      const calendar = await require<{
+        items?: Array<{
+          id: string;
+          summary?: string;
+          description?: string;
+          location?: string;
+          start?: { dateTime?: string; date?: string; timeZone?: string };
+          end?: { dateTime?: string; date?: string; timeZone?: string };
+          attendees?: unknown[];
+        }>;
+        nextPageToken?: string;
+        nextSyncToken?: string;
+      }>(calendarUrl.toString());
+
+      for (const event of calendar.items ?? []) {
+        const startsAt = event.start?.dateTime ?? event.start?.date;
+        const endsAt = event.end?.dateTime ?? event.end?.date;
+        if (!startsAt || !endsAt) continue;
+        fixture.calendarEvents!.push({
+          providerEventId: event.id,
+          calendarId: "primary",
+          summary: event.summary ?? "",
+          description: event.description ?? "",
+          location: event.location ?? "",
+          startsAt: new Date(startsAt).toISOString(),
+          endsAt: new Date(endsAt).toISOString(),
+          // Kept verbatim so a Hawaii event renders in Hawaii time.
+          timeZone: event.start?.timeZone ?? "UTC",
+          attendees: event.attendees ?? [],
+        });
+      }
+      if (calendar.nextSyncToken) fixture.calendarSyncToken = calendar.nextSyncToken;
+      calendarPageToken = calendar.nextPageToken ?? "";
+    } while (calendarPageToken && ++calendarPages < maxSyncPages);
 
     return fixture;
   }

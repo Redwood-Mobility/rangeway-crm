@@ -445,3 +445,186 @@ describe("live Google gateway", () => {
     });
   });
 });
+
+/**
+ * A stand-in Google that records every URL requested, so a test can assert how
+ * a sync resumes rather than only what it returns.
+ */
+function googleApi(pages: {
+  historyStatus?: number;
+  history?: unknown;
+  calendar?: unknown[];
+}): { fetch: typeof fetch; urls: string[] } {
+  const urls: string[] = [];
+  const calendarPages = pages.calendar ?? [{ items: [], nextSyncToken: "cal-sync-1" }];
+  let calendarIndex = 0;
+
+  const respond = (body: unknown, status = 200) =>
+    new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
+
+  const implementation = async (input: string | URL) => {
+    const url = String(input);
+    urls.push(url);
+
+    if (url.includes("gmail/v1/users/me/history")) {
+      if (pages.historyStatus && pages.historyStatus !== 200) {
+        return respond({ error: "not found" }, pages.historyStatus);
+      }
+      return respond(pages.history ?? { history: [], historyId: "history-next" });
+    }
+    if (url.includes("gmail/v1/users/me/profile")) {
+      return respond({ emailAddress: "zak@rangeway.co", historyId: "profile-history" });
+    }
+    if (url.includes("gmail/v1/users/me/messages/")) {
+      return respond({ id: "m1", threadId: "t1", snippet: "hello", internalDate: "1700000000000" });
+    }
+    if (url.includes("gmail/v1/users/me/messages")) {
+      return respond({ messages: [{ id: "m1", threadId: "t1" }] });
+    }
+    if (url.includes("drive/v3/files")) {
+      return respond({ files: [] });
+    }
+    if (url.includes("calendar/v3")) {
+      return respond(calendarPages[Math.min(calendarIndex++, calendarPages.length - 1)]);
+    }
+    return respond({}, 404);
+  };
+
+  return { fetch: implementation as unknown as typeof fetch, urls };
+}
+
+async function seedCredential(pool: Pool): Promise<{ userId: string; reference: string }> {
+  const userId = await seedUser(pool);
+  const reference = newCredentialReference();
+  await storeGoogleTokens(pool, {
+    organizationId,
+    ownerUserId: userId,
+    credentialReference: reference,
+    // Valid for an hour, so no refresh call is involved.
+    tokens: {
+      refreshToken: "1//refresh",
+      accessToken: "ya29.access",
+      accessTokenExpiresAt: new Date(Date.now() + 3_600_000),
+    },
+  });
+  return { userId, reference };
+}
+
+describe("sync continuation", () => {
+  it("records a resumable Gmail checkpoint on the first sync", async (context) => {
+    await withPostgreSql(context, async (pool) => {
+      const { userId, reference } = await seedCredential(pool);
+      const google = googleApi({});
+      const gateway = new LiveGoogleGateway(
+        pool,
+        oauth,
+        { organizationId, ownerUserId: userId },
+        google.fetch,
+      );
+
+      const fixture = await gateway.fetchIncremental({
+        credentialReference: reference,
+        gmailHistoryId: "",
+        drivePageToken: "",
+        calendarSyncToken: "",
+      });
+
+      // The message list carries no history ID, so without reading the profile
+      // there is nothing to resume from and every sync repeats the same window.
+      expect(google.urls.some((url) => url.includes("users/me/profile"))).toBe(true);
+      expect(fixture.gmailHistoryId).toBe("profile-history");
+    });
+  });
+
+  it("asks only for what changed once a checkpoint exists", async (context) => {
+    await withPostgreSql(context, async (pool) => {
+      const { userId, reference } = await seedCredential(pool);
+      const google = googleApi({
+        history: {
+          history: [{ messagesAdded: [{ message: { id: "m1", threadId: "t1" } }] }],
+          historyId: "history-next",
+        },
+      });
+      const gateway = new LiveGoogleGateway(
+        pool,
+        oauth,
+        { organizationId, ownerUserId: userId },
+        google.fetch,
+      );
+
+      const fixture = await gateway.fetchIncremental({
+        credentialReference: reference,
+        gmailHistoryId: "history-1",
+        drivePageToken: "",
+        calendarSyncToken: "",
+      });
+
+      const history = google.urls.find((url) => url.includes("users/me/history"));
+      expect(history).toContain("startHistoryId=history-1");
+      expect(google.urls.some((url) => url.endsWith("users/me/messages?maxResults=50"))).toBe(false);
+      expect(fixture.gmailHistoryId).toBe("history-next");
+      expect(fixture.threads?.[0]?.providerThreadId).toBe("t1");
+    });
+  });
+
+  it("falls back to a full read when the checkpoint has expired", async (context) => {
+    await withPostgreSql(context, async (pool) => {
+      const { userId, reference } = await seedCredential(pool);
+      // Google discards history older than about a week. Failing the sync would
+      // strand the connection permanently.
+      const google = googleApi({ historyStatus: 404 });
+      const gateway = new LiveGoogleGateway(
+        pool,
+        oauth,
+        { organizationId, ownerUserId: userId },
+        google.fetch,
+      );
+
+      const fixture = await gateway.fetchIncremental({
+        credentialReference: reference,
+        gmailHistoryId: "far-too-old",
+        drivePageToken: "",
+        calendarSyncToken: "",
+      });
+
+      expect(google.urls.some((url) => url.includes("users/me/profile"))).toBe(true);
+      expect(fixture.gmailHistoryId).toBe("profile-history");
+    });
+  });
+
+  it("pages calendar to the end so the sync token is captured", async (context) => {
+    await withPostgreSql(context, async (pool) => {
+      const { userId, reference } = await seedCredential(pool);
+      // A sync token arrives only on the final page; stopping at the first left
+      // the window frozen.
+      const google = googleApi({
+        calendar: [
+          { items: [], nextPageToken: "cal-page-2" },
+          { items: [], nextSyncToken: "cal-sync-final" },
+        ],
+      });
+      const gateway = new LiveGoogleGateway(
+        pool,
+        oauth,
+        { organizationId, ownerUserId: userId },
+        google.fetch,
+      );
+
+      const fixture = await gateway.fetchIncremental({
+        credentialReference: reference,
+        gmailHistoryId: "",
+        drivePageToken: "",
+        calendarSyncToken: "existing-sync-token",
+      });
+
+      expect(fixture.calendarSyncToken).toBe("cal-sync-final");
+
+      const calendarUrls = google.urls.filter((url) => url.includes("calendar/v3"));
+      expect(calendarUrls).toHaveLength(2);
+      expect(calendarUrls[0]).toContain("syncToken=existing-sync-token");
+      // Google rejects a page token sent alongside a sync token.
+      expect(calendarUrls[1]).toContain("pageToken=cal-page-2");
+      expect(calendarUrls[1]).not.toContain("syncToken");
+    });
+  });
+});
