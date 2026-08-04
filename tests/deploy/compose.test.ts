@@ -162,6 +162,33 @@ describe("deterministic deployment source contract", () => {
   const productionEnvironment = readRepositoryFile("deploy/env.production.example");
   const dockerIgnore = readRepositoryFile(".dockerignore");
 
+  // The container environment is an explicit allowlist, so a secret written to
+  // `.env` but never named on the service simply does not arrive — and nothing
+  // says so until the code that needs it runs.
+  it("supplies every interpolated runtime variable from the documented production environment", () => {
+    // Not operator settings: the guarded deploy injects these itself.
+    const injectedByDeploy = new Set(["ATLAS_IMAGE_TAG", "ATLAS_RELEASE_SHA", "ATLAS_BIND_PORT"]);
+    const interpolated = [...composeSource.matchAll(/\$\{([A-Z0-9_]+)(?::-[^}]*)?\}/g)]
+      .map((match) => match[1])
+      .filter((name) => !injectedByDeploy.has(name));
+    const documented = new Set(
+      [...productionEnvironment.matchAll(/^([A-Z0-9_]+)=/gm)].map((match) => match[1]),
+    );
+
+    expect([...new Set(interpolated)].filter((name) => !documented.has(name))).toEqual([]);
+  });
+
+  it("gives the credential key to web alone", () => {
+    // Sealing and opening Google tokens happens on the request path. The worker
+    // only acknowledges events, so it is never handed the key.
+    const serviceBlock = (name: string) =>
+      composeSource.split(new RegExp(`^  ${name}:$`, "m"))[1]?.split(/^ {2}[a-z]+:$/m)[0] ?? "";
+
+    expect(serviceBlock("web")).toContain("ATLAS_CREDENTIAL_KEY: ${ATLAS_CREDENTIAL_KEY:-}");
+    expect(serviceBlock("worker")).not.toContain("ATLAS_CREDENTIAL_KEY");
+    expect(serviceBlock("migrator")).not.toContain("ATLAS_CREDENTIAL_KEY");
+  });
+
   it("defines the exact V2 services, images, commands, mounts, and health dependencies", () => {
     expect(composeSource).toMatch(/^name: atlas-v2$/m);
     expect(composeSource.match(/^  (web|worker|migrator|db|caddy):$/gm)?.map((line) => line.trim()).sort()).toEqual([

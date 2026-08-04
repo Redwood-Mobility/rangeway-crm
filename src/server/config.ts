@@ -25,6 +25,7 @@ const configSchema = z
     googleClientId: optionalString,
     googleClientSecret: optionalString,
     googleRedirectUri: optionalString,
+    credentialKey: z.string().trim().default(""),
     workerPollMs: z.coerce.number().int().positive().default(1000),
     releaseSha: z.string().trim().default("development"),
     // V1 compatibility fields remain until the V2 identity and persistence work replaces them.
@@ -77,6 +78,15 @@ const configSchema = z
       }
     }
 
+    // A key that never reaches the process is invisible until someone grants
+    // Google consent and Atlas tries to seal the returned tokens — the worst
+    // possible moment to discover it. Refuse to start instead.
+    if (!value.credentialKey) {
+      context.addIssue({ code: "custom", path: ["credentialKey"], message: "ATLAS_CREDENTIAL_KEY is required in production." });
+    } else if (Buffer.from(value.credentialKey, "base64").byteLength !== 32) {
+      context.addIssue({ code: "custom", path: ["credentialKey"], message: "ATLAS_CREDENTIAL_KEY must be exactly 32 bytes encoded as base64." });
+    }
+
     if (value.googleRedirectUri) {
       try {
         const redirect = new URL(value.googleRedirectUri);
@@ -113,6 +123,7 @@ export function parseConfig(env: NodeJS.ProcessEnv): Config {
     googleClientId: env.GOOGLE_CLIENT_ID,
     googleClientSecret: env.GOOGLE_CLIENT_SECRET,
     googleRedirectUri: env.GOOGLE_REDIRECT_URI,
+    credentialKey: env.ATLAS_CREDENTIAL_KEY,
     workerPollMs: env.WORKER_POLL_MS,
     releaseSha: env.ATLAS_RELEASE_SHA,
     adminEmail: env.ADMIN_EMAIL,

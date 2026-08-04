@@ -24,7 +24,10 @@ services:
       GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
       GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
       GOOGLE_REDIRECT_URI: ${GOOGLE_REDIRECT_URI:-}
-      GOOGLE_ALLOWED_DOMAIN: ${GOOGLE_ALLOWED_DOMAIN:-rangeway.energy}
+      GOOGLE_ALLOWED_DOMAIN: ${GOOGLE_ALLOWED_DOMAIN:-rangeway.co}
+      # Seals Google tokens at rest. Only `web` grants and reads them; the
+      # worker never decrypts a credential, so it is not given the key.
+      ATLAS_CREDENTIAL_KEY: ${ATLAS_CREDENTIAL_KEY:-}
       ATLAS_RELEASE_SHA: ${ATLAS_RELEASE_SHA:-}
     depends_on:
       db:

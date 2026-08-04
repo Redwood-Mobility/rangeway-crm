@@ -15,6 +15,7 @@ const productionEnv = {
   GOOGLE_REDIRECT_URI: "https://atlas.rangeway.app/api/auth/google/callback",
   WORKER_POLL_MS: "2500",
   ATLAS_RELEASE_SHA: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  ATLAS_CREDENTIAL_KEY: "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=",
 };
 
 function expectConfigIssue(env: NodeJS.ProcessEnv, path: string[], message: string) {
@@ -34,6 +35,25 @@ describe("parseConfig", () => {
     expect(config.port).toBe(8080);
     expect(config.authMode).toBe("local");
     expect(config.artifactDir).toBe("./artifacts");
+  });
+
+  // A key absent from the runtime used to surface only when someone finished
+  // Google consent and Atlas tried to seal the tokens it had just been handed.
+  it("refuses to start in production without a credential key", () => {
+    const { ATLAS_CREDENTIAL_KEY, ...withoutKey } = productionEnv;
+    expectConfigIssue(withoutKey, ["credentialKey"], "ATLAS_CREDENTIAL_KEY is required in production.");
+  });
+
+  it.each([
+    ["short", "c2hvcnQ="],
+    ["not base64 at all", "this is definitely not a base64 key"],
+    ["64 bytes rather than 32", Buffer.alloc(64).toString("base64")],
+  ])("rejects a credential key that is %s", (_label, key) => {
+    expectConfigIssue(
+      { ...productionEnv, ATLAS_CREDENTIAL_KEY: key },
+      ["credentialKey"],
+      "ATLAS_CREDENTIAL_KEY must be exactly 32 bytes encoded as base64.",
+    );
   });
 
   it("rejects local authentication in production", () => {
