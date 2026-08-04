@@ -63,6 +63,8 @@ export interface GoogleFixture {
   }>;
   calendarEvents?: Array<{
     providerEventId: string;
+    /** Google's recurring event ID, or the event ID for a one-off. */
+    seriesKey?: string;
     calendarId: string;
     summary: string;
     description?: string;
@@ -75,6 +77,8 @@ export interface GoogleFixture {
   gmailHistoryId?: string;
   drivePageToken?: string;
   calendarSyncToken?: string;
+  /** Anything the sync could not complete, surfaced instead of swallowed. */
+  warnings?: string[];
 }
 
 /**
@@ -391,12 +395,15 @@ export class WorkspaceService implements WorkspacePort {
     let events = 0;
     for (const event of fixture.calendarEvents ?? []) {
       await client.query(
+        // Keyed on the series so a recurring event stays one row and moves to
+        // its nearest occurrence, rather than accumulating one row per day.
         `INSERT INTO calendar_events
-           (id, organization_id, connection_id, owner_user_id, provider_event_id,
+           (id, organization_id, connection_id, owner_user_id, provider_event_id, series_key,
             calendar_id, summary, description, location, starts_at, ends_at, time_zone, attendees)
-         VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-         ON CONFLICT (organization_id, connection_id, provider_event_id)
-         DO UPDATE SET summary = EXCLUDED.summary, description = EXCLUDED.description,
+         VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+         ON CONFLICT (organization_id, connection_id, series_key)
+         DO UPDATE SET provider_event_id = EXCLUDED.provider_event_id,
+                       summary = EXCLUDED.summary, description = EXCLUDED.description,
                        location = EXCLUDED.location, starts_at = EXCLUDED.starts_at,
                        ends_at = EXCLUDED.ends_at, time_zone = EXCLUDED.time_zone,
                        attendees = EXCLUDED.attendees, indexed_at = now()`,
@@ -405,6 +412,7 @@ export class WorkspaceService implements WorkspacePort {
           connectionId,
           userId,
           event.providerEventId,
+          event.seriesKey || event.providerEventId,
           event.calendarId,
           event.summary,
           event.description ?? "",
@@ -434,7 +442,9 @@ export class WorkspaceService implements WorkspacePort {
       ],
     );
 
-    const summary = { threads, messages, driveItems, events };
+    // Warnings ride along with the counts. A partial sync that reports only
+    // totals reads as a complete one.
+    const summary = { threads, messages, driveItems, events, warnings: fixture.warnings ?? [] };
     return this.record(actor, "workspace.synced", "google_connection", connectionId, { summary }, null, summary);
   }
 
@@ -466,8 +476,16 @@ export class WorkspaceService implements WorkspacePort {
            FROM calendar_events c
           WHERE c.organization_id = $1 AND c.owner_user_id = $2
             AND (c.summary ILIKE $3 ESCAPE '\\' OR c.description ILIKE $3 ESCAPE '\\')
+       ),
+       ranked AS (
+         SELECT *, row_number() OVER (PARTITION BY kind ORDER BY occurred_at DESC NULLS LAST) AS rank
+           FROM owned
        )
-       SELECT * FROM owned ORDER BY occurred_at DESC NULLS LAST LIMIT $4`,
+       -- Limited per source. A single global limit ordered by date let the
+       -- busiest source consume every slot and hide the other two entirely.
+       SELECT kind, id, title, summary, occurred_at FROM ranked
+        WHERE rank <= $4
+        ORDER BY occurred_at DESC NULLS LAST`,
       [actor.organizationId, userId, query, limit],
     );
     return { results: result.rows.map(camelize) };

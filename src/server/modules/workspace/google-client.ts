@@ -415,8 +415,13 @@ export class LiveGoogleGateway implements GoogleGateway {
     // Calendar. Google returns `nextSyncToken` only on the final page, so a
     // single request leaves nothing to resume from and the same window is
     // re-read forever. Page to the end.
+    // One entry per series, holding the occurrence nearest to now.
+    const series = new Map<string, NonNullable<GoogleFixture["calendarEvents"]>[number]>();
+    const now = Date.now();
     let calendarPageToken = "";
     let calendarPages = 0;
+    let calendarTruncated = false;
+
     do {
       const calendarUrl = new URL(
         "https://www.googleapis.com/calendar/v3/calendars/primary/events",
@@ -430,13 +435,18 @@ export class LiveGoogleGateway implements GoogleGateway {
       } else if (input.calendarSyncToken) {
         calendarUrl.searchParams.set("syncToken", input.calendarSyncToken);
       } else {
-        calendarUrl.searchParams.set("timeMin", new Date(Date.now() - 30 * 86_400_000).toISOString());
+        // Both ends are bounded. Without `timeMax`, `singleEvents` expands a
+        // recurring event forever — one standing block produced a thousand
+        // rows reaching into 2039.
+        calendarUrl.searchParams.set("timeMin", new Date(now - 30 * 86_400_000).toISOString());
+        calendarUrl.searchParams.set("timeMax", new Date(now + 60 * 86_400_000).toISOString());
       }
       // An expired sync token is a 410 from Calendar; the sync then fails and
       // the owner reconnects. Only absence is tolerated here.
       const calendar = await require<{
         items?: Array<{
           id: string;
+          recurringEventId?: string;
           summary?: string;
           description?: string;
           location?: string;
@@ -452,8 +462,10 @@ export class LiveGoogleGateway implements GoogleGateway {
         const startsAt = event.start?.dateTime ?? event.start?.date;
         const endsAt = event.end?.dateTime ?? event.end?.date;
         if (!startsAt || !endsAt) continue;
-        fixture.calendarEvents!.push({
+        const seriesKey = event.recurringEventId || event.id;
+        const candidate = {
           providerEventId: event.id,
+          seriesKey,
           calendarId: "primary",
           summary: event.summary ?? "",
           description: event.description ?? "",
@@ -463,11 +475,33 @@ export class LiveGoogleGateway implements GoogleGateway {
           // Kept verbatim so a Hawaii event renders in Hawaii time.
           timeZone: event.start?.timeZone ?? "UTC",
           attendees: event.attendees ?? [],
-        });
+        };
+
+        // A weekly meeting is one thing to find, not one per week. Keep the
+        // occurrence closest to now so the index answers "when is this next".
+        const held = series.get(seriesKey);
+        const distance = (value: string) => Math.abs(new Date(value).getTime() - now);
+        if (!held || distance(candidate.startsAt) < distance(held.startsAt)) {
+          series.set(seriesKey, candidate);
+        }
       }
       if (calendar.nextSyncToken) fixture.calendarSyncToken = calendar.nextSyncToken;
       calendarPageToken = calendar.nextPageToken ?? "";
-    } while (calendarPageToken && ++calendarPages < maxSyncPages);
+      if (calendarPageToken && ++calendarPages >= maxSyncPages) {
+        // Stopping early also means no sync token, so the next sync would
+        // re-read the same window. Say so rather than reporting a clean sync.
+        calendarTruncated = true;
+        break;
+      }
+    } while (calendarPageToken);
+
+    fixture.calendarEvents = [...series.values()];
+    if (calendarTruncated) {
+      fixture.warnings = [
+        ...(fixture.warnings ?? []),
+        `Calendar returned more than ${maxSyncPages} pages; this sync covered only part of the window.`,
+      ];
+    }
 
     return fixture;
   }

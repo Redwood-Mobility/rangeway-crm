@@ -348,24 +348,38 @@ export function Workspace() {
               }
             />
           ) : (
-            <ul style={{ listStyle: "none", margin: 0, padding: 0 }}>
-              {indexed.data?.results.map((item) => (
-                <li
-                  key={`${item.kind}:${item.id}`}
-                  style={{ padding: "0.625rem 0", borderBottom: "1px solid var(--border-subtle)" }}
-                >
-                  <div style={{ fontWeight: 600 }}>{item.title || "Untitled"}</div>
-                  {item.summary ? (
-                    <div style={{ color: "var(--text-secondary)" }}>{item.summary}</div>
-                  ) : null}
-                  <div className="meta-row" style={{ margin: "0.25rem 0 0.5rem" }}>
-                    <Badge tone="neutral">{kindLabel[item.kind] ?? item.kind}</Badge>
-                    {item.occurredAt ? <span>{formatDateTime(item.occurredAt)}</span> : null}
-                  </div>
-                  <ShareControl item={item} projects={projects.data?.projects ?? []} />
-                </li>
-              ))}
-            </ul>
+            // Grouped by source. A single flat list ordered by date let one
+            // busy calendar bury every message and file beneath it.
+            (["gmail_thread", "drive_item", "calendar_event"] as const).map((kind) => {
+              const items = (indexed.data?.results ?? []).filter((item) => item.kind === kind);
+              if (items.length === 0) return null;
+              return (
+                <section key={kind} style={{ marginBottom: "1.25rem" }}>
+                  <h3 className="nav-section-label" style={{ marginBottom: "0.375rem" }}>
+                    {kindLabel[kind]} · {items.length}
+                  </h3>
+                  <ul style={{ listStyle: "none", margin: 0, padding: 0 }}>
+                    {items.map((item) => (
+                      <li
+                        key={item.id}
+                        style={{ padding: "0.625rem 0", borderBottom: "1px solid var(--border-subtle)" }}
+                      >
+                        <div style={{ fontWeight: 600 }}>{item.title || "Untitled"}</div>
+                        {item.summary ? (
+                          <div style={{ color: "var(--text-secondary)" }}>{item.summary}</div>
+                        ) : null}
+                        {item.occurredAt ? (
+                          <div className="meta-row" style={{ margin: "0.25rem 0 0.5rem" }}>
+                            <span>{formatDateTime(item.occurredAt)}</span>
+                          </div>
+                        ) : null}
+                        <ShareControl item={item} projects={projects.data?.projects ?? []} />
+                      </li>
+                    ))}
+                  </ul>
+                </section>
+              );
+            })
           )}
         </Panel>
 

@@ -628,3 +628,127 @@ describe("sync continuation", () => {
     });
   });
 });
+
+describe("recurring calendar events", () => {
+  /** A standing weekly block, expanded into one instance per week. */
+  function recurringInstances(count: number) {
+    const base = Date.UTC(2026, 7, 4, 16, 0, 0);
+    return Array.from({ length: count }, (_, index) => ({
+      id: `office_${index}`,
+      recurringEventId: "office_series",
+      summary: "Office",
+      start: { dateTime: new Date(base + index * 7 * 86_400_000).toISOString() },
+      end: { dateTime: new Date(base + index * 7 * 86_400_000 + 3_600_000).toISOString() },
+    }));
+  }
+
+  it("collapses a recurring series to a single indexed entry", async (context) => {
+    await withPostgreSql(context, async (pool) => {
+      const { userId, reference } = await seedCredential(pool);
+      const google = googleApi({
+        calendar: [{ items: recurringInstances(200), nextSyncToken: "cal-sync" }],
+      });
+      const gateway = new LiveGoogleGateway(
+        pool,
+        oauth,
+        { organizationId, ownerUserId: userId },
+        google.fetch,
+      );
+
+      const fixture = await gateway.fetchIncremental({
+        credentialReference: reference,
+        gmailHistoryId: "",
+        drivePageToken: "",
+        calendarSyncToken: "",
+      });
+
+      // 200 occurrences of one standing meeting is one thing worth finding.
+      expect(fixture.calendarEvents).toHaveLength(1);
+      expect(fixture.calendarEvents?.[0].seriesKey).toBe("office_series");
+      expect(fixture.calendarEvents?.[0].summary).toBe("Office");
+    });
+  });
+
+  it("keeps one-off events distinct from each other", async (context) => {
+    await withPostgreSql(context, async (pool) => {
+      const { userId, reference } = await seedCredential(pool);
+      const google = googleApi({
+        calendar: [
+          {
+            items: [
+              { id: "a", summary: "Landowner call", start: { dateTime: "2026-08-05T17:00:00Z" }, end: { dateTime: "2026-08-05T18:00:00Z" } },
+              { id: "b", summary: "Site walk", start: { dateTime: "2026-08-06T17:00:00Z" }, end: { dateTime: "2026-08-06T18:00:00Z" } },
+            ],
+            nextSyncToken: "cal-sync",
+          },
+        ],
+      });
+      const gateway = new LiveGoogleGateway(
+        pool,
+        oauth,
+        { organizationId, ownerUserId: userId },
+        google.fetch,
+      );
+
+      const fixture = await gateway.fetchIncremental({
+        credentialReference: reference,
+        gmailHistoryId: "",
+        drivePageToken: "",
+        calendarSyncToken: "",
+      });
+
+      expect(fixture.calendarEvents).toHaveLength(2);
+    });
+  });
+
+  it("bounds the requested window at both ends", async (context) => {
+    await withPostgreSql(context, async (pool) => {
+      const { userId, reference } = await seedCredential(pool);
+      const google = googleApi({});
+      const gateway = new LiveGoogleGateway(
+        pool,
+        oauth,
+        { organizationId, ownerUserId: userId },
+        google.fetch,
+      );
+
+      await gateway.fetchIncremental({
+        credentialReference: reference,
+        gmailHistoryId: "",
+        drivePageToken: "",
+        calendarSyncToken: "",
+      });
+
+      // Without timeMax, singleEvents expands a recurring event indefinitely.
+      const calendarUrl = google.urls.find((url) => url.includes("calendar/v3"));
+      expect(calendarUrl).toContain("timeMin=");
+      expect(calendarUrl).toContain("timeMax=");
+    });
+  });
+
+  it("reports a truncated sync rather than reporting a clean one", async (context) => {
+    await withPostgreSql(context, async (pool) => {
+      const { userId, reference } = await seedCredential(pool);
+      // Every page offers another; the bound stops it and no sync token arrives.
+      const google = googleApi({
+        calendar: [{ items: recurringInstances(1), nextPageToken: "always-more" }],
+      });
+      const gateway = new LiveGoogleGateway(
+        pool,
+        oauth,
+        { organizationId, ownerUserId: userId },
+        google.fetch,
+      );
+
+      const fixture = await gateway.fetchIncremental({
+        credentialReference: reference,
+        gmailHistoryId: "",
+        drivePageToken: "",
+        calendarSyncToken: "",
+      });
+
+      expect(fixture.calendarSyncToken).toBeUndefined();
+      expect(fixture.warnings?.join(" ")).toContain("only part of the window");
+    });
+  });
+});
