@@ -170,7 +170,9 @@ export function createWorkspaceRouter(
       core,
       "workspace.search",
       z.object({
-        q: z.string().trim().min(2).max(200),
+        // Optional so the screen can show what is indexed without demanding a
+        // search term first. An empty term matches everything, bounded by limit.
+        q: z.string().trim().max(200).default(""),
         limit: z.coerce.number().int().min(1).max(100).default(25),
       }),
     ),

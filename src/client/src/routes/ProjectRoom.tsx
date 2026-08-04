@@ -1,7 +1,10 @@
 import React, { useState, type FormEvent } from "react";
 import { Link, NavLink, useParams } from "react-router";
 import { Pencil } from "lucide-react";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Gates } from "./Gates.js";
+import { apiRequest, newIdempotencyKey } from "../api/client.js";
+import { publishMutationError, publishToast } from "../components/toast.js";
 import { useAddHealthUpdate, useProjectContext, useUpdateProject } from "../api/queries.js";
 import {
   boardLanes,
@@ -35,8 +38,98 @@ const tabs = [
   { key: "gates", label: "Gates" },
   { key: "stakeholders", label: "Stakeholders" },
   { key: "decisions", label: "Decisions & Risks" },
+  { key: "context", label: "Shared context" },
   { key: "activity", label: "Activity" },
 ];
+
+interface WorkspaceShare {
+  id: string;
+  sourceKind: string;
+  title: string;
+  summary: string;
+  occurredAt: string | null;
+  ownerDisplayName: string;
+}
+
+const shareKindLabel: Record<string, string> = {
+  gmail_thread: "Mail",
+  drive_item: "Drive",
+  calendar_event: "Calendar",
+};
+
+/**
+ * Mail, files and meetings someone deliberately shared into this project.
+ *
+ * Nothing arrives here by indexing alone — a Workspace connection stays private
+ * until its owner shares a specific item.
+ */
+function SharedContext({ projectId }: { projectId: string | undefined }) {
+  const client = useQueryClient();
+  const shares = useQuery({
+    queryKey: ["project", projectId, "workspace-shares"],
+    queryFn: () =>
+      apiRequest<{ shares: WorkspaceShare[] }>(`/projects/${projectId}/workspace-shares`),
+    enabled: Boolean(projectId),
+  });
+
+  const revoke = useMutation({
+    mutationFn: (shareId: string) =>
+      apiRequest(`/workspace-shares/${shareId}`, {
+        method: "DELETE",
+        body: {},
+        idempotencyKey: newIdempotencyKey("workspace-share-revoke"),
+      }),
+    onSuccess: () => {
+      void client.invalidateQueries({ queryKey: ["project", projectId, "workspace-shares"] });
+      publishToast("Removed from this project.");
+    },
+    onError: (error) => publishMutationError(error, "That item was not removed."),
+  });
+
+  if (shares.error) {
+    return <ErrorState error={shares.error} onRetry={() => void shares.refetch()} />;
+  }
+
+  return (
+    <Panel title="Shared from Google Workspace">
+      {shares.isPending ? (
+        <SkeletonRows rows={3} />
+      ) : (shares.data?.shares ?? []).length === 0 ? (
+        <EmptyState
+          title="Nothing shared yet"
+          description="Find mail, a file or a meeting under Workspace and share it into this project. Connected mailboxes stay private until someone does."
+        />
+      ) : (
+        <ul style={{ listStyle: "none", margin: 0, padding: 0 }}>
+          {shares.data?.shares.map((share) => (
+            <li
+              key={share.id}
+              style={{ padding: "0.625rem 0", borderBottom: "1px solid var(--border-subtle)" }}
+            >
+              <div style={{ fontWeight: 600 }}>{share.title || "Untitled"}</div>
+              {share.summary ? (
+                <div style={{ color: "var(--text-secondary)" }}>{share.summary}</div>
+              ) : null}
+              <div className="meta-row" style={{ marginTop: "0.25rem" }}>
+                <Badge tone="neutral">{shareKindLabel[share.sourceKind] ?? share.sourceKind}</Badge>
+                <span>Shared by {share.ownerDisplayName}</span>
+                {share.occurredAt ? <span>{formatDateTime(share.occurredAt)}</span> : null}
+                <button
+                  type="button"
+                  className="button button--quiet"
+                  onClick={() => revoke.mutate(share.id)}
+                  disabled={revoke.isPending}
+                >
+                  Remove
+                </button>
+              </div>
+            </li>
+          ))}
+        </ul>
+      )}
+    </Panel>
+  );
+}
 
 export function ProjectRoom() {
   const { projectId, tab = "overview" } = useParams();
@@ -124,6 +217,7 @@ export function ProjectRoom() {
       ) : null}
       {tab === "stakeholders" ? <Stakeholders data={data} /> : null}
       {tab === "decisions" ? <DecisionsAndRisks data={data} /> : null}
+      {tab === "context" ? <SharedContext projectId={projectId} /> : null}
       {tab === "activity" ? <Activity data={data} /> : null}
 
       {Object.values(sections).some((section) => section.truncated) ? (

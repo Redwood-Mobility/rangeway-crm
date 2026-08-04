@@ -31,6 +31,25 @@ interface Suggestion {
   extractorVersion: string;
 }
 
+interface IndexedItem {
+  kind: "gmail_thread" | "drive_item" | "calendar_event";
+  id: string;
+  title: string;
+  summary: string;
+  occurredAt: string | null;
+}
+
+interface ProjectOption {
+  id: string;
+  name: string;
+}
+
+const kindLabel: Record<string, string> = {
+  gmail_thread: "Mail",
+  drive_item: "Drive",
+  calendar_event: "Calendar",
+};
+
 const statusTone: Record<string, "positive" | "caution" | "critical" | "neutral"> = {
   connected: "positive",
   expired: "caution",
@@ -53,10 +72,81 @@ function scopeLabel(scope: string): string {
   return scope;
 }
 
+/**
+ * Lets one indexed item be shared into a project.
+ *
+ * Sharing is per item and explicit: nothing in a mailbox becomes visible to
+ * anyone else because a project exists, only because someone chose this row.
+ */
+function ShareControl({ item, projects }: { item: IndexedItem; projects: ProjectOption[] }) {
+  const client = useQueryClient();
+  const [projectId, setProjectId] = React.useState("");
+
+  const share = useMutation({
+    mutationFn: (targetProjectId: string) =>
+      apiRequest(`/projects/${targetProjectId}/workspace-shares`, {
+        method: "POST",
+        body: { sourceKind: item.kind, sourceId: item.id },
+        idempotencyKey: newIdempotencyKey("workspace-share"),
+      }),
+    onSuccess: () => {
+      void client.invalidateQueries({ queryKey: ["workspace"] });
+      publishToast("Shared into the project.");
+      setProjectId("");
+    },
+    onError: (error) => publishMutationError(error, "That item was not shared."),
+  });
+
+  return (
+    <div style={{ display: "flex", gap: "0.375rem", flexWrap: "wrap" }}>
+      <label className="visually-hidden" htmlFor={`share-${item.id}`}>
+        Share “{item.title || "Untitled"}” into a project
+      </label>
+      <select
+        id={`share-${item.id}`}
+        className="input"
+        value={projectId}
+        onChange={(event) => setProjectId(event.target.value)}
+        style={{ maxWidth: "16rem" }}
+      >
+        <option value="">Share into…</option>
+        {projects.map((project) => (
+          <option key={project.id} value={project.id}>
+            {project.name}
+          </option>
+        ))}
+      </select>
+      <button
+        type="button"
+        className="button"
+        disabled={!projectId || share.isPending}
+        onClick={() => share.mutate(projectId)}
+      >
+        {share.isPending ? "Sharing…" : "Share"}
+      </button>
+    </div>
+  );
+}
+
 export function Workspace() {
   const client = useQueryClient();
   const [params] = useSearchParams();
   const connectResult = params.get("connect");
+  const [term, setTerm] = React.useState("");
+  const [appliedTerm, setAppliedTerm] = React.useState("");
+
+  const indexed = useQuery({
+    queryKey: ["workspace", "search", appliedTerm],
+    queryFn: () =>
+      apiRequest<{ results: IndexedItem[] }>("/workspace/search", {
+        query: { q: appliedTerm, limit: 50 },
+      }),
+  });
+
+  const projects = useQuery({
+    queryKey: ["workspace", "project-options"],
+    queryFn: () => apiRequest<{ projects: ProjectOption[] }>("/projects", { query: { limit: 100 } }),
+  });
 
   const connections = useQuery({
     queryKey: ["workspace", "connections"],
@@ -207,6 +297,76 @@ export function Workspace() {
             </li>
             <li>Disconnecting stops all syncing and revokes the stored credential.</li>
           </ul>
+        </Panel>
+
+        <Panel title="What Atlas has indexed">
+          <form
+            onSubmit={(event) => {
+              event.preventDefault();
+              setAppliedTerm(term.trim());
+            }}
+            style={{ display: "flex", gap: "0.375rem", marginBottom: "0.75rem", flexWrap: "wrap" }}
+          >
+            <label className="visually-hidden" htmlFor="workspace-search">
+              Search your mail, Drive and calendar
+            </label>
+            <input
+              id="workspace-search"
+              className="input"
+              type="search"
+              placeholder="Search your mail, Drive and calendar"
+              value={term}
+              onChange={(event) => setTerm(event.target.value)}
+              style={{ flex: "1 1 16rem" }}
+            />
+            <button type="submit" className="button">
+              Search
+            </button>
+            {appliedTerm ? (
+              <button
+                type="button"
+                className="button button--quiet"
+                onClick={() => {
+                  setTerm("");
+                  setAppliedTerm("");
+                }}
+              >
+                Clear
+              </button>
+            ) : null}
+          </form>
+
+          {indexed.isPending ? (
+            <SkeletonRows rows={4} />
+          ) : (indexed.data?.results ?? []).length === 0 ? (
+            <EmptyState
+              title={appliedTerm ? "Nothing matched" : "Nothing indexed yet"}
+              description={
+                appliedTerm
+                  ? "Try a shorter term, or clear the search to see everything indexed."
+                  : "Connect Google and run a sync. Only you can see what is indexed here."
+              }
+            />
+          ) : (
+            <ul style={{ listStyle: "none", margin: 0, padding: 0 }}>
+              {indexed.data?.results.map((item) => (
+                <li
+                  key={`${item.kind}:${item.id}`}
+                  style={{ padding: "0.625rem 0", borderBottom: "1px solid var(--border-subtle)" }}
+                >
+                  <div style={{ fontWeight: 600 }}>{item.title || "Untitled"}</div>
+                  {item.summary ? (
+                    <div style={{ color: "var(--text-secondary)" }}>{item.summary}</div>
+                  ) : null}
+                  <div className="meta-row" style={{ margin: "0.25rem 0 0.5rem" }}>
+                    <Badge tone="neutral">{kindLabel[item.kind] ?? item.kind}</Badge>
+                    {item.occurredAt ? <span>{formatDateTime(item.occurredAt)}</span> : null}
+                  </div>
+                  <ShareControl item={item} projects={projects.data?.projects ?? []} />
+                </li>
+              ))}
+            </ul>
+          )}
         </Panel>
 
         <Panel title="Suggestions awaiting review">
